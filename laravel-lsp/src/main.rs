@@ -4781,6 +4781,39 @@ impl LaravelLanguageServer {
         Some(decls)
     }
 
+    /// The fully-qualified Folio route name a `.blade.php` page declares, IF the
+    /// cursor at `position` sits on the page's own `name('...')` helper call.
+    ///
+    /// Resolves the name from the already-built in-memory route index — the same
+    /// source `add_declaration_locations`' Folio branch reads — rather than
+    /// re-walking the project filesystem, and reads the cursor file from the
+    /// editor buffer or disk asynchronously. So this find-references / rename hot
+    /// path never blocks a Tokio worker thread on a synchronous project walk
+    /// (the walk happens at most once, inside `spawn_blocking`, when the index is
+    /// built). Containment is structural: the file text is read only after the
+    /// index match succeeds, and the index holds only mounts that stayed under
+    /// the project root, so an out-of-tree page is never read here. Returns
+    /// `None` when the file isn't a named Folio page or the cursor isn't on its
+    /// `name(...)` call.
+    async fn folio_route_name_for_cursor(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Option<String> {
+        let name = {
+            let guard = self.route_index.read().await;
+            laravel_lsp::folio_discovery::folio_name_for_file(guard.as_ref()?, file_path)?
+        };
+        let uri = Url::from_file_path(file_path).ok()?;
+        let content = self.document_or_disk_content(&uri, file_path).await?;
+        laravel_lsp::folio_discovery::cursor_on_page_name(
+            &content,
+            position.line,
+            position.character,
+        )
+        .then_some(name)
+    }
+
     /// Return the current content of `uri` — the editor buffer if the file is
     /// open (so unsaved edits are reflected), otherwise the on-disk text.
     /// Returns `None` only when neither source is readable.
@@ -17927,6 +17960,18 @@ async fn classify_with_decl_fallback(
     // aren't tagged by php.scm. Use the mtime-cached decl walker so
     // subsequent invocations don't re-parse the file.
     if !is_in_routes_dir(file_path) {
+        // A Folio page's `name('...')` helper declares its route name, but the
+        // page lives outside `routes/` and the bare helper isn't tagged by
+        // php.scm. If the cursor sits on that call, resolve it to the page's
+        // (mount-prefixed) route name — read from the already-built in-memory
+        // route index, never a fresh filesystem walk — so find-references /
+        // rename reach every `route('...')` usage of the page.
+        if let Some(name) = server
+            .folio_route_name_for_cursor(file_path, position)
+            .await
+        {
+            return Some(laravel_lsp::references::SymbolRef::Route(name));
+        }
         return None;
     }
     let decls = server.cached_route_decls(file_path).await?;
@@ -18147,6 +18192,39 @@ async fn collect_declaration_locations(
                             },
                         });
                     }
+                }
+            }
+
+            // Folio pages are filesystem-derived routes injected into the index
+            // with their backing `.blade.php` file as the declaration site (top
+            // of file). They live outside `routes/`, so the walk above never
+            // sees them — surface the page itself. A conventional route of the
+            // same name shadows the Folio page in the index (keep-first
+            // insertion), so this only fires for genuinely Folio-owned names; no
+            // double-counting with the `routes/` walk above.
+            let folio_decl = {
+                let guard = server.route_index.read().await;
+                guard
+                    .as_ref()
+                    .and_then(|idx| idx.get(name))
+                    .filter(|def| def.file.to_str().is_some_and(|s| s.ends_with(".blade.php")))
+                    .map(|def| (def.file.clone(), def.line, def.column, def.end_column))
+            };
+            if let Some((file, line, column, end_column)) = folio_decl {
+                if let Ok(uri) = Url::from_file_path(&file) {
+                    out.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position {
+                                line,
+                                character: column,
+                            },
+                            end: Position {
+                                line,
+                                character: end_column,
+                            },
+                        },
+                    });
                 }
             }
         }
