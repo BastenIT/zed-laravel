@@ -330,6 +330,107 @@ fn anonymous_component_namespace_resolves_relative_to_view_paths() {
     );
 }
 
+// ─── Flux component resolution (issue #60) ─────────────────────────────
+
+fn make_bare_config() -> LaravelConfigData {
+    LaravelConfigData {
+        root: PathBuf::from("/project"),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    }
+}
+
+#[test]
+fn normalize_flux_tag_name_rewrites_single_colon_prefix() {
+    assert_eq!(
+        normalize_flux_tag_name("flux:button").as_deref(),
+        Some("flux::button"),
+    );
+    assert_eq!(
+        normalize_flux_tag_name("flux:icon.arrow-right").as_deref(),
+        Some("flux::icon.arrow-right"),
+    );
+}
+
+#[test]
+fn normalize_flux_tag_name_leaves_non_flux_and_namespaced_alone() {
+    // Already-namespaced `<x-flux::button>` arrives pre-normalized.
+    assert_eq!(normalize_flux_tag_name("flux::button"), None);
+    // Non-Flux names untouched.
+    assert_eq!(normalize_flux_tag_name("button"), None);
+    assert_eq!(normalize_flux_tag_name("livewire:counter"), None);
+}
+
+#[test]
+fn flux_tag_resolves_to_conventional_sources() {
+    // `<flux:button>` resolves with no explicit registration via the
+    // convention fallback: app-published views, the package source, and Flux Pro.
+    let config = make_bare_config();
+    let paths = config.resolve_component_path("flux:button");
+
+    assert!(
+        paths
+            .iter()
+            .any(|p| p == &PathBuf::from("/project/resources/views/flux/button.blade.php")),
+        "published view path missing: {:?}",
+        paths,
+    );
+    assert!(
+        paths.iter().any(|p| p
+            == &PathBuf::from(
+                "/project/vendor/livewire/flux/stubs/resources/views/flux/button.blade.php"
+            )),
+        "package source path missing: {:?}",
+        paths,
+    );
+    assert!(
+        paths.iter().any(|p| p
+            == &PathBuf::from(
+                "/project/vendor/livewire/flux-pro/stubs/resources/views/flux/button.blade.php"
+            )),
+        "Flux Pro path missing: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn flux_dotted_tag_maps_dots_to_directories() {
+    // `<flux:icon.arrow-right>` → `flux/icon/arrow-right.blade.php`.
+    let config = make_bare_config();
+    let paths = config.resolve_component_path("flux:icon.arrow-right");
+
+    assert!(
+        paths.iter().any(
+            |p| p == &PathBuf::from("/project/resources/views/flux/icon/arrow-right.blade.php")
+        ),
+        "dotted Flux name must map dots to directories: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn flux_namespace_tag_resolves_same_as_single_colon() {
+    // The `<x-flux::button>` namespace form resolves through the same fallback.
+    let config = make_bare_config();
+    let paths = config.resolve_component_path("flux::button");
+    assert!(
+        paths
+            .iter()
+            .any(|p| p == &PathBuf::from("/project/resources/views/flux/button.blade.php")),
+        "namespace form must resolve via the Flux fallback: {:?}",
+        paths,
+    );
+}
+
 #[test]
 fn unregistered_anonymous_prefix_does_not_borrow_registered_directory() {
     let config = make_config_with_anonymous_path(
@@ -825,6 +926,85 @@ fn resolves(name: &str, config: &LaravelConfigData, autoload: &ComposerAutoload)
     component_candidate_paths(name, config, autoload)
         .iter()
         .any(|p| p.exists())
+}
+
+/// End-to-end for issue #60's completion criterion: a Flux component resolved
+/// from its conventional vendor source must surface its declared `@props` as
+/// offered attributes. Exercises the same chain the completion handler runs —
+/// `resolve_component_path` → first on-disk candidate → `extract_prop_names`.
+#[test]
+fn flux_component_props_are_offered_for_completion() {
+    let (_dir, root) = project_with_files(&[(
+        "vendor/livewire/flux/stubs/resources/views/flux/button.blade.php",
+        "@props([\n    'variant' => 'primary',\n    'size',\n    'icon' => null,\n])\n\
+         <button {{ $attributes }}>{{ $slot }}</button>\n",
+    )]);
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    };
+
+    // Resolve `<flux:button>` the way goto/hover/completion do, then read the
+    // first candidate that actually exists on disk.
+    let resolved = config
+        .resolve_component_path("flux:button")
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("flux:button should resolve to its vendor blade source");
+
+    let content = std::fs::read_to_string(&resolved).unwrap();
+    let props = crate::blade_props::extract_prop_names(&content);
+
+    assert!(
+        props.contains(&"variant".to_string()),
+        "known prop `variant` must be offered for a resolved Flux component: {:?}",
+        props,
+    );
+    assert_eq!(
+        props,
+        vec!["variant", "size", "icon"],
+        "all declared props offered, in declaration order",
+    );
+}
+
+#[test]
+fn flux_tag_skips_invalid_colon_class_candidate() {
+    // A namespaced tag must not emit a conventional class candidate — the
+    // colon-bearing `app/View/Components/Flux:button.php` is an invalid path on
+    // Windows and a guaranteed-miss `stat` on POSIX. (Follow-up from PR #99
+    // round-2 review; `component_candidate_paths` doesn't touch the FS, so an
+    // empty project root is enough.)
+    let (_dir, root) = project_with_files(&[]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(&root, &[]);
+
+    let candidates = component_candidate_paths("flux:button", &config, &autoload);
+    assert!(
+        candidates.iter().all(|p| !p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .contains(':')),
+        "no candidate may carry a `:` in its filename: {:#?}",
+        candidates,
+    );
+    assert!(
+        !candidates
+            .iter()
+            .any(|p| p.starts_with(root.join("app/View/Components"))),
+        "a namespaced Flux tag must not probe the conventional class dir: {:#?}",
+        candidates,
+    );
 }
 
 #[test]

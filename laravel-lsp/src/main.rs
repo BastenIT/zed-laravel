@@ -5571,13 +5571,15 @@ impl LaravelLanguageServer {
         );
     }
 
-    /// Rescan node_modules (for Flux, etc.)
+    /// Rescan node_modules (JS-side packages).
+    ///
+    /// Flux is intentionally not scanned here: it ships via Composer under
+    /// `vendor/livewire/flux`, not node_modules. Flux components are discovered
+    /// through the vendor service-provider scan and the conventional-path
+    /// fallback in `LaravelConfigData::resolve_component_path`.
     async fn rescan_node_modules(&self, _root: &Path) {
         info!("🔍 Rescanning node_modules...");
         let start = std::time::Instant::now();
-
-        // TODO: Scan for Flux components in node_modules
-        // For now, just update the mtime
 
         let mut cache_guard = self.cache.write().await;
         if let Some(ref mut cache) = *cache_guard {
@@ -8104,6 +8106,128 @@ impl LaravelLanguageServer {
         }
 
         None
+    }
+
+    /// Check if cursor is inside a Flux component tag like `<flux:button` or
+    /// `<flux:icon.arrow-right`. Returns the partial name typed after `<flux:`
+    /// (for filtering completions), or `None` when the cursor is past the name
+    /// (hit a space, `>`, or `/`).
+    fn get_flux_component_context(line_text: &str, character: u32) -> Option<StringContext> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        if let Some(pos) = before_cursor.rfind("<flux:") {
+            let start_pos = pos + 6; // After "<flux:"
+            let after_prefix = &before_cursor[start_pos..];
+
+            if after_prefix.contains(' ')
+                || after_prefix.contains('>')
+                || after_prefix.contains('/')
+            {
+                return None;
+            }
+
+            // Flux names are dotted/kebab (`icon.arrow-right`); reject anything
+            // else so attribute text after the name isn't treated as a name.
+            if after_prefix
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+            {
+                return Some(StringContext {
+                    prefix: after_prefix.to_string(),
+                    start_col: start_pos as u32,
+                    end_col: cursor as u32,
+                    quote_char: ' ',
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Check if the cursor sits at an *attribute* position inside an open Flux
+    /// tag — i.e. past the component name but before the tag closes, as in
+    /// `<flux:button │>` or `<flux:button variant="primary" si│>`.
+    ///
+    /// Returns the resolvable component name (`flux:button`, dotted names
+    /// preserved) plus a [`StringContext`] for the partial attribute word being
+    /// typed (its prefix filters the offered props; `start_col`/`end_col` mark
+    /// the replacement range). Returns `None` when the cursor is still in the
+    /// component name (that's [`Self::get_flux_component_context`]'s job), when
+    /// the tag has already closed, or when the cursor is inside an attribute
+    /// *value* (a quoted string) — props complete attribute *names* only.
+    fn get_flux_attribute_context(
+        line_text: &str,
+        character: u32,
+    ) -> Option<(String, StringContext)> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+        let before_cursor = &line_text[..cursor];
+
+        let pos = before_cursor.rfind("<flux:")?;
+        let after_tag = &before_cursor[pos + 6..]; // after "<flux:"
+
+        // A `>` between the tag and the cursor means the tag already closed.
+        if after_tag.contains('>') {
+            return None;
+        }
+
+        // The component name runs until the first whitespace. No whitespace yet
+        // means the cursor is still in the name — not an attribute position.
+        let first_ws = after_tag.find(char::is_whitespace)?;
+        let name = &after_tag[..first_ws];
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+        {
+            return None;
+        }
+
+        // Everything after the name is the attribute region. An odd number of
+        // quotes means the cursor is inside an attribute value — bail.
+        let attrs = &after_tag[first_ws..];
+        if attrs.matches('"').count() % 2 == 1 || attrs.matches('\'').count() % 2 == 1 {
+            return None;
+        }
+
+        // The partial attribute is the word after the last whitespace. Walk
+        // back over char boundaries: a raw byte index from `rfind` + 1 lands
+        // inside a multi-byte whitespace (e.g. U+00A0 NO-BREAK SPACE) and
+        // panics the slice below. Mirrors the `char_indices().rev()` helpers
+        // used elsewhere in this file.
+        let word_start = before_cursor
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(cursor);
+        let partial = &before_cursor[word_start..];
+        // `=`, `"` or `'` in the partial means we're past the name into a value.
+        if partial.contains('=') || partial.contains('"') || partial.contains('\'') {
+            return None;
+        }
+
+        // Drop a leading `:` (bound attribute) from the filter prefix, keeping
+        // the replacement range pointed at the prop name itself.
+        let prefix = partial.trim_start_matches(':');
+        let prefix_offset = partial.len() - prefix.len();
+
+        Some((
+            format!("flux:{}", name),
+            StringContext {
+                prefix: prefix.to_string(),
+                start_col: (word_start + prefix_offset) as u32,
+                end_col: cursor as u32,
+                quote_char: ' ',
+            },
+        ))
     }
 
     /// Check if cursor is inside a Livewire component tag like `<livewire:...` or `@livewire('...')`
@@ -16173,6 +16297,14 @@ return [
         // `resolve_component_existing_file` guarantees diagnostics and
         // goto-definition can never disagree about whether a component exists.
         for comp_ref in &patterns.components {
+            // Flux's `<flux:...>` tags resolve through vendor/published paths
+            // that may be absent in a given editing session; goto/hover degrade
+            // gracefully, so skip the hard not-found error for them (Flux
+            // diagnostics are out of scope). `<x-flux::...>` keeps its check.
+            if comp_ref.name.starts_with("flux:") && !comp_ref.name.starts_with("flux::") {
+                continue;
+            }
+
             if self
                 .resolve_component_existing_file(&comp_ref.name)
                 .await
@@ -17393,6 +17525,12 @@ return [
     /// disk, otherwise `None`. Handles dotted names (`forms.input` →
     /// `Forms/Input.php`) and kebab segments (`alert-box` → `AlertBox.php`).
     async fn resolve_component_class_file(&self, name: &str) -> Option<PathBuf> {
+        // Namespaced tags (`flux:button`, `pkg::widget`) never map to an
+        // `app/View/Components/*.php` class — and a `:` in the derived filename
+        // is invalid on Windows and a wasted stat on POSIX. Bail before probing.
+        if name.contains(':') {
+            return None;
+        }
         let root = self.root_path.read().await.clone()?;
         let class_path = name
             .split('.')
@@ -22102,6 +22240,130 @@ impl LanguageServer for LaravelLanguageServer {
                     "   Returning {} Blade component completion items",
                     items.len()
                 );
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for Flux component context (<flux:...)
+            if let Some(flux_ctx) = Self::get_flux_component_context(line_text, position.character)
+            {
+                debug!(
+                    "   Flux component context, filter prefix: '{}'",
+                    flux_ctx.prefix
+                );
+
+                let candidates = match self.root_path.read().await.clone() {
+                    Some(root) => laravel_lsp::component_completion::collect_flux_components(&root),
+                    None => Vec::new(),
+                };
+
+                let prefix_lower = flux_ctx.prefix.to_lowercase();
+                let items: Vec<CompletionItem> = candidates
+                    .into_iter()
+                    .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|c| CompletionItem {
+                        label: c.name.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail: Some(c.detail.clone()),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(format!("<flux:{}>", c.name))
+                                .summary("Flux component.")
+                                .section(format!("Source: {}", c.detail))
+                                .into_documentation(),
+                        ),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: flux_ctx.start_col,
+                                },
+                                end: Position {
+                                    line: position.line,
+                                    character: flux_ctx.end_col,
+                                },
+                            },
+                            new_text: c.name.clone(),
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                debug!(
+                    "   Returning {} Flux component completion items",
+                    items.len()
+                );
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Flux attribute context (`<flux:button │>`): offer the resolved
+            // component's `@props` as attributes — the props/slots half of the
+            // completion criterion. Resolution reuses the goto/hover path
+            // (`resolve_component_file` → `resolve_component_path`), so the same
+            // published / vendor / Flux Pro fallbacks apply.
+            if let Some((component_name, attr_ctx)) =
+                Self::get_flux_attribute_context(line_text, position.character)
+            {
+                debug!(
+                    "   Flux attribute context for `<{}>`, filter prefix: '{}'",
+                    component_name, attr_ctx.prefix
+                );
+
+                let prop_names = match self.resolve_component_file(&component_name).await {
+                    Some(path) => {
+                        let content = std::fs::read_to_string(&path).unwrap_or_default();
+                        laravel_lsp::blade_props::extract_prop_names(&content)
+                    }
+                    None => Vec::new(),
+                };
+
+                let prefix_lower = attr_ctx.prefix.to_lowercase();
+                let items: Vec<CompletionItem> = prop_names
+                    .into_iter()
+                    .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
+                    .map(|p| CompletionItem {
+                        label: p.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some(format!("<{}> prop", component_name)),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(format!("{} (prop)", p))
+                                .summary("Flux component prop.")
+                                .into_documentation(),
+                        ),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: attr_ctx.start_col,
+                                },
+                                end: Position {
+                                    line: position.line,
+                                    character: attr_ctx.end_col,
+                                },
+                            },
+                            new_text: p.clone(),
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                debug!("   Returning {} Flux prop completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)

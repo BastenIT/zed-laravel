@@ -2891,6 +2891,12 @@ impl LaravelConfigData {
     pub fn resolve_component_path(&self, component_name: &str) -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
+        // Flux's `<flux:button>` sugar maps to the `flux` anonymous-component
+        // namespace; rewrite the single-colon prefix to the `::` form so the
+        // namespace resolution below treats it like `<x-flux::button>`.
+        let flux_normalized = normalize_flux_tag_name(component_name);
+        let component_name = flux_normalized.as_deref().unwrap_or(component_name);
+
         // Icon-set check first: <x-heroicon-o-clock> and friends resolve to a
         // concrete SVG file path. The blade-icons Factory registers each icon
         // at runtime via a loop over filesystem manifests, so static AST analysis
@@ -2974,6 +2980,30 @@ impl LaravelConfigData {
                     let base = self.root.join(view_path).join(dir);
                     push_component_file_candidates(&mut paths, base.join(&component_path));
                 }
+            }
+
+            // Flux ships anonymous Blade components under the `flux` prefix.
+            // Beyond any registration discovered from its service provider, fall
+            // back to Flux's conventional locations: the app-published
+            // `resources/views/flux/`, the package source `vendor/livewire/flux`,
+            // and Flux Pro `vendor/livewire/flux-pro`.
+            if ns == "flux" {
+                push_component_file_candidates(
+                    &mut paths,
+                    self.root.join("resources/views/flux").join(&component_path),
+                );
+                push_component_file_candidates(
+                    &mut paths,
+                    self.root
+                        .join("vendor/livewire/flux/stubs/resources/views/flux")
+                        .join(&component_path),
+                );
+                push_component_file_candidates(
+                    &mut paths,
+                    self.root
+                        .join("vendor/livewire/flux-pro/stubs/resources/views/flux")
+                        .join(&component_path),
+                );
             }
 
             // Package component - check package view path first
@@ -3062,6 +3092,18 @@ impl LaravelConfigData {
     }
 }
 
+/// Rewrite a Flux single-colon component tag name (`flux:button`,
+/// `flux:icon.arrow-right`) into the `flux::` namespace form the component
+/// resolver understands. Returns `None` for names that aren't Flux tags or are
+/// already namespaced (`flux::button` arrives pre-normalized).
+pub fn normalize_flux_tag_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("flux:")?;
+    if rest.starts_with(':') {
+        return None;
+    }
+    Some(format!("flux::{rest}"))
+}
+
 /// Push the three file shapes Laravel accepts for an anonymous component at
 /// `base` (the component's path under its directory, *without* extension),
 /// mirroring `ComponentTagCompiler`'s guess order:
@@ -3113,9 +3155,15 @@ pub fn component_candidate_paths(
 ) -> Vec<PathBuf> {
     let mut candidates = config.resolve_component_path(name);
 
-    // Conventional class-backed component (non-namespaced names).
-    candidates
-        .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+    // Conventional class-backed component (non-namespaced names only). A
+    // namespaced tag like `flux:button` or `pkg::badge` would produce an
+    // invalid `app/View/Components/Flux:button.php` candidate — illegal on
+    // Windows and a wasted `stat` on POSIX. Namespaced forms resolve via the
+    // PSR-4 `componentNamespace` block below instead, so skip them here.
+    if !name.contains(':') {
+        candidates
+            .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+    }
 
     // Explicit class-backed registration: Blade::component('tag', Class::class)
     // in any provider (facade or instance form). Laravel core registers
