@@ -18147,7 +18147,7 @@ async fn classify_with_decl_fallback(
     // Fallback path: route-name declarations live in `routes/*.php` and
     // aren't tagged by php.scm. Use the mtime-cached decl walker so
     // subsequent invocations don't re-parse the file.
-    if !is_in_routes_dir(file_path) {
+    if !is_in_routes_dir(file_path, root) {
         // A Folio page's `name('...')` helper declares its route name, but the
         // page lives outside `routes/` and the bare helper isn't tagged by
         // php.scm. If the cursor sits on that call, resolve it to the page's
@@ -18230,12 +18230,30 @@ async fn decl_range_at(
     None
 }
 
-/// Heuristic: is this file under a `routes/` subdirectory anywhere in its
-/// path? Used to gate the declaration-fallback walk so we don't pay the
-/// parse cost on every PHP file.
-fn is_in_routes_dir(path: &Path) -> bool {
-    path.components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new("routes"))
+/// Heuristic: should the declaration-fallback walk run for this file?
+///
+/// Route-name declarations (`->name('home')`) live in the project's
+/// `routes/` directory, so we gate the (potentially expensive) decl walk on
+/// the file living there. There are two modes:
+///
+/// - **Root known (`Some`)** — precise: the file's *immediate parent* must be
+///   exactly `<root>/routes`. So `routes/web.php` matches, but a Folio page
+///   mounted at `routes/pages/about.php` does **not** — its parent is
+///   `routes/pages`. This keeps the Folio branch in
+///   `classify_with_decl_fallback` reachable for pages that happen to sit
+///   under `routes/` (issue #105); the old broad check matched any `routes`
+///   component and silently swallowed them.
+/// - **Root unknown (`None`)** — fall back to the broad heuristic: any path
+///   component named `routes`. Without a root we can't anchor the match, so
+///   we keep the original permissive behavior rather than miss real route
+///   files.
+fn is_in_routes_dir(path: &Path, root: Option<&Path>) -> bool {
+    match root {
+        Some(root) => path.parent() == Some(root.join("routes").as_path()),
+        None => path
+            .components()
+            .any(|c| c.as_os_str() == std::ffi::OsStr::new("routes")),
+    }
 }
 
 /// Return the column range of the classified pattern under the cursor.
