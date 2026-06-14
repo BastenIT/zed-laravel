@@ -34,38 +34,64 @@ pub enum BladeLoopType {
     While,
 }
 
-/// Parse variables from `@foreach` / `@forelse` directive arguments.
-/// Handles: `@foreach($items as $item)`, `@foreach($items as $key => $value)`,
-/// `@foreach($category->items as $item)`.
+/// Parse the bound variables from `@foreach` / `@forelse` directive arguments —
+/// every name the loop introduces, in source order.
+///
+/// A foreach target (right of the last ` as `) is a PHP *lvalue*: it has no
+/// method calls or expressions, so every `$ident` token in it IS a bound
+/// variable. Extracting them all — rather than matching one fixed shape — covers
+/// every binding form with one rule:
+/// - plain `$item` → `[item]`
+/// - key/value `$key => $value` → `[key, value]`
+/// - by-reference `&$item` → `[item]` (the `&` carries no name)
+/// - list destructuring `[$a, $b]` / `list($a, $b)` → `[a, b]`
+/// - key + destructured value `$k => [$a, $b]` → `[k, a, b]`
+///
+/// A binding the parser can't see any `$ident` in (a truncated/garbled header)
+/// yields an empty list — the caller treats such a foreach/forelse as an
+/// *opaque* loop and refuses the rename rather than guessing its scope.
 pub fn parse_foreach_variables(arguments: &str) -> Vec<(String, String)> {
     lazy_static! {
-        static ref FOREACH_RE: Regex =
-            Regex::new(r#"\([^)]+\s+as\s+(?:\$(\w+)\s*=>\s*)?\$(\w+)\s*\)"#).unwrap();
+        static ref BOUND_VAR_RE: Regex = Regex::new(r#"\$(\w+)"#).unwrap();
     }
 
-    let mut vars = Vec::new();
-    if let Some(caps) = FOREACH_RE.captures(arguments) {
-        if let Some(key_match) = caps.get(1) {
-            vars.push((key_match.as_str().to_string(), "mixed".to_string()));
-        }
-        if let Some(value_match) = caps.get(2) {
-            vars.push((value_match.as_str().to_string(), "mixed".to_string()));
-        }
-    }
-    vars
+    let Some(binding) = foreach_binding(arguments) else {
+        return Vec::new();
+    };
+    BOUND_VAR_RE
+        .captures_iter(binding)
+        .filter_map(|caps| caps.get(1))
+        .map(|m| (m.as_str().to_string(), "mixed".to_string()))
+        .collect()
 }
 
 /// Parse the iterable expression from `@foreach` / `@forelse` arguments.
-/// e.g. `($this->audits as $audit)` -> `Some("$this->audits")`.
+/// e.g. `($this->audits as $audit)` -> `Some("$this->audits")`,
+/// `($users->where('active', true) as $user)` -> `Some("$users->where('active', true)")`.
 pub fn parse_foreach_iterable(arguments: &str) -> Option<String> {
-    lazy_static! {
-        static ref ITER_RE: Regex = Regex::new(r#"\(\s*(.+?)\s+as\s+\$"#).unwrap();
-    }
+    strip_outer_parens(arguments.trim())
+        .rsplit_once(" as ")
+        .map(|(iterable, _)| iterable.trim().to_string())
+}
 
-    ITER_RE
-        .captures(arguments)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_string())
+/// Return the binding portion (right of the LAST ` as `) of a foreach argument
+/// list. Splitting on the last keyword — rather than regex-capturing the
+/// iterable with a `[^)]` run — keeps iterables that contain their own parens
+/// or `as` (method calls like `$users->where('active', true)`) intact, so the
+/// loop variable is still recovered. `None` when the directive has no ` as `.
+fn foreach_binding(arguments: &str) -> Option<&str> {
+    strip_outer_parens(arguments.trim())
+        .rsplit_once(" as ")
+        .map(|(_, binding)| binding)
+}
+
+/// Strip a single matching outer parenthesis pair, if both are present.
+/// Only the outermost pair is removed, so nested parens inside the iterable are
+/// preserved.
+fn strip_outer_parens(s: &str) -> &str {
+    s.strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(s)
 }
 
 /// Parse variables from `@for` directive arguments.
@@ -84,37 +110,129 @@ pub fn parse_for_variables(arguments: &str) -> Vec<(String, String)> {
     vars
 }
 
+/// The balanced `(…)` argument list of a loop directive whose opening `(` is at
+/// byte `open` on line `start_line`, joining continuation lines when the header
+/// wraps across physical lines. Returns the argument substring **including** the
+/// outer parens (interior runs of whitespace between joined lines collapsed to a
+/// single space), or `None` if the parens never balance before end of file.
+///
+/// Two reasons the parens must be balanced rather than regex-captured:
+/// - An iterable containing a call — `@foreach($users->where('active', true) as
+///   $user)` — would truncate at the first `)` under a `\([^)]*\)` regex, losing
+///   the ` as $user` tail.
+/// - A long header is routinely broken across lines:
+///   `@foreach($users->where('active', true)` ⏎ `    as $user)`. A per-line scan
+///   gives up at the first line end.
+///
+/// In both cases the binding goes unrecognized, the loop scope turns invisible,
+/// and a rename inside it silently clobbers the whole file — the file-scope
+/// fallback admits every occurrence (issue #55). Parens inside single/double-
+/// quoted strings are ignored so a string argument can't throw off the depth
+/// count. Reads forward only as far as needed for the depth to return to zero.
+fn balanced_directive_arguments(lines: &[&str], start_line: usize, open: usize) -> Option<String> {
+    // Fast path: balanced on the opening line — the overwhelmingly common case.
+    // Returns the exact source slice, byte-for-byte as the old per-line scan did.
+    if let Some(close) = matching_paren(lines[start_line], open) {
+        return Some(lines[start_line][open..=close].to_string());
+    }
+
+    // Slow path: the header wraps. Accumulate continuation lines (joined by a
+    // single space, so a binding split as `… as` ⏎ `$user` still parses) until
+    // the parens balance.
+    let mut buf = lines[start_line][open..].to_string();
+    for line in &lines[start_line + 1..] {
+        buf.push(' ');
+        buf.push_str(line.trim_start());
+        if let Some(close) = matching_paren(&buf, 0) {
+            buf.truncate(close + 1);
+            return Some(buf);
+        }
+    }
+    None
+}
+
+/// Given the byte index of an opening `(` in `s`, return the byte index of its
+/// matching `)`, balancing nested parens and ignoring any parens that sit
+/// inside single- or double-quoted string literals. Returns `None` when the
+/// parens are unbalanced on this line. `(`, `)`, `'`, `"`, `\` are ASCII, so
+/// the returned indices always land on char boundaries.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = open;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1; // skip the escaped byte
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+lazy_static! {
+    /// A loop directive head — `@foreach`/`@forelse`/`@for`/`@while` up to and
+    /// including its opening `(`. Shared by block parsing and broken-header
+    /// detection.
+    static ref LOOP_HEAD_RE: Regex =
+        Regex::new(r#"@(foreach|forelse|for|while)\s*\("#).unwrap();
+}
+
 /// Find all loop blocks in Blade content and their boundaries.
 /// Returns a list of loop blocks with start/end lines and extracted variables.
 pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
     lazy_static! {
-        static ref LOOP_START_RE: Regex =
-            Regex::new(r#"@(foreach|forelse|for|while)\s*(\([^)]*\))"#).unwrap();
         static ref LOOP_END_RE: Regex =
             Regex::new(r#"@(endforeach|endforelse|endfor|endwhile)"#).unwrap();
     }
 
+    let lines: Vec<&str> = content.lines().collect();
     let mut blocks = Vec::new();
     let mut open_loops: Vec<(BladeLoopType, Vec<(String, String)>, Option<String>, usize)> =
         Vec::new();
 
-    for (line_idx, line) in content.lines().enumerate() {
-        for caps in LOOP_START_RE.captures_iter(line) {
-            let directive = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let arguments = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-            let (loop_type, variables, iterable) = match directive {
+    for line_idx in 0..lines.len() {
+        let line = lines[line_idx];
+        for caps in LOOP_HEAD_RE.captures_iter(line) {
+            let Some(directive) = caps.get(1) else {
+                continue;
+            };
+            // The opening paren is the final byte of the whole match; the
+            // argument list may continue onto following lines.
+            let open = caps.get(0).unwrap().end() - 1;
+            let Some(arguments) = balanced_directive_arguments(&lines, line_idx, open) else {
+                continue;
+            };
+            let (loop_type, variables, iterable) = match directive.as_str() {
                 "foreach" => (
                     BladeLoopType::Foreach,
-                    parse_foreach_variables(arguments),
-                    parse_foreach_iterable(arguments),
+                    parse_foreach_variables(&arguments),
+                    parse_foreach_iterable(&arguments),
                 ),
                 "forelse" => (
                     BladeLoopType::Forelse,
-                    parse_foreach_variables(arguments),
-                    parse_foreach_iterable(arguments),
+                    parse_foreach_variables(&arguments),
+                    parse_foreach_iterable(&arguments),
                 ),
-                "for" => (BladeLoopType::For, parse_for_variables(arguments), None),
+                "for" => (BladeLoopType::For, parse_for_variables(&arguments), None),
                 "while" => (BladeLoopType::While, Vec::new(), None),
                 _ => continue,
             };
@@ -160,6 +278,29 @@ pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
     }
 
     blocks
+}
+
+/// 0-based line of every loop directive head whose parenthesised argument list
+/// never balances — a syntactically broken header (typically a missing `)`).
+/// [`find_loop_blocks`] silently drops such a head (it can't form a block), so
+/// the scope structure below it is unreliable. The scope-aware rename uses this
+/// to fail closed — treating everything from a broken header onward as
+/// unresolved — rather than renaming file-wide. A header that merely *wraps*
+/// across lines still balances (via [`balanced_directive_arguments`]) and is
+/// never flagged; only genuinely unclosed parens are.
+pub fn unbalanced_loop_head_lines(content: &str) -> Vec<usize> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    for line_idx in 0..lines.len() {
+        for caps in LOOP_HEAD_RE.captures_iter(lines[line_idx]) {
+            let open = caps.get(0).unwrap().end() - 1;
+            if balanced_directive_arguments(&lines, line_idx, open).is_none() {
+                out.push(line_idx);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Get all loop blocks that enclose the given cursor position.
