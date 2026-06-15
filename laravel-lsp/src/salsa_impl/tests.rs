@@ -1323,7 +1323,7 @@ fn flux_hover_without_vendor_file_shows_file_not_found() {
         crate::hover::source_link(&p.to_string_lossy(), url.as_str(), None)
     });
     let trailer = if link.is_none() {
-        Some("*(file not found)*")
+        Some(crate::hover::FILE_NOT_FOUND_TRAILER)
     } else {
         None
     };
@@ -1334,7 +1334,7 @@ fn flux_hover_without_vendor_file_shows_file_not_found() {
     });
 
     assert!(
-        rendered.contains("*(file not found)*"),
+        rendered.contains(crate::hover::FILE_NOT_FOUND_TRAILER),
         "absent flux source must render the file-not-found trailer: {rendered}",
     );
     assert!(
