@@ -18147,7 +18147,7 @@ async fn classify_with_decl_fallback(
     // Fallback path: route-name declarations live in `routes/*.php` and
     // aren't tagged by php.scm. Use the mtime-cached decl walker so
     // subsequent invocations don't re-parse the file.
-    if !is_in_routes_dir(file_path, root) {
+    if !is_in_routes_dir(root, file_path) {
         // A Folio page's `name('...')` helper declares its route name, but the
         // page lives outside `routes/` and the bare helper isn't tagged by
         // php.scm. If the cursor sits on that call, resolve it to the page's
@@ -18230,29 +18230,29 @@ async fn decl_range_at(
     None
 }
 
-/// Heuristic: should the declaration-fallback walk run for this file?
+/// Should the declaration-fallback walk run for this file? Gates the
+/// (potentially expensive) route-name decl walk on the file being a
+/// conventional route file under the project root's own `routes/` directory.
 ///
-/// Route-name declarations (`->name('home')`) live in the project's
-/// `routes/` directory, so we gate the (potentially expensive) decl walk on
-/// the file living there. There are two modes:
+/// When the root is known (`Some`) the check is precise: the file's *immediate
+/// parent* must be exactly `<root>/routes`, so `routes/web.php` and
+/// `routes/api.php` match. Anything nested deeper does not — a Folio page at
+/// `routes/pages/about.php` (parent `<root>/routes/pages`) is rejected, keeping
+/// the Folio branch in `classify_with_decl_fallback` reachable (issue #105), as
+/// is a package's `vendor/.../routes/web.php` or any `routes` component outside
+/// `<root>/routes` (issue #98). This immediate-parent test subsumes the earlier
+/// `starts_with(<root>/routes)` check from #98: it still rejects every deeper
+/// `routes` component, and additionally rejects pages nested *below*
+/// `<root>/routes` — which `starts_with` wrongly accepted.
 ///
-/// - **Root known (`Some`)** — precise: the file's *immediate parent* must be
-///   exactly `<root>/routes`. So `routes/web.php` matches, but a Folio page
-///   mounted at `routes/pages/about.php` does **not** — its parent is
-///   `routes/pages`. This keeps the Folio branch in
-///   `classify_with_decl_fallback` reachable for pages that happen to sit
-///   under `routes/` (issue #105); the old broad check matched any `routes`
-///   component and silently swallowed them.
-/// - **Root unknown (`None`)** — fall back to the broad heuristic: any path
-///   component named `routes`. Without a root we can't anchor the match, so
-///   we keep the original permissive behavior rather than miss real route
-///   files.
-fn is_in_routes_dir(path: &Path, root: Option<&Path>) -> bool {
+/// When the root is unknown (`None`) it returns `false` so the walk never
+/// triggers without a root to anchor against (issue #98). The earlier broad
+/// "any `routes` component" fallback was the source of the false-positives #98
+/// removed, so it is deliberately not reinstated.
+fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
     match root {
-        Some(root) => path.parent() == Some(root.join("routes").as_path()),
-        None => path
-            .components()
-            .any(|c| c.as_os_str() == std::ffi::OsStr::new("routes")),
+        Some(r) => path.parent() == Some(r.join("routes").as_path()),
+        None => false,
     }
 }
 

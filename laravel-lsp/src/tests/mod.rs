@@ -15,7 +15,7 @@ mod loop_variable_resolution;
 mod rename_integration;
 mod route_binding_resolution;
 mod route_diagnostics;
-mod routes_dir_scoping;
+mod routes_dir_gate;
 mod slot_variable_resolution;
 mod translation_namespace_check;
 mod vite_completion_context;
