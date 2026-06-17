@@ -14,13 +14,21 @@
 //!   symlink whose link path is textually inside the root but whose target is
 //!   missing (issues #55, #130, #134, #155). Used by `main.rs` and
 //!   `slot_navigation.rs`.
-//! - [`path_within_root_lexical`] falls back to a `normalize_path`-based lexical
-//!   prefix check. It is for *speculative* candidate paths that don't exist on
-//!   disk yet (so they can't canonicalize) — fail-closing them would drop every
-//!   not-yet-created candidate. Used by `salsa_impl.rs`'s component-candidate
-//!   filter, which must admit such paths while still refusing interior-`..`
-//!   escapes (`normalize_path` collapses `..`/`.` before the prefix test,
-//!   because `Path::starts_with` is component-wise and does NOT resolve `..`).
+//! - [`path_within_root_lexical`] gates on a `normalize_path`-collapsed
+//!   `starts_with` check that **never canonicalizes the candidate**, so an
+//!   out-of-root candidate is refused without ever being probed on disk (issue
+//!   #145). The check tests the candidate against the root as given and, only if
+//!   that fails, against the root's canonicalized form — canonicalizing the
+//!   *root* (a trusted in-root path) is not an oracle and tolerates the macOS
+//!   `/var`→`/private/var` symlinked-root case. A candidate that *is* lexically
+//!   in-root is then canonicalized to reject symlink escapes, falling back to the
+//!   already-proven lexical result for *speculative* candidates that don't exist
+//!   on disk yet (so they can't canonicalize) — fail-closing those would drop
+//!   every not-yet-created candidate. Used by `salsa_impl.rs`'s
+//!   component-candidate filter, which must admit such paths while still refusing
+//!   interior-`..` escapes (`normalize_path` collapses `..`/`.` before the prefix
+//!   test, because `Path::starts_with` is component-wise and does NOT resolve
+//!   `..`).
 
 use std::path::Path;
 
@@ -52,16 +60,47 @@ pub fn path_within_root(path: &Path, root: &Path) -> bool {
     canonical_containment(path, root).unwrap_or(false)
 }
 
-/// True if `path` is contained within `root`, with a **lexical** fallback for
-/// paths that can't be canonicalized. When canonicalization fails, the path is
-/// `normalize_path`-collapsed (interior `..`/`.` resolved) and tested against
-/// `root` with `starts_with`. This admits speculative candidates that don't yet
-/// exist on disk — the candidate filter in `salsa_impl.rs` relies on that — while
-/// still refusing a candidate whose normalized form escapes the root. Not a
-/// security guard: callers that read or emit the path must use
-/// [`path_within_root`] instead.
+/// True if `path` is contained within `root`, gated by a **lexical** check that
+/// never `canonicalize()`s the candidate, so an out-of-root candidate is rejected
+/// *before* any `stat`/`realpath` probe of it — closing the out-of-root existence
+/// oracle that an upfront `canonicalize()` of the candidate would leak (issue
+/// #145).
+///
+/// The candidate is `normalize_path`-collapsed (interior `..`/`.` resolved) and
+/// tested with `starts_with` against the root — first as given, and only if that
+/// fails, against the root's canonicalized form. Canonicalizing the *root* (a
+/// trusted, in-root path) is not an oracle; it just tolerates the macOS
+/// `/var`→`/private/var` symlinked-root case, where an in-root candidate carries
+/// the resolved prefix that the raw `root` lacks. A candidate under neither form
+/// is out-of-root and is refused without ever being probed.
+///
+/// A candidate that *is* lexically inside the root is then verified by
+/// canonicalizing it — rejecting symlink escapes (a real target resolving outside
+/// the root) and preserving the #55/#134 symlink behaviour. A speculative
+/// candidate that doesn't exist on disk yet can't be canonicalized — already
+/// proven lexically contained, it is admitted, which the candidate filter in
+/// `salsa_impl.rs` relies on. Not a security guard for paths that will be read or
+/// emitted: those must use [`path_within_root`], which is fail-closed.
 pub fn path_within_root_lexical(path: &Path, root: &Path) -> bool {
-    canonical_containment(path, root).unwrap_or_else(|| normalize_path(path).starts_with(root))
+    let normalized = normalize_path(path);
+
+    // Lexical gate — never canonicalizes the candidate. A path under neither the
+    // root as given nor its symlink-resolved form is out-of-root and refused with
+    // no probe of it (the existence oracle issue #145 closes). Canonicalizing the
+    // root only tolerates the macOS `/var`→`/private/var` symlinked-root case.
+    let lexically_in_root = normalized.starts_with(root)
+        || root
+            .canonicalize()
+            .map(|real_root| normalized.starts_with(&real_root))
+            .unwrap_or(false);
+    if !lexically_in_root {
+        return false;
+    }
+
+    // Lexically in-root: canonicalize the candidate to reject symlink escapes; a
+    // speculative not-yet-created candidate (canonicalize fails) is admitted,
+    // already proven lexically contained above.
+    canonical_containment(path, root).unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -145,6 +184,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn lexical_reject_precedes_canonicalize_for_out_of_root_candidate() {
+        // Prove the lexical-reject branch fires BEFORE any `canonicalize()`
+        // syscall (issue #145 — close the out-of-root existence oracle). The
+        // candidate is an out-of-root symlink that, *if* canonicalized, would
+        // resolve back INSIDE the root. So the guard can only reject it by
+        // running the lexical check first: a `false` result proves no disk probe
+        // of the out-of-root path decided the outcome. This is distinct from
+        // merely asserting `None` — under the old canonicalize-first order this
+        // exact path would be admitted (`true`).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        let views = root.join("resources").join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let real = views.join("card.blade.php");
+        std::fs::write(&real, "{{ $x }}").unwrap();
+
+        // A symlink OUTSIDE the root pointing at the real in-root file.
+        let outside_link = tmp.path().join("outside-link.blade.php");
+        std::os::unix::fs::symlink(&real, &outside_link).unwrap();
+
+        // Preconditions: the link is lexically out-of-root, but canonicalizes to
+        // a path inside it — so a canonicalize-first guard would *admit* it.
+        assert!(
+            !outside_link.starts_with(&root),
+            "the link path is lexically outside the root"
+        );
+        assert_eq!(
+            outside_link.canonicalize().unwrap(),
+            real.canonicalize().unwrap(),
+            "the link resolves back inside the root"
+        );
+
+        // Lexical reject wins → the out-of-root candidate is refused without the
+        // canonicalize() syscall ever deciding it.
+        assert!(
+            !path_within_root_lexical(&outside_link, &root),
+            "an out-of-root candidate must be rejected lexically, before any disk probe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn guard_is_fail_closed_on_dangling_under_root_symlink() {
         // A symlink at `<root>/dangling` whose target was never created:
         // `canonicalize` fails, so the fail-closed guard must refuse it even
@@ -168,6 +249,95 @@ mod tests {
         assert!(
             !path_within_root(&dangling, root.path()),
             "a dangling under-root symlink must be refused — the guard is fail-closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_admits_in_root_candidate_under_symlinked_root() {
+        // The macOS `/var`→`/private/var` symlinked-root tolerance (AC #2). When
+        // the root is given as a symlink but the candidate carries the *resolved*
+        // prefix, the only thing that admits it is the gate's `root.canonicalize()`
+        // leg (`:91-95`) — canonicalizing the *trusted root* is not an oracle. If
+        // that leg is ever dropped or inverted, in-root component goto-definition
+        // silently breaks on macOS while the rest of the suite stays green.
+        let tmp = TempDir::new().unwrap();
+        let real_root = tmp.path().join("real-project");
+        std::fs::create_dir_all(&real_root).unwrap();
+
+        // Build the candidate under the root's *canonical* (symlink-resolved) form,
+        // mirroring how macOS hands the LSP a `/private/var/...` candidate while the
+        // workspace root is the `/var/...` symlink.
+        let real_canonical = real_root.canonicalize().unwrap();
+        let views = real_canonical.join("resources").join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let candidate = views.join("card.blade.php");
+        std::fs::write(&candidate, "{{ $x }}").unwrap();
+
+        // Root passed as a *symlink* pointing at the real root.
+        let symlink_root = tmp.path().join("link-project");
+        std::os::unix::fs::symlink(&real_root, &symlink_root).unwrap();
+
+        // Preconditions: the candidate is NOT lexically under the root as given —
+        // so the first `starts_with(root)` leg fails — yet the symlink root
+        // canonicalizes to the candidate's prefix, so only the
+        // `root.canonicalize()` leg can admit it.
+        assert!(
+            !candidate.starts_with(&symlink_root),
+            "candidate must not be lexically under the symlink root as given"
+        );
+        assert_eq!(
+            symlink_root.canonicalize().unwrap(),
+            real_canonical,
+            "the symlink root must canonicalize to the real root"
+        );
+
+        assert!(
+            path_within_root_lexical(&candidate, &symlink_root),
+            "an in-root candidate under a symlinked root must be admitted via the root-canonicalize leg"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_refuses_in_root_symlink_escaping_the_root() {
+        // AC #2's "no containment downgrade" (#55/#134): a symlink whose *link
+        // path* is lexically inside the root but whose target resolves OUTSIDE it
+        // must still be refused by the lexical guard. The lexical gate admits the
+        // link path, but the candidate-canonicalize step
+        // (`canonical_containment`, `:103`) catches the escape — this asserts that
+        // directly on `path_within_root_lexical`, not just on the fail-closed
+        // `path_within_root`.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A real file OUTSIDE the root.
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = outside_dir.join("secret.blade.php");
+        std::fs::write(&secret, "{{ $x }}").unwrap();
+
+        // An under-root symlink whose target escapes the root.
+        let escaping_link = root.join("escape.blade.php");
+        std::os::unix::fs::symlink(&secret, &escaping_link).unwrap();
+
+        // Preconditions: the link path is lexically inside the root (it passes the
+        // lexical gate), but it canonicalizes to a path outside the root.
+        assert!(
+            escaping_link.starts_with(&root),
+            "the link path is lexically inside the root"
+        );
+        let link_target = escaping_link.canonicalize().unwrap();
+        let real_root = root.canonicalize().unwrap();
+        assert!(
+            !link_target.starts_with(&real_root),
+            "the link's real target escapes the root"
+        );
+
+        assert!(
+            !path_within_root_lexical(&escaping_link, &root),
+            "an in-root symlink whose target escapes the root must be refused — no containment downgrade"
         );
     }
 }
