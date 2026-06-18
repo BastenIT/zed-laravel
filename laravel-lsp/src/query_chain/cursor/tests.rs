@@ -540,6 +540,77 @@ fn eloquent_static_with_first_arg_resolves_to_relation_completion() {
     assert_eq!(ctx.effective_model.as_deref(), Some("User"));
 }
 
+// ---- relation hops (issue #211) ------------------------------------------
+
+#[test]
+fn unknown_relation_method_call_queues_a_pending_hop() {
+    // `competitions()` isn't a known builder method, so in EloquentBuilder mode
+    // the walker queues it as a relation hop to resolve against the model. Mode
+    // stays EloquentBuilder (a relation method returns a builder).
+    let ctx = detect("User::query()->competitions()->whereIn('ty|pe', ['x']);").expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+    assert!(
+        ctx.pending_relation_hops
+            .contains(&"competitions".to_string()),
+        "competitions() should be queued as a relation hop; got {:?}",
+        ctx.pending_relation_hops
+    );
+}
+
+#[test]
+fn known_builder_methods_do_not_queue_relation_hops() {
+    // A chain of recognised builder methods queues no relation hops.
+    let ctx = detect("User::where('id', 1)->orderBy('id')->where('em|');").expect("ctx");
+    assert!(
+        ctx.pending_relation_hops.is_empty(),
+        "recognised methods must not queue hops; got {:?}",
+        ctx.pending_relation_hops
+    );
+}
+
+#[test]
+fn eloquent_static_starter_methods_do_not_queue_relation_hops() {
+    // `withTrashed`, `limit` & friends live *only* in ELOQUENT_STATIC_STARTERS,
+    // so without that table in `is_known_builder_method` they would be mis-queued
+    // as relation-hop candidates mid-chain. Only the genuine relation accessor
+    // (`competitions`) may be queued — not the recognised builder methods that
+    // precede it.
+    let ctx =
+        detect("User::query()->withTrashed()->limit(10)->competitions()->where('ty|pe', 'x');")
+            .expect("ctx");
+    assert_eq!(
+        ctx.pending_relation_hops,
+        vec!["competitions".to_string()],
+        "only the relation accessor should be queued; got {:?}",
+        ctx.pending_relation_hops
+    );
+}
+
+#[test]
+fn relation_property_receiver_starts_collection_with_pending_hop() {
+    // `$user->competitions->where('|')` — the relation read as a property is a
+    // Collection of the related model; the property name is the first pending
+    // hop and the chain runs in EloquentCollection mode.
+    let ctx = detect(
+        "use App\\Models\\User;\n/** @var User $user */\n$user->competitions->where('ty|pe', 'x');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::EloquentCollection);
+    assert_eq!(ctx.effective_model.as_deref(), Some("App\\Models\\User"));
+    assert_eq!(ctx.pending_relation_hops, vec!["competitions".to_string()]);
+}
+
+#[test]
+fn relation_property_receiver_without_known_base_type_is_unresolved() {
+    // No `@var` / typed param for `$user` → base type unknown → no context
+    // (completion silently no-ops rather than guessing the model).
+    assert!(
+        detect("$user->competitions->where('ty|pe', 'x');").is_none(),
+        "an untyped base variable must not resolve to a context"
+    );
+}
+
 #[test]
 fn eloquent_static_where_has_first_arg_resolves_to_closure_carrier() {
     // `User::whereHas('po|', closure)` — `whereHas` is in CLOSURE_CARRIERS
