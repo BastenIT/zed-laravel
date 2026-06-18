@@ -2003,6 +2003,18 @@ struct LaravelLanguageServer {
     /// schedule call cancels the previous timer, so a burst of saves
     /// produces one disk write after the burst settles.
     magic_cache_save_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Dominant Inertia page extension (`vue` / `tsx` / `jsx` / `svelte`),
+    /// detected once at startup by counting files under `resources/js/Pages/`.
+    /// Used as the default for the "create page" code action and to break
+    /// ambiguous goto-definition resolution. Issue #10.
+    ///
+    /// Two-level option so "detected, no Inertia" is distinct from "not yet
+    /// detected" — without it, a non-Inertia project's `None` would trigger a
+    /// full directory walk on *every* goto/hover/diagnostic:
+    ///   - `None`          → startup detection hasn't run yet
+    ///   - `Some(None)`    → detection ran; project has no Inertia pages
+    ///   - `Some(Some(e))` → detected dominant extension `e`
+    inertia_default_ext: Arc<RwLock<Option<Option<String>>>>,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -2120,6 +2132,9 @@ enum FileActionType {
     EnvVar,
     /// Laravel Pennant feature class
     Feature,
+    /// Inertia.js page file under resources/js/Pages/ (issue #10). The target
+    /// extension (`.vue`/`.tsx`/`.jsx`/`.svelte`) is carried on `target_path`.
+    InertiaPage,
 }
 
 /// Represents a file creation action parsed from a diagnostic
@@ -2144,7 +2159,21 @@ impl FileAction {
             None => return Vec::new(),
         };
 
-        if message.starts_with("View file not found") {
+        if message.starts_with("Inertia page not found") {
+            vec![FileAction {
+                action_type: FileActionType::InertiaPage,
+                name: LaravelLanguageServer::extract_name_from_diagnostic(
+                    message,
+                    "Inertia page not found: '",
+                    "'",
+                )
+                .unwrap_or("Page")
+                .to_string(),
+                target_path: PathBuf::from(target_path),
+                file_exists: false,
+                copy_from: None,
+            }]
+        } else if message.starts_with("View file not found") {
             vec![FileAction {
                 action_type: FileActionType::View,
                 name: LaravelLanguageServer::extract_name_from_diagnostic(
@@ -2360,6 +2389,17 @@ impl FileAction {
                 // Convert the feature key to PascalCase for the class name
                 let class_name = feature_key_to_class_name(&self.name);
                 format!("Create feature class: {}", class_name)
+            }
+            FileActionType::InertiaPage => {
+                // Name the framework after the target extension so the action
+                // reads "Create page (Vue / React / Svelte): <name>".
+                let framework = match self.target_path.extension().and_then(|e| e.to_str()) {
+                    Some("vue") => "Vue",
+                    Some("tsx") | Some("jsx") => "React",
+                    Some("svelte") => "Svelte",
+                    _ => "page",
+                };
+                format!("Create page ({}): {}", framework, self.name)
             }
         }
     }
@@ -4028,6 +4068,7 @@ impl LaravelLanguageServer {
                 laravel_lsp::view_var_index::ViewVarIndex::new(),
             )),
             magic_cache_save_handle: Arc::new(RwLock::new(None)),
+            inertia_default_ext: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -8162,6 +8203,111 @@ impl LaravelLanguageServer {
         }
 
         // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
+    }
+
+    /// Check if the cursor sits inside the page-name string of an Inertia call
+    /// (issue #10) and, if so, return the partial page name plus the text range
+    /// to replace. Mirrors [`Self::get_view_call_context`] but for Inertia's
+    /// three call sites:
+    ///
+    /// - `inertia('Page')` — the helper function.
+    /// - `Inertia::render('Page', $props)` — the facade. The `rfind` also
+    ///   catches the fully-qualified `\Inertia\Inertia::render('Page')` form,
+    ///   since that string ends with `Inertia::render(`.
+    /// - `Route::inertia('/path', 'Page')` — the page name is the *second*
+    ///   argument (after the URI), handled specially like `Route::view`.
+    fn get_inertia_call_context(line_text: &str, character: u32) -> Option<StringContext> {
+        // `character` is an LSP code-point column, not a byte offset. Route it
+        // through `char_col_to_byte_offset` (like every sibling `*_context`
+        // helper) so the slice below always lands on a char boundary — a raw
+        // `&line_text[..character]` panics on any line with a multibyte char
+        // before the cursor. The helper clamps a past-end column to
+        // `line_text.len()`, so the old out-of-bounds guard is unneeded.
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
+
+        let before_cursor = &line_text[..cursor];
+
+        let mut matches: Vec<(usize, char, usize)> = Vec::new();
+
+        // Facade: Inertia::render('Page' | "Page" — the page is the first
+        // argument and the class name is explicit, so a plain rfind suffices.
+        // (pattern_string, quote_char, pattern_length-including-quote)
+        for (pattern, quote, len) in [
+            ("Inertia::render('", '\'', 17),
+            ("Inertia::render(\"", '"', 17),
+        ] {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                matches.push((pos, quote, len));
+            }
+        }
+
+        // Helper: inertia('Page' | "Page". The literal `inertia(` is also a
+        // substring of `Route::inertia(` — whose page name is the *second*
+        // argument, handled separately below — so guard against matching that
+        // method call (and any `…inertia(` identifier) by requiring the char
+        // before `inertia` not to be part of a `::`/identifier. A real global
+        // helper call sits at line start or after a non-identifier delimiter.
+        for (pattern, quote, len) in [("inertia('", '\'', 9), ("inertia(\"", '"', 9)] {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let is_global_helper = match pos.checked_sub(1) {
+                    None => true,
+                    Some(i) => {
+                        let prev = before_cursor.as_bytes()[i];
+                        prev != b':' && prev != b'_' && !prev.is_ascii_alphanumeric()
+                    }
+                };
+                if is_global_helper {
+                    matches.push((pos, quote, len));
+                }
+            }
+        }
+
+        // Route::inertia('/path', 'Page') — the page name is the second
+        // argument. Same shape as the Route::view handling above.
+        if let Some(route_pos) = before_cursor.rfind("Route::inertia(") {
+            let after_route = &before_cursor[route_pos + 15..];
+            if let Some(comma_pos) = after_route.find(',') {
+                let after_comma = &after_route[comma_pos + 1..];
+                let trimmed = after_comma.trim_start();
+                if let Some(first_char) = trimmed.chars().next() {
+                    if first_char == '\'' || first_char == '"' {
+                        let quote_char = first_char;
+                        let quote_pos_in_after_comma = after_comma.find(quote_char).unwrap();
+                        let start = route_pos + 15 + comma_pos + 1 + quote_pos_in_after_comma + 1;
+                        if start <= cursor {
+                            let content = &before_cursor[start..];
+                            if !content.contains(quote_char) {
+                                matches.push((start - 1, quote_char, 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Closest match to the cursor wins.
+        let (pos, quote_char, pattern_len) = matches.into_iter().max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Bail if the string already closed before the cursor.
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
         let end_col = Self::find_string_end(line_text, start_pos, quote_char);
 
         Some(StringContext {
@@ -12315,6 +12461,18 @@ impl LaravelLanguageServer {
         completions
     }
 
+    /// Every Inertia page under `resources/js/Pages/`, as `/`-nested page names
+    /// without extension (issue #10). Drives completion inside the three Inertia
+    /// call sites. Already sorted and de-duplicated by [`inertia::list_pages`].
+    async fn get_all_inertia_pages(&self) -> Vec<String> {
+        use laravel_lsp::inertia;
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        inertia::list_pages(&root)
+    }
+
     /// Get all Blade component names from component directories for autocomplete
     async fn get_all_blade_components(
         &self,
@@ -13237,6 +13395,7 @@ impl LaravelLanguageServer {
                 | FileActionType::ConfigPhp
                 | FileActionType::EnvVar
                 | FileActionType::BladeComponentWithClass
+                | FileActionType::InertiaPage
         ) {
             return Self::fallback_template(action);
         }
@@ -13272,7 +13431,8 @@ impl LaravelLanguageServer {
             | FileActionType::TranslationJson
             | FileActionType::ConfigPhp
             | FileActionType::EnvVar
-            | FileActionType::BladeComponentWithClass => {
+            | FileActionType::BladeComponentWithClass
+            | FileActionType::InertiaPage => {
                 return Self::fallback_template(action);
             }
         };
@@ -13422,6 +13582,23 @@ class {}
 "#,
                     class_name
                 )
+            }
+            FileActionType::InertiaPage => {
+                // Stub matches the target extension: a Single-File Component for
+                // Vue/Svelte, a minimal default-export component for React
+                // (.tsx/.jsx). The last path segment becomes the component name.
+                let component = action.name.rsplit('/').next().unwrap_or(&action.name);
+                match action.target_path.extension().and_then(|e| e.to_str()) {
+                    Some("vue") => {
+                        "<script setup lang=\"ts\">\n</script>\n\n<template>\n    <div></div>\n</template>\n".to_string()
+                    }
+                    Some("svelte") => "<script lang=\"ts\">\n</script>\n\n<div></div>\n".to_string(),
+                    // React (.tsx / .jsx) and any other extension.
+                    _ => format!(
+                        "export default function {}() {{\n    return <div></div>;\n}}\n",
+                        Self::kebab_to_pascal_case(component)
+                    ),
+                }
             }
             FileActionType::TranslationPhp => {
                 // For PHP files, the key is the nested key (e.g., "welcome" from "messages.welcome")
@@ -15615,6 +15792,7 @@ return [
             magic_deps: self.magic_deps.clone(),
             view_vars: self.view_vars.clone(),
             magic_cache_save_handle: self.magic_cache_save_handle.clone(),
+            inertia_default_ext: self.inertia_default_ext.clone(),
         }
     }
 
@@ -15660,6 +15838,56 @@ return [
             }
         }
         out
+    }
+
+    /// Build an "Inertia page not found" ERROR diagnostic for a single page
+    /// reference, or `None` when the page already resolves (`resolved == true`)
+    /// or its name is invalid (traversing) and so has no actionable create path
+    /// (issue #10).
+    ///
+    /// The filesystem probe lives in the caller (`resolve_inertia_file`); this is
+    /// the pure decision + message builder, mirroring
+    /// [`Self::route_not_found_diagnostics`] and [`Self::asset_diagnostic`] so the
+    /// ERROR-severity and "Expected at" contract is testable without a live
+    /// server. The "Expected at" path is built with the project's `dominant`
+    /// extension so the downstream create-page code action lands a file of the
+    /// right type.
+    fn inertia_not_found_diagnostic(
+        page_ref: &laravel_lsp::salsa_impl::InertiaReferenceData,
+        resolved: bool,
+        root: &Path,
+        dominant: Option<&str>,
+    ) -> Option<Diagnostic> {
+        if resolved {
+            return None;
+        }
+        // An invalid (traversing) page name yields no expected path; skip it
+        // rather than emit an unactionable diagnostic.
+        let expected_path = laravel_lsp::inertia::page_create_path(root, &page_ref.name, dominant)?;
+        Some(Diagnostic {
+            range: Range {
+                start: Position {
+                    line: page_ref.line,
+                    character: page_ref.column,
+                },
+                end: Position {
+                    line: page_ref.line,
+                    character: page_ref.end_column,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: None,
+            source: Some("laravel".to_string()),
+            message: format!(
+                "Inertia page not found: '{}'\nExpected at: {}",
+                page_ref.name,
+                expected_path.to_string_lossy()
+            ),
+            related_information: None,
+            tags: None,
+            code_description: None,
+            data: None,
+        })
     }
 
     /// Resolve an asset-helper reference to the absolute path the helper points
@@ -15960,6 +16188,25 @@ return [
                         data: None,
                     };
                     diagnostics.push(diagnostic);
+                }
+            }
+
+            // Check Inertia page references (issue #10). A page resolves to a
+            // JS/TS file under resources/js/Pages/; a missing one is always an
+            // ERROR. The "Expected at" path uses the dominant project extension
+            // so the create-page code action lands a file of the right type.
+            if !patterns.inertia_refs.is_empty() {
+                let dominant = self.inertia_dominant_extension().await;
+                for page_ref in &patterns.inertia_refs {
+                    let resolved = self.resolve_inertia_file(&page_ref.name).await.is_some();
+                    if let Some(diag) = Self::inertia_not_found_diagnostic(
+                        page_ref,
+                        resolved,
+                        &config.root,
+                        dominant.as_deref(),
+                    ) {
+                        diagnostics.push(diag);
+                    }
                 }
             }
 
@@ -16967,6 +17214,7 @@ return [
         // all patterns and lives in `hover::render`.
         let rendered = match pattern {
             PatternAtPosition::View(view) => self.hover_for_view(&view.name).await,
+            PatternAtPosition::Inertia(page) => self.hover_for_inertia(&page.name).await,
             // Pass `comp.name` (bare, without `x-` prefix) — `tag_name`
             // includes the prefix which would break path resolution.
             PatternAtPosition::Component(comp) => self.hover_for_component(&comp.name).await,
@@ -17043,6 +17291,27 @@ return [
                 language: hover::CodeLanguage::Php,
                 content: s,
             }),
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Inertia page — link to the resolved JS/TS page file under
+    /// `resources/js/Pages/`, or a not-found trailer (issue #10).
+    async fn hover_for_inertia(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let path = self.resolve_inertia_file(name).await;
+        let link = match &path {
+            Some(p) => Some(self.source_link(p, None).await),
+            None => None,
+        };
+        let trailer = if link.is_none() {
+            Some(hover::FILE_NOT_FOUND_TRAILER)
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
             source_link: link.as_deref(),
             trailer,
             ..Default::default()
@@ -18373,6 +18642,90 @@ return [
         None
     }
 
+    /// Resolve an Inertia page name to an existing file under
+    /// `resources/js/Pages/` (issue #10). Candidates are probed in
+    /// [`laravel_lsp::inertia::PAGE_EXTENSIONS`] priority order, but the
+    /// project's dominant extension is tried first so an ambiguous page (one
+    /// that exists as both `.vue` and `.tsx`) prefers the dominant one — and
+    /// emits a `warn!` (AC: "warn if ambiguous"). Uses the shared file-existence
+    /// cache (a 5-second TTL — see [`Self::file_exists_cached`]).
+    ///
+    /// This is the single shared resolution entry point for goto-definition,
+    /// hover, and the missing-page diagnostic, so the fail-closed containment
+    /// guard below covers all three at once: like
+    /// [`Self::create_view_location_from_salsa`] (issues #148/#130), a resolved
+    /// page must lie inside the project root before it can become a navigation
+    /// target. `resolve_page_candidates` only gates on the lexical
+    /// `path_within_root_lexical`; the security guard is the fail-closed
+    /// `path_within_root` applied here, after the existence probe.
+    async fn resolve_inertia_file(&self, name: &str) -> Option<PathBuf> {
+        use laravel_lsp::inertia;
+        let config = self.get_cached_config().await?;
+        let root = &config.root;
+
+        let mut candidates = inertia::resolve_page_candidates(root, name);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Float the dominant-extension candidate to the front so it wins an
+        // ambiguous match (AC: "prefer the dominant one").
+        if let Some(dom) = self.inertia_dominant_extension().await {
+            candidates.sort_by_key(|p| {
+                let is_dom = p.extension().and_then(|e| e.to_str()) == Some(dom.as_str());
+                // false (0) sorts before true (1), so negate: dominant first.
+                !is_dom as u8
+            });
+        }
+
+        // Probe every candidate, collecting the ones that both exist and lie
+        // inside the project root. The first (dominant-floated) survivor is the
+        // resolved file; more than one means the page is ambiguous (resolves to
+        // several extensions on disk) and we warn (AC: "warn if ambiguous").
+        let mut existing = Vec::new();
+        for path in candidates {
+            if !self.file_exists_cached(&path).await {
+                continue;
+            }
+            // Containment guard (issues #148/#130), fail-closed: refuse to hand
+            // the client a navigation target outside the project root. `continue`
+            // so a later in-root candidate can still resolve.
+            if !path_within_root(&path, root) {
+                continue;
+            }
+            existing.push(path);
+        }
+
+        if existing.len() > 1 {
+            warn!(
+                "⚠️  Inertia page '{}' is ambiguous — resolves to multiple extensions {:?}; preferring '{}'",
+                name,
+                existing
+                    .iter()
+                    .filter_map(|p| p.extension().and_then(|e| e.to_str()))
+                    .collect::<Vec<_>>(),
+                existing[0].display()
+            );
+        }
+
+        existing.into_iter().next()
+    }
+
+    /// The project's dominant Inertia page extension, detected at startup and
+    /// cached. The cache is a two-level option (see the `inertia_default_ext`
+    /// field): once detection has run, both the "has an extension" and the
+    /// "non-Inertia project" outcomes are memoized as `Some(_)`, so a
+    /// non-Inertia project never re-walks the directory on every
+    /// goto/hover/diagnostic. Only the pre-detection `None` falls back to an
+    /// on-demand walk (a request arriving before background init completes).
+    async fn inertia_dominant_extension(&self) -> Option<String> {
+        if let Some(detected) = self.inertia_default_ext.read().await.clone() {
+            return detected;
+        }
+        let root = self.root_path.read().await.clone()?;
+        laravel_lsp::inertia::detect_dominant_extension(&root)
+    }
+
     /// Same shape as [`Self::resolve_view_file`] but for Blade components.
     async fn resolve_component_file(&self, name: &str) -> Option<PathBuf> {
         let config = self.get_cached_config().await?;
@@ -18673,6 +19026,7 @@ fn pattern_range_at(
     let pat = patterns.find_at_position(line, column)?;
     let (l, start, end) = match pat {
         laravel_lsp::salsa_impl::PatternAtPosition::View(v) => (v.line, v.column, v.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Inertia(i) => (i.line, i.column, i.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Route(r) => (r.line, r.column, r.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::HelperIdentifier(h) => {
             (h.line, h.column, h.end_column)
@@ -19923,6 +20277,22 @@ impl LanguageServer for LaravelLanguageServer {
                 server.register_config_with_salsa(&root).await;
             }
 
+            // Detect the dominant Inertia page extension once, at startup, by
+            // counting files under resources/js/Pages/ (issue #10). Cached for
+            // the create-page code action and ambiguous goto resolution; stays
+            // None on non-Inertia projects. The walk is cheap relative to the
+            // file-indexing that follows, and runs off the request path.
+            {
+                let dom = laravel_lsp::inertia::detect_dominant_extension(&root);
+                if let Some(ext) = &dom {
+                    info!("🅸 Inertia detected — dominant page extension: .{}", ext);
+                }
+                // Wrap in `Some` to record that detection HAS run — `Some(None)`
+                // (non-Inertia project) is then distinct from the initial `None`,
+                // so we never re-walk the tree per request (issue #10).
+                *server.inertia_default_ext.write().await = Some(dom);
+            }
+
             // Register project files with Salsa for reference finding (if config available).
             // The progress handle is MOVED into register_project_files_with_salsa,
             // which forwards it into the spawned warming task — that task is
@@ -20433,6 +20803,21 @@ impl LanguageServer for LaravelLanguageServer {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
             };
+            // Inertia page files (resources/js/Pages/**/*.{vue,tsx,jsx,svelte})
+            // are not PHP — they never enter the Salsa pattern index, so the
+            // Salsa update/remove path below doesn't apply. A create/change/
+            // delete only needs to evict the file-existence cache entry so
+            // resolve_inertia_file (goto, hover, and the missing-page
+            // diagnostic) sees the new on-disk state immediately instead of
+            // waiting out the 5-second TTL (issue #10).
+            if laravel_lsp::inertia::is_page_file(&path) {
+                self.file_exists_cache.write().await.remove(&path);
+                match change.typ {
+                    FileChangeType::DELETED => deleted += 1,
+                    _ => created_or_changed += 1,
+                }
+                continue;
+            }
             // A Command class can live anywhere, but conventionally sits under a
             // `Commands/` directory (app or package). That heuristic keeps the
             // index fresh without rebuilding on every unrelated `.php` save.
@@ -20705,6 +21090,19 @@ impl LanguageServer for LaravelLanguageServer {
             PatternAtPosition::View(view) => {
                 debug!("Laravel: Found view: {}", view.name);
                 self.create_view_location_from_salsa(&view).await
+            }
+            PatternAtPosition::Inertia(page) => {
+                debug!("Laravel: Found Inertia page: {}", page.name);
+                self.resolve_inertia_file(&page.name)
+                    .await
+                    .and_then(|path| {
+                        Url::from_file_path(&path).ok().map(|uri| {
+                            GotoDefinitionResponse::Scalar(Location {
+                                uri,
+                                range: Range::default(),
+                            })
+                        })
+                    })
             }
             PatternAtPosition::Component(comp) => {
                 debug!("Laravel: Found component: {}", comp.name);
@@ -22854,6 +23252,62 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} view completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for Inertia page context: inertia('…'), Inertia::render('…'),
+            // or Route::inertia('/path', '…') (issue #10). Lists every page under
+            // resources/js/Pages/ without extension, filtered by the partial.
+            if let Some(inertia_ctx) = Self::get_inertia_call_context(line_text, position.character)
+            {
+                debug!(
+                    "   Inertia context, filter prefix: '{}'",
+                    inertia_ctx.prefix
+                );
+
+                let pages = self.get_all_inertia_pages().await;
+
+                let prefix_lower = inertia_ctx.prefix.to_lowercase();
+                let items: Vec<CompletionItem> = pages
+                    .into_iter()
+                    .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
+                    .map(|page| CompletionItem {
+                        label: page.clone(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: Some(format!("{}/{}", laravel_lsp::inertia::PAGES_DIR, page)),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&page)
+                                .summary("Inertia.js page.")
+                                .section(format!("Under: {}/", laravel_lsp::inertia::PAGES_DIR))
+                                .into_documentation(),
+                        ),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: inertia_ctx.start_col,
+                                },
+                                end: Position {
+                                    line: position.line,
+                                    character: inertia_ctx.end_col,
+                                },
+                            },
+                            new_text: page.clone(),
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                debug!("   Returning {} Inertia completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)
