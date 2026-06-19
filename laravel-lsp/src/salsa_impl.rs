@@ -3389,6 +3389,33 @@ pub struct BindingRegistrationData {
     pub priority: u8,
 }
 
+/// Pairs the class-hierarchy index (FQCN → file) with the in-actor container
+/// binding registry (binding key → concrete FQCN) behind the
+/// [`crate::member_resolver::ClassFileResolver`] seam, so the live query path
+/// (find-references fallback, hover, rename) types `app('key')` / `resolve('key')`
+/// receivers the same way the build pass does — without materializing the full
+/// class-file map a `SnapshotResolver` would need.
+struct ContainerAwareResolver<'a> {
+    index: &'a crate::class_hierarchy_index::ClassHierarchyIndex,
+    bindings: &'a HashMap<String, BindingRegistrationData>,
+    singletons: &'a HashMap<String, BindingRegistrationData>,
+}
+
+impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
+        crate::member_resolver::ClassFileResolver::class_file(self.index, fqcn)
+    }
+    fn binding_concrete(&self, key: &str) -> Option<String> {
+        // Bindings win over singletons on key collision (mirrors
+        // `handle_get_binding_by_name`); the concrete is normalized to the
+        // leading-backslash-free form the class index keys on.
+        self.bindings
+            .get(key)
+            .or_else(|| self.singletons.get(key))
+            .map(|b| b.concrete_class.trim_start_matches('\\').to_string())
+    }
+}
+
 /// Environment variable data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EnvVariableData {
@@ -3984,6 +4011,12 @@ pub enum SalsaRequest {
     /// magic-member index build (M4).
     SnapshotClassFiles {
         reply: oneshot::Sender<Arc<std::collections::HashMap<String, PathBuf>>>,
+    },
+    /// Snapshot the `binding key → concrete FQCN` map for the same out-of-actor
+    /// build, so `app('key')` / `resolve('key')` receivers resolve to their
+    /// bound class while indexing.
+    SnapshotBindings {
+        reply: oneshot::Sender<Arc<std::collections::HashMap<String, String>>>,
     },
     /// Snapshot every indexed class grouped by file, so warming can persist
     /// the hierarchy to the disk cache.
@@ -4631,6 +4664,23 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::SnapshotClassFiles { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot the container-binding registry as a `binding key → concrete
+    /// FQCN` map for the out-of-actor magic-member build. Mirrors
+    /// [`Self::snapshot_class_files`]: the build pass resolves `app('key')`
+    /// receivers against this owned copy without borrowing the actor.
+    pub async fn snapshot_bindings(
+        &self,
+    ) -> Result<Arc<std::collections::HashMap<String, String>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotBindings { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -5815,6 +5865,24 @@ impl SalsaActor {
                     }
                     let snapshot = self.class_files_snapshot.clone().unwrap_or_default();
                     let _ = reply.send(snapshot);
+                }
+                SalsaRequest::SnapshotBindings { reply } => {
+                    // Bindings number in the dozens, not thousands, so build
+                    // fresh each call — no cache to invalidate on service-
+                    // provider edits. Singletons first, then plain binds, so a
+                    // plain bind wins on key collision (mirrors the precedence
+                    // in `handle_get_binding_by_name`). Concrete FQCNs are
+                    // normalized to the leading-backslash-free form the class
+                    // index keys on.
+                    let mut map: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    for (key, reg) in self.sp_singletons.iter().chain(self.sp_bindings.iter()) {
+                        map.insert(
+                            key.clone(),
+                            reg.concrete_class.trim_start_matches('\\').to_string(),
+                        );
+                    }
+                    let _ = reply.send(Arc::new(map));
                 }
                 SalsaRequest::SnapshotHierarchyNodes { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
@@ -7441,6 +7509,7 @@ impl SalsaActor {
         // Blade-embedded refs may not locate, which is fine — the component
         // fallback below is text-based).
         let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let resolver = self.container_aware_resolver();
         if let Some(receiver) = tree
             .root_node()
             .descendant_for_byte_range(member_ref.receiver_byte_start, member_ref.receiver_byte_end)
@@ -7451,7 +7520,7 @@ impl SalsaActor {
                 member_ref.form,
                 bytes,
                 &aliases,
-                &self.class_hierarchy_index,
+                &resolver,
                 &mut classviews,
                 &project_root,
                 None, // query-time path — no dependency recording
@@ -7510,6 +7579,7 @@ impl SalsaActor {
         let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
 
         let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let resolver = self.container_aware_resolver();
         let receiver = tree.root_node().descendant_for_byte_range(
             member_ref.receiver_byte_start,
             member_ref.receiver_byte_end,
@@ -7526,7 +7596,7 @@ impl SalsaActor {
                 member_ref.form,
                 bytes,
                 &aliases,
-                &self.class_hierarchy_index,
+                &resolver,
                 &mut classviews,
                 &project_root,
                 None, // query-time path — no dependency recording
@@ -7543,7 +7613,7 @@ impl SalsaActor {
                         receiver,
                         bytes,
                         &aliases,
-                        &self.class_hierarchy_index,
+                        &resolver,
                         &mut classviews,
                         &project_root,
                     )?;
@@ -7620,6 +7690,7 @@ impl SalsaActor {
         let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
 
         let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let resolver = self.container_aware_resolver();
         let receiver = tree.root_node().descendant_for_byte_range(
             member_ref.receiver_byte_start,
             member_ref.receiver_byte_end,
@@ -7630,7 +7701,7 @@ impl SalsaActor {
             member_ref.form,
             bytes,
             &aliases,
-            &self.class_hierarchy_index,
+            &resolver,
             &mut classviews,
             &project_root,
             None, // query-time path — no dependency recording
@@ -7785,6 +7856,17 @@ impl SalsaActor {
             .get(name)
             .cloned()
             .or_else(|| self.sp_singletons.get(name).cloned())
+    }
+
+    /// A container-aware [`ClassFileResolver`](crate::member_resolver::ClassFileResolver)
+    /// over the actor's class index + binding registry, for the live query path
+    /// (find-references fallback, hover, rename).
+    fn container_aware_resolver(&self) -> ContainerAwareResolver<'_> {
+        ContainerAwareResolver {
+            index: &self.class_hierarchy_index,
+            bindings: &self.sp_bindings,
+            singletons: &self.sp_singletons,
+        }
     }
 
     /// Handle get view namespace by name (queries Salsa-parsed service providers)
