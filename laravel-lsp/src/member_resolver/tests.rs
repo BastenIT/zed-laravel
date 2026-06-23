@@ -2092,3 +2092,52 @@ function show($mystery) {
     );
     assert!(deps.is_empty(), "{deps:?}");
 }
+
+// ─── End-to-end: a closure-bound key resolves app('key')->member ───────────
+//
+// Proves the new tree-sitter binding walker feeds the SAME `concrete_class`
+// the class-concrete path does. A closure-derived concrete is a plain FQCN,
+// byte-identical to a class-const one, and PHP, Blade, and Volt converge on the
+// same `resolve_container_receiver` leaf that consumes it — so the PHP caller
+// below is representative of all three surfaces.
+
+#[test]
+fn closure_singleton_resolves_app_member_end_to_end() {
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let provider = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\ServiceProvider;
+use App\Models\Tenant;
+class AppServiceProvider extends ServiceProvider {
+    public function register(): void {
+        $this->app->singleton('currentTenant', fn () => Tenant::where('domain', request()->host())->first());
+    }
+}
+"#;
+    // Parse the provider exactly as the actor does, and read back the concrete
+    // the walker resolved for the closure binding.
+    let db = crate::salsa_impl::LaravelDatabase::default();
+    let file = crate::salsa_impl::ServiceProviderFile::new(
+        &db,
+        p.root.join("app/Providers/AppServiceProvider.php"),
+        0,
+        provider.to_string(),
+        2,
+    );
+    let parsed = crate::salsa_impl::parse_service_provider_source(&db, file, p.root.clone());
+    let concrete = parsed
+        .bindings(&db)
+        .iter()
+        .find(|b| b.abstract_name(&db).name(&db) == "currentTenant")
+        .map(|b| b.concrete_class(&db).clone())
+        .expect("currentTenant closure binding parsed");
+    assert_eq!(concrete, "App\\Models\\Tenant");
+
+    // Feed that concrete through the resolution engine the live container-aware
+    // resolver uses: `app('currentTenant')->logo` types to the bound model.
+    let resolver = tenant_bound_to(&p, &concrete);
+    let caller = "<?php $x = app('currentTenant')->logo;";
+    let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Accessor);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Tenant");
+}
