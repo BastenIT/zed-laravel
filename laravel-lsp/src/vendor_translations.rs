@@ -124,7 +124,7 @@ pub fn scan_vendor_translation_namespaces(root: &Path) -> HashMap<String, PathBu
         }
 
         extract_translations_from(&source, path, root, &mut namespaces);
-        extract_builder_translations_from(&source, path, &mut namespaces);
+        extract_builder_translations_from(&source, path, root, &mut namespaces);
     }
 
     namespaces
@@ -236,24 +236,28 @@ fn extract_translations_from(
         else {
             continue;
         };
-        // Resolve to the real on-disk path and refuse anything that escapes the
-        // project root. The four argument forms all capture an arbitrary string,
-        // so a crafted `loadTranslationsFrom('../../etc/passwd', 'ns')` could
-        // otherwise seed the map with an out-of-root directory the resolver would
-        // later read from — the same fail-closed path-traversal guard every other
-        // read site in this codebase applies (issue #248). `canonicalize()`
-        // failing (the target dir doesn't exist yet) drops the entry rather than
-        // storing an unresolved `..`-laden path; it re-enters the map on a later
-        // scan once the directory exists.
-        let Ok(resolved) = lang_dir.canonicalize() else {
-            continue;
-        };
-        if !crate::path_containment::path_within_root(&resolved, root) {
+        // Refuse anything that escapes the project root, but keep a not-yet-
+        // published in-root lang dir. The four argument forms all capture an
+        // arbitrary string, so a crafted `loadTranslationsFrom('../../etc', 'ns')`
+        // could otherwise seed the map with an out-of-root directory the resolver
+        // would later read from (issue #248). `path_within_root_lexical` refuses
+        // that escape — it collapses interior `..`/`.` and rejects an out-of-root
+        // candidate *before* any disk probe — while admitting a speculative in-root
+        // dir that doesn't exist yet. That admission matters: this map is built
+        // once and cached for the LSP's lifetime (`vendor_translation_namespaces_for`
+        // never re-scans it), so a fail-closed `canonicalize()` here would
+        // permanently drop every registration whose dir is absent at first scan —
+        // a fresh clone, pre-`vendor:publish`, or a mid-`composer install` package —
+        // the exact unpublished case this module exists to serve. The real read-time
+        // security is the fail-closed `path_within_root` at the read site
+        // (`translation_lookup::resolve_namespaced_in_dir`); this is the codebase's
+        // standard lexical-at-candidate / fail-closed-at-read split.
+        if !crate::path_containment::path_within_root_lexical(&lang_dir, root) {
             continue;
         }
         namespaces
             .entry(ns.as_str().to_string())
-            .or_insert(resolved);
+            .or_insert_with(|| crate::route_discovery::normalize_path(&lang_dir));
     }
 }
 
@@ -267,6 +271,7 @@ fn extract_translations_from(
 fn extract_builder_translations_from(
     source: &str,
     provider_path: &Path,
+    root: &Path,
     namespaces: &mut HashMap<String, PathBuf>,
 ) {
     if !BUILDER_HAS_TRANSLATIONS_RE.is_match(source) {
@@ -287,8 +292,19 @@ fn extract_builder_translations_from(
         return;
     };
     let lang_dir = provider_dir.join("../resources/lang");
-    let resolved = lang_dir.canonicalize().unwrap_or(lang_dir);
-    namespaces.entry(namespace).or_insert(resolved);
+    // Apply the same containment guard as `extract_translations_from` so the
+    // "every read site is guarded" invariant holds uniformly — this builder
+    // registration feeds the same merged map the goto/hover/diagnostic paths
+    // read. The builder dir is derived from the provider path so it is normally
+    // in-root, but the lexical guard refuses a `..` escape before any disk probe
+    // while preserving a not-yet-published in-root dir; the read site is
+    // fail-closed (issue #248).
+    if !crate::path_containment::path_within_root_lexical(&lang_dir, root) {
+        return;
+    }
+    namespaces
+        .entry(namespace)
+        .or_insert_with(|| crate::route_discovery::normalize_path(&lang_dir));
 }
 
 #[cfg(test)]

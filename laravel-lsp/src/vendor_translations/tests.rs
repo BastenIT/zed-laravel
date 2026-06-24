@@ -41,6 +41,39 @@ class BillingServiceProvider {
 }
 
 #[test]
+fn preserves_registration_for_not_yet_published_in_root_dir() {
+    // Regression (issue #248, second-review blocker): the namespace map is built
+    // once and cached for the LSP's lifetime, so a registration whose lang dir is
+    // absent at scan time — a fresh clone, a package pre-`vendor:publish`, or one
+    // mid-`composer install` — must NOT be dropped. It has to survive so the
+    // namespaced key resolves once the directory appears, without an editor
+    // restart. The lexical containment guard admits the speculative in-root dir
+    // while still refusing `..` escapes; the fail-closed read-site guard in
+    // `translation_lookup` provides the actual read-time security.
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "billing", "BillingServiceProvider");
+    // Deliberately do NOT create the lang dir on disk — this is the unpublished case.
+    fs::write(
+        &provider,
+        "<?php\nclass X { public function boot() { $this->loadTranslationsFrom(__DIR__.'/../resources/lang', 'billing'); } }\n",
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    let resolved = map
+        .get("billing")
+        .expect("a not-yet-published in-root registration must be preserved, not dropped");
+    assert!(
+        resolved.ends_with("resources/lang"),
+        "must store the registered in-root dir, got: {resolved:?}"
+    );
+    assert!(
+        !resolved.exists(),
+        "precondition: the registered dir must not exist on disk yet"
+    );
+}
+
+#[test]
 fn ignores_non_provider_php_files() {
     // A non-provider file with `loadTranslationsFrom` in a docblock should
     // be skipped by the filename gate.
@@ -89,10 +122,6 @@ fn captures_multiple_namespaces_across_packages() {
     let project = TempDir::new().unwrap();
     let p1 = fake_vendor_package(project.path(), "acme", "billing", "BillingServiceProvider");
     let p2 = fake_vendor_package(project.path(), "acme", "auth", "AuthServiceProvider");
-    // The registered lang dirs must exist on disk — the scan refuses any
-    // registration whose directory can't be canonicalized (issue #248).
-    fs::create_dir_all(p1.parent().unwrap().join("../lang")).unwrap();
-    fs::create_dir_all(p2.parent().unwrap().join("../lang")).unwrap();
     fs::write(
         &p1,
         "<?php\nclass X { public function boot() { $this->loadTranslationsFrom(__DIR__.'/../lang', 'billing'); } }\n",
@@ -123,10 +152,6 @@ fn first_registration_wins_on_namespace_conflict() {
     let project = TempDir::new().unwrap();
     let p1 = fake_vendor_package(project.path(), "first", "pkg", "FirstServiceProvider");
     let p2 = fake_vendor_package(project.path(), "second", "pkg", "SecondServiceProvider");
-    // Both registered lang dirs must exist — the scan refuses a registration
-    // whose directory can't be canonicalized (issue #248).
-    fs::create_dir_all(p1.parent().unwrap().join("../lang")).unwrap();
-    fs::create_dir_all(p2.parent().unwrap().join("../lang")).unwrap();
     fs::write(
         &p1,
         "<?php\nclass A { public function boot() { $this->loadTranslationsFrom(__DIR__.'/../lang', 'shared'); } }\n",
@@ -218,6 +243,41 @@ class ToolsServiceProvider extends PackageServiceProvider
     assert!(
         map.contains_key("tools"),
         "->name('laravel-tools') must register namespace 'tools', got {map:?}"
+    );
+}
+
+#[test]
+fn builder_preserves_registration_for_not_yet_published_in_root_dir() {
+    // The builder path (`->name()->hasTranslations()`) now carries the same
+    // lexical containment guard as the literal-call path (issue #248 follow-up).
+    // Its derived `../resources/lang` dir is always in-root, so the guard must
+    // admit it even when the directory doesn't exist yet — the registration is
+    // preserved exactly as the old `canonicalize().unwrap_or(lang_dir)` did,
+    // without weakening containment.
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "tools", "ToolsServiceProvider");
+    // Deliberately do NOT create resources/lang — the unpublished builder case.
+    fs::write(
+        &provider,
+        r#"<?php
+class ToolsServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme-tools')->hasTranslations();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    let resolved = map
+        .get("acme-tools")
+        .expect("a not-yet-published builder registration must be preserved");
+    assert!(
+        resolved.ends_with("resources/lang"),
+        "must store the builder's in-root lang dir, got: {resolved:?}"
     );
 }
 
@@ -442,9 +502,10 @@ fn refuses_registration_escaping_project_root() {
     // A crafted `loadTranslationsFrom` argument that climbs out of the project
     // root must never enter the namespace map — the resolver would otherwise read
     // translation files from outside the project tree (issue #248, path
-    // traversal). The escape target is created on disk so it canonicalizes
-    // successfully, proving the entry is rejected by the containment guard and
-    // not merely dropped because the directory is missing.
+    // traversal). The escape target is created on disk, so its rejection cannot be
+    // attributed to a missing directory: the lexical containment guard refuses it
+    // on root grounds alone (it collapses the interior `..` and sees the path land
+    // outside the root) even though the directory exists.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("project");
     fs::create_dir_all(&root).unwrap();

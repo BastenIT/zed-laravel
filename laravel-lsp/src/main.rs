@@ -14766,6 +14766,16 @@ return [
                 .and_then(|m| m.get(namespace).cloned())
                 .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
             let target = lang_dir.join("en").join(format!("{}.php", file_segment));
+            // Containment guard (issue #248), fail-closed and uniform with every
+            // sibling goto handler (e.g. `:14108`, `:14158`, `:14235`, `:14290`):
+            // both the fallback `lang_dir` (the raw `namespace` from the key) and
+            // the appended `file_segment` are user-controlled text after `::`, so a
+            // `..` sequence could otherwise resolve `target` outside the project
+            // root and hand the client an out-of-root navigation target. Refuse
+            // before the existence probe so no out-of-root path is even stat'd.
+            if !path_within_root(&target, root) {
+                return None;
+            }
             if self.file_exists_cached(&target).await {
                 if let Ok(target_uri) = Url::from_file_path(&target) {
                     let origin_selection_range = Range {
