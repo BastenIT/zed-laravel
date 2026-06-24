@@ -89,6 +89,10 @@ fn captures_multiple_namespaces_across_packages() {
     let project = TempDir::new().unwrap();
     let p1 = fake_vendor_package(project.path(), "acme", "billing", "BillingServiceProvider");
     let p2 = fake_vendor_package(project.path(), "acme", "auth", "AuthServiceProvider");
+    // The registered lang dirs must exist on disk — the scan refuses any
+    // registration whose directory can't be canonicalized (issue #248).
+    fs::create_dir_all(p1.parent().unwrap().join("../lang")).unwrap();
+    fs::create_dir_all(p2.parent().unwrap().join("../lang")).unwrap();
     fs::write(
         &p1,
         "<?php\nclass X { public function boot() { $this->loadTranslationsFrom(__DIR__.'/../lang', 'billing'); } }\n",
@@ -119,6 +123,10 @@ fn first_registration_wins_on_namespace_conflict() {
     let project = TempDir::new().unwrap();
     let p1 = fake_vendor_package(project.path(), "first", "pkg", "FirstServiceProvider");
     let p2 = fake_vendor_package(project.path(), "second", "pkg", "SecondServiceProvider");
+    // Both registered lang dirs must exist — the scan refuses a registration
+    // whose directory can't be canonicalized (issue #248).
+    fs::create_dir_all(p1.parent().unwrap().join("../lang")).unwrap();
+    fs::create_dir_all(p2.parent().unwrap().join("../lang")).unwrap();
     fs::write(
         &p1,
         "<?php\nclass A { public function boot() { $this->loadTranslationsFrom(__DIR__.'/../lang', 'shared'); } }\n",
@@ -345,6 +353,120 @@ fn vendor_scan_resolves_dirname_dir_argument() {
     assert!(
         resolved.ends_with("billing/lang"),
         "dirname(__DIR__).'/lang' must resolve to the package root's lang dir, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn scans_app_provider_with_dirname_dir_argument() {
+    // `dirname(__DIR__).'/lang'` climbs one level from the provider directory
+    // (app/Providers → app) for an app service provider, mirroring the vendor
+    // scan's handling of the same form (AC: dirname(__DIR__) coverage for the
+    // app scanner specifically).
+    let project = TempDir::new().unwrap();
+    // app/Providers/AppServiceProvider.php → dirname(__DIR__) is app, /lang → app/lang
+    fs::create_dir_all(project.path().join("app/lang")).unwrap();
+    write_app_provider(
+        project.path(),
+        "AppServiceProvider",
+        r#"<?php
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(dirname(__DIR__).'/lang', 'app');
+    }
+}
+"#,
+    );
+
+    let map = scan_app_translation_namespaces(project.path());
+    let resolved = map.get("app").expect("should find app namespace");
+    assert!(
+        resolved.ends_with("app/lang"),
+        "dirname(__DIR__).'/lang' must resolve to <root>/app/lang, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn app_provider_wins_over_vendor_on_namespace_conflict() {
+    // When a vendor package and an app service provider both register the same
+    // namespace, the merge in `main.rs::vendor_translation_namespaces_for`
+    // (`vendor.extend(app)`) makes the app entry win — App (2) outranks
+    // Package (1) in the project's priority convention. This exercises that
+    // documented `extend()` / app-wins semantics rather than assuming it.
+    let project = TempDir::new().unwrap();
+
+    // Vendor provider registers `shared` → vendor/acme/shared-pkg/lang.
+    let vendor_provider = fake_vendor_package(
+        project.path(),
+        "acme",
+        "shared-pkg",
+        "SharedServiceProvider",
+    );
+    fs::create_dir_all(vendor_provider.parent().unwrap().join("../lang")).unwrap();
+    fs::write(
+        &vendor_provider,
+        "<?php\nclass V { public function boot() { $this->loadTranslationsFrom(__DIR__.'/../lang', 'shared'); } }\n",
+    )
+    .unwrap();
+
+    // App provider registers the same `shared` namespace → <root>/lang/app.
+    fs::create_dir_all(project.path().join("lang/app")).unwrap();
+    write_app_provider(
+        project.path(),
+        "AppServiceProvider",
+        r#"<?php
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(lang_path('app'), 'shared');
+    }
+}
+"#,
+    );
+
+    // Mirror the merge order in `vendor_translation_namespaces_for`.
+    let mut merged = scan_vendor_translation_namespaces(project.path());
+    merged.extend(scan_app_translation_namespaces(project.path()));
+
+    let resolved = merged.get("shared").expect("conflict must still resolve");
+    assert!(
+        resolved.ends_with("lang/app"),
+        "app registration must win the namespace clash, got: {resolved:?}"
+    );
+    assert!(
+        !resolved.to_string_lossy().contains("shared-pkg"),
+        "app registration must override the vendor entry, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn refuses_registration_escaping_project_root() {
+    // A crafted `loadTranslationsFrom` argument that climbs out of the project
+    // root must never enter the namespace map — the resolver would otherwise read
+    // translation files from outside the project tree (issue #248, path
+    // traversal). The escape target is created on disk so it canonicalizes
+    // successfully, proving the entry is rejected by the containment guard and
+    // not merely dropped because the directory is missing.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    // A sibling of the project root — inside the tempdir, but outside `root`.
+    fs::create_dir_all(tmp.path().join("escape/lang")).unwrap();
+
+    write_app_provider(
+        &root,
+        "AppServiceProvider",
+        r#"<?php
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(base_path('../escape/lang'), 'evil');
+    }
+}
+"#,
+    );
+
+    let map = scan_app_translation_namespaces(&root);
+    assert!(
+        !map.contains_key("evil"),
+        "a registration resolving outside the project root must be refused, got: {map:?}"
     );
 }
 

@@ -236,7 +236,21 @@ fn extract_translations_from(
         else {
             continue;
         };
-        let resolved = lang_dir.canonicalize().unwrap_or(lang_dir);
+        // Resolve to the real on-disk path and refuse anything that escapes the
+        // project root. The four argument forms all capture an arbitrary string,
+        // so a crafted `loadTranslationsFrom('../../etc/passwd', 'ns')` could
+        // otherwise seed the map with an out-of-root directory the resolver would
+        // later read from — the same fail-closed path-traversal guard every other
+        // read site in this codebase applies (issue #248). `canonicalize()`
+        // failing (the target dir doesn't exist yet) drops the entry rather than
+        // storing an unresolved `..`-laden path; it re-enters the map on a later
+        // scan once the directory exists.
+        let Ok(resolved) = lang_dir.canonicalize() else {
+            continue;
+        };
+        if !crate::path_containment::path_within_root(&resolved, root) {
+            continue;
+        }
         namespaces
             .entry(ns.as_str().to_string())
             .or_insert(resolved);

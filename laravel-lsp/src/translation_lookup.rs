@@ -58,7 +58,7 @@ pub fn resolve_translation_detailed(
         // Published path missed — try the unpublished vendor directory.
         if let Some(map) = vendor_map {
             if let Some(dir) = map.get(namespace) {
-                return resolve_namespaced_in_dir(dir, rest, locale);
+                return resolve_namespaced_in_dir(root, dir, rest, locale);
             }
         }
         return None;
@@ -128,6 +128,7 @@ fn resolve_namespaced(
 /// fallback used when the published path missed and the namespace was
 /// discovered via [`crate::vendor_translations`].
 fn resolve_namespaced_in_dir(
+    root: &Path,
     lang_dir: &Path,
     rest: &str,
     locale: &str,
@@ -139,6 +140,13 @@ fn resolve_namespaced_in_dir(
         return None;
     }
     let path = lang_dir.join(locale).join(format!("{}.php", file));
+    // Defense-in-depth: never read a file outside the project root, even if a
+    // malicious `loadTranslationsFrom` argument seeded `lang_dir` with an
+    // out-of-root path. The same fail-closed guard every other read site in this
+    // codebase applies before `read_to_string` (issue #248).
+    if !crate::path_containment::path_within_root(&path, root) {
+        return None;
+    }
     read_php_value(&path, &key_path)
 }
 
