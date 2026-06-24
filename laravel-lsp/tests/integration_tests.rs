@@ -1527,3 +1527,93 @@ mod command_resolution {
         fs::remove_dir_all(&dir).ok();
     }
 }
+
+// ============================================================================
+// App service-provider translation registrations (issue #248)
+// ============================================================================
+
+mod app_provider_translations {
+    use laravel_lsp::translation_lookup::resolve_translation_detailed;
+    use laravel_lsp::vendor_translations::{
+        scan_app_translation_namespaces, scan_vendor_translation_namespaces,
+    };
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Merge the vendor and app provider scans the same way the LSP does in
+    /// `vendor_translation_namespaces_for` (app registrations win on a clash).
+    fn merged_namespace_map(root: &std::path::Path) -> HashMap<String, PathBuf> {
+        let mut merged = scan_vendor_translation_namespaces(root);
+        merged.extend(scan_app_translation_namespaces(root));
+        merged
+    }
+
+    #[test]
+    fn app_provider_lang_path_registration_resolves_namespaced_key() {
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+
+        // AppServiceProvider registers `app` translations at lang_path('app').
+        let providers = root.join("app/Providers");
+        fs::create_dir_all(&providers).unwrap();
+        fs::write(
+            providers.join("AppServiceProvider.php"),
+            r#"<?php
+namespace App\Providers;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(lang_path('app'), 'app');
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        // The translation file lives at lang/app/en/notification.php.
+        let lang_en = root.join("lang/app/en");
+        fs::create_dir_all(&lang_en).unwrap();
+        fs::write(
+            lang_en.join("notification.php"),
+            r#"<?php
+return [
+    'task_group_status_change' => [
+        'title' => 'Status changed',
+    ],
+];
+"#,
+        )
+        .unwrap();
+
+        let map = merged_namespace_map(root);
+        assert!(
+            map.contains_key("app"),
+            "merged map must carry the app-provider namespace, got {map:?}"
+        );
+
+        // No false "translation not found": the key resolves through the map to
+        // the real lang/app file, not the published lang/vendor/app/ fallback.
+        let resolved = resolve_translation_detailed(
+            root,
+            "app::notification.task_group_status_change.title",
+            "en",
+            Some(&map),
+        )
+        .expect("app::notification.task_group_status_change.title must resolve");
+
+        assert!(
+            resolved
+                .source_file
+                .ends_with("lang/app/en/notification.php"),
+            "must resolve to lang/app/en/notification.php, got {:?}",
+            resolved.source_file
+        );
+        assert!(
+            resolved.value.contains("Status changed"),
+            "resolved value should be the translated string, got {:?}",
+            resolved.value
+        );
+    }
+}

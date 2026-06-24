@@ -14753,6 +14753,42 @@ return [
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
+        // Namespaced keys (`namespace::file.key`) resolve through the merged
+        // vendor/app registration map — the package's real lang dir when the
+        // namespace was registered (e.g. via an app service provider), else the
+        // published `lang/vendor/<ns>/` path. Mirrors the diagnostic's
+        // "Expected at:" and hover so goto can't disagree with them (issue #248).
+        if let Some((namespace, rest)) = trans.key.split_once("::") {
+            let file_segment = rest.split('.').next().unwrap_or(rest);
+            let vendor_map = self.vendor_translation_namespaces_for(root).await;
+            let lang_dir = vendor_map
+                .as_deref()
+                .and_then(|m| m.get(namespace).cloned())
+                .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
+            let target = lang_dir.join("en").join(format!("{}.php", file_segment));
+            if self.file_exists_cached(&target).await {
+                if let Ok(target_uri) = Url::from_file_path(&target) {
+                    let origin_selection_range = Range {
+                        start: Position {
+                            line: trans.line,
+                            character: trans.column,
+                        },
+                        end: Position {
+                            line: trans.line,
+                            character: trans.end_column,
+                        },
+                    };
+                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                        origin_selection_range: Some(origin_selection_range),
+                        target_uri,
+                        target_range: Range::default(),
+                        target_selection_range: Range::default(),
+                    }]));
+                }
+            }
+            return None;
+        }
+
         // Determine if this is a dotted key (PHP file) or text key (JSON file)
         let is_dotted_key = trans.key.contains('.') && !trans.key.contains(' ');
 
@@ -19003,10 +19039,11 @@ return [
         }
     }
 
-    /// Return the cached vendor translation-namespace map, building it on
-    /// first call. The scan walks `vendor/` for service providers calling
-    /// `loadTranslationsFrom(...)` — see [`laravel_lsp::vendor_translations`].
-    /// Subsequent hover calls reuse the cached Arc without re-scanning.
+    /// Return the cached translation-namespace map, building it on first call.
+    /// The map merges two scans (see [`laravel_lsp::vendor_translations`]):
+    /// `vendor/` service providers calling `loadTranslationsFrom(...)`, and the
+    /// app's own `app/Providers/` service providers. Subsequent hover calls
+    /// reuse the cached Arc without re-scanning.
     async fn vendor_translation_namespaces_for(
         &self,
         root: &Path,
@@ -19021,7 +19058,15 @@ return [
         // walkdir traversal doesn't block the LSP event loop.
         let root_clone = root.to_path_buf();
         let scanned = tokio::task::spawn_blocking(move || {
-            laravel_lsp::vendor_translations::scan_vendor_translation_namespaces(&root_clone)
+            let mut merged =
+                laravel_lsp::vendor_translations::scan_vendor_translation_namespaces(&root_clone);
+            // App service-provider registrations override vendor ones on a
+            // namespace clash — App (2) outranks Package (1) in the project's
+            // priority convention.
+            let app_map =
+                laravel_lsp::vendor_translations::scan_app_translation_namespaces(&root_clone);
+            merged.extend(app_map);
+            merged
         })
         .await
         .ok()?;

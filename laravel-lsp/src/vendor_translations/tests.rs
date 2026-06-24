@@ -239,3 +239,118 @@ class UiServiceProvider extends PackageServiceProvider
         "no ->hasTranslations() means no translation namespace, got {map:?}"
     );
 }
+
+// ─── App service-provider registrations (app/Providers/**/*.php) ─────────
+
+/// Write a service provider under `app/Providers/<name>.php` with the given
+/// body and return its path.
+fn write_app_provider(project: &Path, name: &str, body: &str) -> PathBuf {
+    let dir = project.join("app").join("Providers");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.php"));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn scans_app_provider_with_lang_path_argument() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("lang/app")).unwrap();
+    write_app_provider(
+        project.path(),
+        "AppServiceProvider",
+        r#"<?php
+namespace App\Providers;
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(lang_path('app'), 'app');
+    }
+}
+"#,
+    );
+
+    let map = scan_app_translation_namespaces(project.path());
+    let resolved = map.get("app").expect("should find app namespace");
+    assert!(
+        resolved.ends_with("lang/app"),
+        "lang_path('app') must resolve to <root>/lang/app, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn scans_app_provider_with_base_path_argument() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("lang/custom")).unwrap();
+    write_app_provider(
+        project.path(),
+        "TranslationServiceProvider",
+        r#"<?php
+class TranslationServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(base_path('lang/custom'), 'custom');
+    }
+}
+"#,
+    );
+
+    let map = scan_app_translation_namespaces(project.path());
+    let resolved = map.get("custom").expect("should find custom namespace");
+    assert!(
+        resolved.ends_with("lang/custom"),
+        "base_path('lang/custom') must resolve to <root>/lang/custom, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn scans_app_provider_with_dir_concat_argument() {
+    // The existing `__DIR__.'...'` form must keep working for app providers.
+    let project = TempDir::new().unwrap();
+    // app/Providers/AppServiceProvider.php + __DIR__.'/../../lang/app' → <root>/lang/app
+    fs::create_dir_all(project.path().join("lang/app")).unwrap();
+    write_app_provider(
+        project.path(),
+        "AppServiceProvider",
+        r#"<?php
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(__DIR__.'/../../lang/app', 'app');
+    }
+}
+"#,
+    );
+
+    let map = scan_app_translation_namespaces(project.path());
+    let resolved = map.get("app").expect("should find app namespace");
+    assert!(
+        resolved.ends_with("lang/app"),
+        "__DIR__.'/../../lang/app' must resolve to <root>/lang/app, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn vendor_scan_resolves_dirname_dir_argument() {
+    // `dirname(__DIR__).'/lang'` climbs one level from the provider directory.
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "billing", "BillingServiceProvider");
+    // provider lives in vendor/acme/billing/src — dirname(__DIR__) is .../billing
+    fs::create_dir_all(provider.parent().unwrap().join("../lang")).unwrap();
+    fs::write(
+        &provider,
+        "<?php\nclass X { public function boot() { $this->loadTranslationsFrom(dirname(__DIR__).'/lang', 'billing'); } }\n",
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    let resolved = map.get("billing").expect("should find billing namespace");
+    assert!(
+        resolved.ends_with("billing/lang"),
+        "dirname(__DIR__).'/lang' must resolve to the package root's lang dir, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn app_scan_returns_empty_without_providers_dir() {
+    let project = TempDir::new().unwrap();
+    let map = scan_app_translation_namespaces(project.path());
+    assert!(map.is_empty(), "no app/Providers means no namespaces");
+}

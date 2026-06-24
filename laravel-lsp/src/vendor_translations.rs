@@ -26,10 +26,35 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 lazy_static! {
-    /// Matches `$this->loadTranslationsFrom(__DIR__.'/relative/path', 'namespace')`.
-    /// Captures the relative path and the namespace.
+    /// Matches `$this->loadTranslationsFrom(<first-arg>, 'namespace')`, capturing
+    /// the raw first-argument expression and the namespace. The first argument is
+    /// resolved to an absolute lang directory by [`resolve_load_translations_arg`],
+    /// which understands the `__DIR__`, `dirname(__DIR__)`, `lang_path()` and
+    /// `base_path()` forms Laravel app and package providers use in practice.
     static ref LOAD_TRANSLATIONS_RE: Regex = Regex::new(
-        r#"\$this->loadTranslationsFrom\s*\(\s*__DIR__\s*\.\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
+        r#"\$this->loadTranslationsFrom\s*\(\s*([^,]+?)\s*,\s*['"]([^'"]+)['"]\s*\)"#
+    ).unwrap();
+
+    /// `lang_path('app')` — the argument resolves to `<root>/lang/<arg>`.
+    static ref LANG_PATH_ARG_RE: Regex = Regex::new(
+        r#"^lang_path\s*\(\s*['"]([^'"]*)['"]\s*\)$"#
+    ).unwrap();
+
+    /// `base_path('lang/custom')` — the argument resolves to `<root>/<arg>`.
+    static ref BASE_PATH_ARG_RE: Regex = Regex::new(
+        r#"^base_path\s*\(\s*['"]([^'"]*)['"]\s*\)$"#
+    ).unwrap();
+
+    /// `dirname(__DIR__).'/lang'` — `__DIR__` is the provider directory, so
+    /// `dirname()` climbs one level and the literal is joined onto that parent.
+    static ref DIRNAME_DIR_ARG_RE: Regex = Regex::new(
+        r#"^dirname\s*\(\s*__DIR__\s*\)\s*\.\s*['"]([^'"]+)['"]$"#
+    ).unwrap();
+
+    /// `__DIR__.'/../resources/lang'` — the literal is joined onto the provider
+    /// directory.
+    static ref DIR_ARG_RE: Regex = Regex::new(
+        r#"^__DIR__\s*\.\s*['"]([^'"]+)['"]$"#
     ).unwrap();
 
     /// Matches a fluent package-builder name declaration: `->name('package')`.
@@ -98,16 +123,97 @@ pub fn scan_vendor_translation_namespaces(root: &Path) -> HashMap<String, PathBu
             continue;
         }
 
-        extract_translations_from(&source, path, &mut namespaces);
+        extract_translations_from(&source, path, root, &mut namespaces);
         extract_builder_translations_from(&source, path, &mut namespaces);
     }
 
     namespaces
 }
 
+/// Walk `app/Providers/` for application service providers that register
+/// translation namespaces via `loadTranslationsFrom`. Returns a map of
+/// `namespace → absolute lang directory`, resolved exactly as the vendor scan
+/// resolves its registrations (see [`resolve_load_translations_arg`]).
+///
+/// App providers are the usual home for registrations the vendor scan never
+/// sees — e.g. `loadTranslationsFrom(lang_path('app'), 'app')` in
+/// `AppServiceProvider`. Unlike the vendor scan, there is no `ServiceProvider`
+/// filename gate: any `*.php` under `app/Providers/` is eligible, gated only on
+/// containing a `loadTranslationsFrom` call.
+pub fn scan_app_translation_namespaces(root: &Path) -> HashMap<String, PathBuf> {
+    let providers = root.join("app").join("Providers");
+    if !providers.is_dir() {
+        return HashMap::new();
+    }
+
+    let mut namespaces: HashMap<String, PathBuf> = HashMap::new();
+
+    for entry in walkdir::WalkDir::new(&providers)
+        .max_depth(10)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("php") {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(path) else {
+            continue;
+        };
+        if !source.contains("loadTranslationsFrom") {
+            continue;
+        }
+
+        extract_translations_from(&source, path, root, &mut namespaces);
+    }
+
+    namespaces
+}
+
+/// Resolve a `loadTranslationsFrom` first-argument expression to an absolute
+/// lang directory. `provider_dir` is the directory holding the service-provider
+/// file (PHP's `__DIR__`); `root` is the project root (the base for the
+/// `lang_path`/`base_path` helpers). Returns `None` for argument forms this
+/// scanner doesn't model, so an unrecognized call contributes no entry rather
+/// than a wrong one.
+fn resolve_load_translations_arg(arg: &str, provider_dir: &Path, root: &Path) -> Option<PathBuf> {
+    if let Some(cap) = LANG_PATH_ARG_RE.captures(arg) {
+        return Some(
+            root.join("lang")
+                .join(strip_path_prefix(cap.get(1)?.as_str())),
+        );
+    }
+    if let Some(cap) = BASE_PATH_ARG_RE.captures(arg) {
+        return Some(root.join(strip_path_prefix(cap.get(1)?.as_str())));
+    }
+    if let Some(cap) = DIRNAME_DIR_ARG_RE.captures(arg) {
+        return Some(
+            provider_dir
+                .parent()?
+                .join(strip_path_prefix(cap.get(1)?.as_str())),
+        );
+    }
+    if let Some(cap) = DIR_ARG_RE.captures(arg) {
+        return Some(provider_dir.join(strip_path_prefix(cap.get(1)?.as_str())));
+    }
+    None
+}
+
+/// Strip a leading `/` or `./` so the fragment joins onto the receiver instead
+/// of being treated as absolute (Rust's `Path::join` discards the receiver when
+/// the argument starts with `/`).
+fn strip_path_prefix(fragment: &str) -> &str {
+    fragment.trim_start_matches('/').trim_start_matches("./")
+}
+
 /// Apply [`LOAD_TRANSLATIONS_RE`] to the given source. Each match contributes
-/// a `namespace → absolute_lang_dir` entry. The relative path is resolved
-/// against the provider file's directory (the `__DIR__` reference).
+/// a `namespace → absolute_lang_dir` entry. The first argument is resolved by
+/// [`resolve_load_translations_arg`], which covers the `__DIR__`,
+/// `dirname(__DIR__)`, `lang_path()` and `base_path()` forms; `root` is the
+/// project root the path helpers are relative to.
 ///
 /// First-match-wins on namespace conflict — service-provider boot order is
 /// non-deterministic and we have no good way to rank packages without a full
@@ -115,26 +221,21 @@ pub fn scan_vendor_translation_namespaces(root: &Path) -> HashMap<String, PathBu
 fn extract_translations_from(
     source: &str,
     provider_path: &Path,
+    root: &Path,
     namespaces: &mut HashMap<String, PathBuf>,
 ) {
-    let provider_dir = match provider_path.parent() {
-        Some(d) => d,
-        None => return,
+    let Some(provider_dir) = provider_path.parent() else {
+        return;
     };
 
     for cap in LOAD_TRANSLATIONS_RE.captures_iter(source) {
-        let (Some(rel), Some(ns)) = (cap.get(1), cap.get(2)) else {
+        let (Some(arg), Some(ns)) = (cap.get(1), cap.get(2)) else {
             continue;
         };
-        // PHP source: `__DIR__.'/../resources/lang'` — the captured fragment
-        // starts with `/`. Rust's `Path::join` treats any path starting with
-        // `/` as absolute and discards the receiver, so we strip leading `/`
-        // and `./` before joining onto the provider directory.
-        let rel_str = rel
-            .as_str()
-            .trim_start_matches('/')
-            .trim_start_matches("./");
-        let lang_dir = provider_dir.join(rel_str);
+        let Some(lang_dir) = resolve_load_translations_arg(arg.as_str().trim(), provider_dir, root)
+        else {
+            continue;
+        };
         let resolved = lang_dir.canonicalize().unwrap_or(lang_dir);
         namespaces
             .entry(ns.as_str().to_string())
