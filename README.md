@@ -86,58 +86,92 @@ Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: in
 
 ## ⚙️ Configuration
 
-The extension works out of the box with zero configuration. It automatically discovers your Laravel project structure, including view paths, component namespaces, route files, and service providers.
+The extension works out of the box with **zero configuration** — it auto-discovers your view paths, component namespaces, route files, and service providers. Everything below is optional.
 
-Everything below is optional — **with one exception**: if you've customized which language servers run for PHP or Blade, see [🔌 Coexisting with your PHP / Blade language servers](#-coexisting-with-your-php--blade-language-servers) first, or the extension won't activate in those files.
+> ⚠️ **One conditional requirement.** If you set an explicit `language_servers` list for PHP or Blade (common when pinning a PHP LSP), that list *replaces* Zed's defaults — you **must** include `"laravel-lsp"` or the extension won't attach. Symptom: features work in `.env` files but do nothing in `.php` / `.blade.php`. The block below shows the correct form.
 
-### 🔌 Coexisting with your PHP / Blade language servers
+### 🎛️ All settings
 
-This extension registers a language server called `laravel-lsp` for **PHP**, **Blade**, **XML**, and `.env` (Shell Script) files. By default Zed runs it automatically alongside your other servers — no setup needed.
+Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inline comments below are valid — copy what you need. Every value is shown at its **default**; delete a line to keep that default.
 
-**If you've customized `language_servers` for PHP or Blade** (common when pinning a specific PHP LSP), you must add `laravel-lsp` to those lists, or it won't attach and none of the Blade/PHP features appear. An explicit list *replaces* Zed's defaults — keep the `"..."` token to preserve them:
-
-```json
-{
-  "languages": {
-    "PHP":   { "language_servers": ["laravel-lsp", "..."] },
-    "Blade": { "language_servers": ["laravel-lsp", "..."] }
-  }
-}
-```
-
-> 💡 **Symptom:** features work in `.env` files (you see code-lens counts) but do nothing in `.php` / `.blade.php`. That's this setting — `.env` is treated as Shell Script, which you likely didn't override.
-
-### 🎛️ Extension settings
-
-Add any of these to your Zed `settings.json`:
-
-```json
+```jsonc
 {
   "lsp": {
+    // ── This extension's own settings ──────────────────────────────────
     "laravel-lsp": {
       "settings": {
+        // Delay (ms) before autocomplete refreshes after a keystroke.
+        // Lower 50–100 = snappier; higher 300–500 = less CPU.   Default: 200
         "autoCompleteDebounce": 200,
+
         "blade": {
+          // Space between a directive and its parentheses.
+          // false → @if($x)    true → @if ($x)                  Default: false
           "directiveSpacing": false
         },
+
         "codeLens": {
+          // Reference-count lenses + unused-symbol diagnostic (opt-in while
+          // the feature matures). Guide: docs/code-lens.md.     Default: false
           "enabled": false
         },
+
         "diagnostics": {
-          "severity": "warning"
+          // Severity for query-chain diagnostics (unknown column / relation /
+          // table in Eloquent & DB::table() chains). Silent without a live DB
+          // connection. One of: "error" | "warning" | "info" | "off".
+          "severity": "warning"   // Default: "warning"
         }
       }
+    },
+
+    // ── Optional third-party language-server tweaks ────────────────────
+    // Silence shellcheck SC2034 "APP_NAME appears unused" on .env lines
+    // (Zed lints .env as Shell Script). The bashIde wrapper is required.
+    // Trade-offs & alternatives: docs/environment.md.
+    "bash-language-server": {
+      "settings": {
+        "bashIde": { "shellcheckArguments": ["--exclude=SC2034"] }
+      }
+    },
+
+    // Hide noisy vendor stub-template hits from Intelephense goto-definition.
+    // Restart after editing (Cmd+Shift+P → "lsp: restart").
+    // Deeper tuning (licence key, IDE helpers): docs/tuning-intelephense.md.
+    "intelephense": {
+      "settings": {
+        "files": { "exclude": ["**/stubs/**"] }
+      }
+    }
+  },
+
+  // ── Zed per-language toggles that unlock our features ───────────────
+  "languages": {
+    "PHP": {
+      // An explicit list REPLACES Zed's defaults, so "laravel-lsp" must appear
+      // or this extension won't attach; "..." re-expands the remaining defaults.
+      // Prefix a server with "!" to DISABLE it — pick ONE PHP LSP (Intelephense
+      // here) and turn the rest off, because running several PHP servers at once
+      // produces duplicate completions, hovers, and diagnostics.
+      "language_servers": ["laravel-lsp", "intelephense", "!phpactor", "!phptools", "..."],
+      // LSP outlines: our route-file outline + your PHP LSP's class outline.
+      // "on" | "off"                                            Default: "off"
+      "document_symbols": "on"
+    },
+    "Blade": {
+      // Same rules as PHP. "!phpactor" stops the PHP-oriented Phpactor server
+      // from also attaching to .blade.php files and double-reporting.
+      "language_servers": ["laravel-lsp", "!phpactor", "..."],
+      // Our Blade outline (@extends / @section / <x-*> / <livewire:*> …).
+      "document_symbols": "on",
+      // Highlight custom inline @directive() macros tree-sitter can't see
+      // (e.g. a @money($x) Blade::directive). Requires Zed semantic-token
+      // support; "combined" overlays them on the Blade extension's colors.
+      "semantic_tokens": "combined"
     }
   }
 }
 ```
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `autoCompleteDebounce` | `200` | Delay (ms) before autocomplete updates after typing. Lower values (50-100ms) give faster feedback. Higher values (300-500ms) reduce CPU usage. |
-| `blade.directiveSpacing` | `false` | Add space between directive name and parentheses. `false`: `@if($condition)` / `true`: `@if ($condition)` |
-| `codeLens.enabled` | `false` | Turn on [reference-count code lenses](docs/code-lens.md) and the unused-symbol diagnostic. Opt-in while the feature matures. |
-| `diagnostics.severity` | `"warning"` | Severity for query-chain diagnostics (unknown column/relation/table in Eloquent & `DB::table()` chains). One of `"warning"`, `"error"`, `"info"`, or `"off"` to disable. Requires a working database connection — diagnostics stay silent when the schema can't be introspected. |
 
 ### 🗄️ Database connection
 
@@ -152,40 +186,6 @@ DB_PASSWORD=secret
 ```
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
-
-### 🌱 `.env` "appears unused" warnings
-
-Open a `.env` and Zed underlines every line — `APP_NAME appears unused. Verify use (or export if used externally)`. That's **shellcheck's SC2034**, not this extension: Zed lints `.env` files as *Shell Script*, where the `KEY=value` lines Laravel reads at runtime look like unused variables. Silence just that rule while keeping shell highlighting, via your `settings.json`:
-
-```json
-{
-  "lsp": {
-    "bash-language-server": {
-      "settings": {
-        "bashIde": {
-          "shellcheckArguments": ["--exclude=SC2034"]
-        }
-      }
-    }
-  }
-}
-```
-
-The `bashIde` wrapper is required — the bash server won't see the setting without it. Prefer a project-scoped `.shellcheckrc`, a per-file directive, or reclassifying `.env` away from Shell Script entirely (so real shell scripts keep SC2034)? See the **[environment files guide](docs/environment.md)** for all the options and trade-offs.
-
-### 🎨 Blade directive highlighting
-
-The [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension already highlights standard directives and paired `@custom … @endcustom` blocks through tree-sitter. This optional setting adds the one case tree-sitter can't see: your app's **custom inline directives** registered via `Blade::directive()` (e.g. a `@money($amount)` macro). The LSP highlights them precisely — it colors only directives it has actually discovered (the same scan that drives directive completion), so PHPDoc `@param` tags, CSS at-rules like `@media`, and the `@` in email addresses are left alone, and commented-out directives stay dark. Enable it in your Zed `settings.json`:
-
-```json
-{
-  "languages": {
-    "Blade": {
-      "semantic_tokens": "combined"
-    }
-  }
-}
-```
 
 ### 🗺️ Outline panel
 
@@ -204,44 +204,9 @@ PHP class outlines (controllers, models, Livewire components, jobs, services) co
 | Blade templates | This extension, the [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension (for the `Blade` language definition), plus `document_symbols: on` for `Blade`. |
 | PHP class files | A PHP language server (the [PHP](https://github.com/zed-extensions/php) extension provides Intelephense / Phpactor / PhpTools), plus `document_symbols: on` for `PHP`. |
 
-Zed defaults to tree-sitter outlines, which don't call any LSP — opt into LSP outlines per-language ([`zed#48780`](https://github.com/zed-industries/zed/pull/48780)):
-
-```json
-{
-  "languages": {
-    "PHP": {
-      "document_symbols": "on"
-    },
-    "Blade": {
-      "document_symbols": "on"
-    }
-  }
-}
-```
-
-`document_symbols: on` for `PHP` unlocks both our route outline (for files under `routes/`) and your PHP LSP's class outline (for everything else). `document_symbols: on` for `Blade` unlocks our Blade outline. (This opt-in is a Zed quirk — LSP clients that request `textDocument/documentSymbol` unconditionally, like Helix or Neovim, wouldn't need it.)
+Zed defaults to tree-sitter outlines, which don't call any LSP — the `document_symbols: "on"` toggles in the [settings block above](#-all-settings) opt you into LSP outlines (`PHP` unlocks our route outline *and* your PHP LSP's class outline; `Blade` unlocks our Blade outline). This opt-in is a Zed quirk ([`zed#48780`](https://github.com/zed-industries/zed/pull/48780)) — clients that always request `textDocument/documentSymbol`, like Helix or Neovim, don't need it.
 
 > **Quirks worth knowing** — Zed colors outline labels by word-matching them against the source buffer's tree-sitter highlights, which produces slightly inconsistent colors on multi-segment URLs (e.g., `/cra-details` may color `cra` and `details` differently if they match different tokens elsewhere in the file). Route names appear in the LSP `detail` field, which Zed's outline panel doesn't currently render (VSCode and Sublime/LSP do). Both are tracked upstream: [zed#57576](https://github.com/zed-industries/zed/issues/57576).
-
-### 🔧 Tuning Intelephense
-
-If you use Intelephense as your PHP language server, goto-definition on a class name can surface noisy stub-template results from `vendor/*/stubs/`. The quick fix is to exclude them — those scaffold templates are never loaded at runtime:
-
-```json
-{
-  "lsp": {
-    "intelephense": {
-      "settings": {
-        "files": {
-          "exclude": ["**/stubs/**"]
-        }
-      }
-    }
-  }
-}
-```
-
-After saving, restart Intelephense (`Cmd+Shift+P → lsp: restart`). For the licence-key shape, the `_ide_helper*.php` / `.phpstorm.meta.php` trade-offs, the cache caveat, and per-project `.intelephense.json`, see the **[full Intelephense tuning guide](docs/tuning-intelephense.md)**.
 
 ## 🩺 Troubleshooting
 
@@ -260,7 +225,7 @@ The language server only attaches to files Zed has classified as **PHP**, **Blad
 
 ### 3. Did you override `language_servers` for PHP or Blade?
 
-If features work in `.env` files but not in `.php` / `.blade.php`, you've almost certainly set an explicit `language_servers` list that omits `laravel-lsp`. See [🔌 Coexisting with your PHP / Blade language servers](#-coexisting-with-your-php--blade-language-servers) for the fix.
+If features work in `.env` files but not in `.php` / `.blade.php`, you've almost certainly set an explicit `language_servers` list that omits `laravel-lsp`. See [the settings block](#-all-settings) for the fix — include `"laravel-lsp"` in the list.
 
 ### 4. Check the language-server log
 
