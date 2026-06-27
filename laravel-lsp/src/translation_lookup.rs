@@ -58,7 +58,7 @@ pub fn resolve_translation_detailed(
         // Published path missed — try the unpublished vendor directory.
         if let Some(map) = vendor_map {
             if let Some(dir) = map.get(namespace) {
-                return resolve_namespaced_in_dir(dir, rest, locale);
+                return resolve_namespaced_in_dir(root, dir, rest, locale);
             }
         }
         return None;
@@ -126,8 +126,10 @@ fn resolve_namespaced(
 
 /// Resolve a namespaced key against an explicit lang directory — the
 /// fallback used when the published path missed and the namespace was
-/// discovered via [`crate::vendor_translations`].
+/// discovered via [`crate::vendor_translations`]. `root` is the project root,
+/// used to fence the read inside the tree.
 fn resolve_namespaced_in_dir(
+    root: &Path,
     lang_dir: &Path,
     rest: &str,
     locale: &str,
@@ -139,6 +141,15 @@ fn resolve_namespaced_in_dir(
         return None;
     }
     let path = lang_dir.join(locale).join(format!("{}.php", file));
+    // Defense-in-depth: `lang_dir` is derived from a `loadTranslationsFrom`
+    // argument in project/vendor source — untrusted input. A traversal like
+    // `base_path('../../../../.ssh')` or `__DIR__.'/../../../../etc'` could seed
+    // an out-of-root directory; fail-closed before the read so a namespaced key
+    // can never turn the LSP into an arbitrary-file-read primitive. Mirrors the
+    // guard every other read site in this codebase applies (issue #248).
+    if !crate::path_containment::path_within_root(&path, root) {
+        return None;
+    }
     read_php_value(&path, &key_path)
 }
 

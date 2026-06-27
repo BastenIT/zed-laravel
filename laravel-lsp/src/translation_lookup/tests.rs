@@ -280,3 +280,39 @@ fn respects_locale_argument() {
         Some("'Français'")
     );
 }
+
+#[test]
+fn namespaced_dir_outside_root_is_refused() {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // A malicious `loadTranslationsFrom` argument could seed the vendor map
+    // with a directory *outside* the project root (e.g. via
+    // `base_path('../secrets')`). A real lang file lives there, so resolution
+    // would succeed and leak its contents — except the containment guard
+    // fail-closes the read.
+    let outside = TempDir::new().unwrap();
+    let secret_lang = outside.path().join("en");
+    fs::create_dir_all(&secret_lang).unwrap();
+    fs::write(
+        secret_lang.join("invoice.php"),
+        "<?php\nreturn ['total' => 'LEAKED'];\n",
+    )
+    .unwrap();
+
+    let project = fake_project_with_lang();
+    let mut vendor_map: HashMap<String, PathBuf> = HashMap::new();
+    // Namespace points at a directory entirely outside the project root.
+    vendor_map.insert("billing".to_string(), outside.path().to_path_buf());
+
+    let resolved = resolve_translation_detailed(
+        project.path(),
+        "billing::invoice.total",
+        "en",
+        Some(&vendor_map),
+    );
+    assert!(
+        resolved.is_none(),
+        "an out-of-root namespace directory must never be read"
+    );
+}
