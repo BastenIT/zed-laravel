@@ -135,12 +135,24 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
       }
     },
 
-    // Hide noisy vendor stub-template hits from Intelephense goto-definition.
+    // Trim Intelephense goto-definition noise. This extension resolves facades,
+    // macros & mixins to their concrete implementation, so the generated IDE-helper
+    // stubs (and the PhpStorm meta file) only add duplicate facade/Eloquent hits to
+    // the goto multibuffer. Excluding them lets our resolution stand alone.
+    // Trade-off: Intelephense then loses completion for *package-added* facade
+    // methods (Scout, Telescope, Spatie…); core facade completion is unaffected
+    // (it reads framework docblocks, not the helper). Full rationale, the cache
+    // caveat, and a per-project `.intelephense.json` variant: docs/tuning-intelephense.md.
     // Restart after editing (Cmd+Shift+P → "lsp: restart").
-    // Deeper tuning (licence key, IDE helpers): docs/tuning-intelephense.md.
     "intelephense": {
       "settings": {
-        "files": { "exclude": ["**/stubs/**"] }
+        "files": {
+          "exclude": [
+            "**/stubs/**",            // scaffold templates (Jetstream, Filament…), never run
+            "**/_ide_helper*.php",    // barryvdh/laravel-ide-helper facade + model stubs
+            "**/.phpstorm.meta.php"   // PhpStorm container-binding type hints
+          ]
+        }
       }
     }
   },
