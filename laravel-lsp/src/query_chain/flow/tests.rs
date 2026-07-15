@@ -552,3 +552,253 @@ function search() {
         "an extra flow hop lowers confidence"
     );
 }
+
+// ---- resolve_collection_relation (issue #246) ----------------------------
+
+/// Run [`super::resolve_collection_relation`] against the Nth occurrence of
+/// `$var` in the snippet.
+fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, String, Vec<String>)> {
+    let wrapped = format!("<?php\n{src}");
+    let tree = parse_php(&wrapped).expect("parse");
+    let bytes = wrapped.as_bytes();
+    let aliases = extract_use_aliases(&tree, &wrapped);
+    let node = find_nth_var(&tree, bytes, var, n)?;
+    let (rhs, start) = super::latest_assignment_before(node, bytes, var)?;
+    super::resolve_collection_relation(rhs, start, bytes, &aliases)
+}
+
+/// `resolve_collection_at` with no heuristic middle hops expected — the
+/// common assertion shape.
+fn resolve_collection_simple(src: &str, var: &str, n: usize) -> Option<(String, String)> {
+    resolve_collection_at(src, var, n).map(|(base, relation, hops)| {
+        assert!(hops.is_empty(), "expected no heuristic hops, got {hops:?}");
+        (base, relation)
+    })
+}
+
+#[test]
+fn collection_relation_detects_instance_rooted_chain() {
+    // The exact issue #246 shape: an executed relation query (with
+    // table-qualified select args) assigned to a variable. n=2 is the use
+    // site ($regs LHS is n=0... the RHS has no $regs, so LHS=0, use=1).
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user->competitions()->select('competitions.id', 'competitions.type')->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_simple(src, "regs", 1),
+        Some(("App\\Models\\User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_detects_static_rooted_chain() {
+    let src = r#"
+function run() {
+    $regs = User::query()->competitions()->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_simple(src, "regs", 1),
+        Some(("User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_accepts_pluck_terminator() {
+    let src = r#"
+function run(User $user) {
+    $ids = $user->competitions()->pluck('id');
+    $ids->filter();
+}
+"#;
+    assert_eq!(
+        resolve_collection_simple(src, "ids", 1),
+        Some(("User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_rejects_unexecuted_relation_builder() {
+    // No collection terminator — `$q` is a relation *builder*, not a
+    // hydrated collection. Detection must not fire.
+    let src = r#"
+function run(User $user) {
+    $q = $user->competitions();
+    $q->where('type', 'league');
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "q", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_single_model_terminator() {
+    // `first()` yields a Model, not a Collection.
+    let src = r#"
+function run(User $user) {
+    $c = $user->competitions()->first();
+    $c->load('players');
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "c", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_known_builder_root_call() {
+    // `where()` is a recognised builder method — the collection holds the
+    // ROOT model, so the plain flow path (InstanceVar) must keep handling it.
+    let src = r#"
+function run(User $user) {
+    $users = $user->where('active', 1)->get();
+    $users->pluck('id');
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "users", 1), None);
+}
+
+#[test]
+fn collection_relation_collects_unrecognised_middle_calls_as_hops() {
+    // PR #266 round 4 (proactive): unrecognised middle calls no longer
+    // reject the shape — mirroring the inline cursor collector, each is a
+    // heuristic hop candidate (a scope on the running model, a pivot builder
+    // method we don't model, or a further relation hop), returned in source
+    // order after the relation claim.
+    let src = r#"
+function run(User $user) {
+    $x = $user->competitions()->approved()->organizer()->get();
+    $x->pluck('id');
+}
+"#;
+    assert_eq!(
+        resolve_collection_at(src, "x", 1),
+        Some((
+            "User".to_string(),
+            "competitions".to_string(),
+            vec!["approved".to_string(), "organizer".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn collection_relation_collects_pivot_method_as_hop() {
+    // BelongsToMany pivot builder methods (`wherePivot`, `withPivot`, …)
+    // aren't in the recognised-builder catalog — they must ride the
+    // heuristic-hop path rather than reject the shape, or the exact issue
+    // #246 false positive returns for pivot-filtered chains.
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user->competitions()->wherePivot('active', 1)->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_at(src, "regs", 1),
+        Some((
+            "App\\Models\\User".to_string(),
+            "competitions".to_string(),
+            vec!["wherePivot".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn collection_relation_rejects_mode_flip_with_unrecognised_middle_present() {
+    // The mode-flip gate (round 3) survives the heuristic-middle loosening:
+    // a mid-chain `toBase()` still rejects even when an unrecognised call
+    // also sits mid-chain.
+    let src = r#"
+function run(User $user) {
+    $rows = $user->competitions()->approved()->toBase()->get();
+    $rows->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "rows", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_mid_chain_collection_terminator() {
+    // PR #266 review (round 3): `get()` mid-chain flips the tail to a
+    // Collection — `pluck('id')` then yields scalars, not related models.
+    // The gate must reject rather than type `$ids` to the related model.
+    let src = r#"
+function run(User $user) {
+    $ids = $user->competitions()->get()->pluck('id');
+    $ids->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "ids", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_mid_chain_mode_flip() {
+    // PR #266 review (round 3): `toBase()` mid-chain drops to the base
+    // builder — `get()` then yields raw stdClass rows, not hydrated related
+    // models.
+    let src = r#"
+function run(User $user) {
+    $rows = $user->competitions()->toBase()->get();
+    $rows->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "rows", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_mid_chain_single_model_terminator() {
+    // Same bug class: `first()` mid-chain terminates the query into a single
+    // model — the tail no longer types the relation query.
+    let src = r#"
+function run(User $user) {
+    $x = $user->competitions()->first()->get();
+    $x->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "x", 1), None);
+}
+
+#[test]
+fn collection_relation_detects_parenthesized_new_root() {
+    // `(new User)` as the chain root — parens are unwrapped during the root
+    // walk and the construction types the base model.
+    let src = r#"
+use App\Models\User;
+function run() {
+    $regs = (new User)->competitions()->get();
+    $regs->pluck('id');
+}
+"#;
+    assert_eq!(
+        resolve_collection_simple(src, "regs", 1),
+        Some(("App\\Models\\User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_requires_resolvable_base() {
+    // `$user` has no typed param / docblock / assignment — the base model is
+    // unknown, so detection returns None.
+    let src = r#"
+function run($user) {
+    $regs = $user->competitions()->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "regs", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_non_starter_static_root() {
+    // `Carbon::now()` isn't an Eloquent static starter — not a chain we type.
+    let src = r#"
+function run() {
+    $x = Carbon::now()->addDays(3)->get();
+    $x->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "x", 1), None);
+}
