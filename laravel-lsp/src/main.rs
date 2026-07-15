@@ -38,11 +38,11 @@ use laravel_lsp::route_discovery::{
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
 use laravel_lsp::salsa_impl::{
-    ActionReferenceData, AssetReferenceData, BindingReferenceData, ComponentReferenceData,
-    ConfigReferenceData, DirectiveReferenceData, EnvReferenceData, FeatureReferenceData,
-    LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData, PatternAtPosition,
-    ReferenceLocationData, RouteReferenceData, SalsaActor, SalsaHandle, TranslationReferenceData,
-    UrlReferenceData, ViewReferenceData,
+    registration_ripple_keys, ActionReferenceData, AssetReferenceData, BindingReferenceData,
+    ComponentReferenceData, ConfigReferenceData, DirectiveReferenceData, EnvReferenceData,
+    FeatureReferenceData, LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData,
+    PatternAtPosition, ReferenceLocationData, RouteReferenceData, SalsaActor, SalsaHandle,
+    TranslationReferenceData, UrlReferenceData, ViewReferenceData,
 };
 
 // The Linux release binaries are static musl builds; musl's default
@@ -1911,6 +1911,11 @@ struct LaravelLanguageServer {
     /// formatter, branch switch) into one dependency-tracked incremental
     /// reconverge; a batch already draining is never aborted.
     magic_rebuild_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the save-path dependent-ripple task
+    /// ([`Self::refresh_magic_on_save`]'s background `refresh_magic_dependents`
+    /// spawn), kept solely so tests can await the ripple deterministically
+    /// (#255) — the production path never joins or aborts it.
+    magic_ripple_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Accumulated external `.php` changes + the batch task's liveness flag,
     /// under one mutex (see [`WatchedBatchState`]). Producer:
     /// `did_change_watched_files` records events and spawns a task iff none is
@@ -4320,6 +4325,7 @@ impl LaravelLanguageServer {
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
             magic_rebuild_handle: Arc::new(RwLock::new(None)),
+            magic_ripple_handle: Arc::new(RwLock::new(None)),
             magic_batch_state: Arc::new(tokio::sync::Mutex::new(WatchedBatchState::default())),
             file_exists_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_config: Arc::new(RwLock::new(None)),
@@ -6390,13 +6396,16 @@ impl LaravelLanguageServer {
     /// no magic work). The flow (#80):
     ///
     /// 1. Snapshot the file's pre-save class surfaces (the hierarchy still
-    ///    holds them — nothing has re-parsed yet).
+    ///    holds them — nothing has re-parsed yet) and, for a provider, its
+    ///    registration contribution (macros / bindings / facade aliases).
     /// 2. Push the saved buffer into Salsa, run the instant per-file refresh
     ///    (which re-parses, updates the hierarchy, records receiver deps, and
     ///    updates the file's view-render contribution).
-    /// 3. Diff pre/post surfaces and view renders. A body-only edit — the
-    ///    overwhelming majority of saves — diffs empty and stops here: no
-    ///    other file's resolution can have changed.
+    /// 3. Diff pre/post surfaces, registrations, and view renders. An edit
+    ///    that changes none of them — the overwhelming majority of saves —
+    ///    diffs empty and stops here: no other file's resolution can have
+    ///    changed. (Registration diffs are what catch a `boot()`/`register()`
+    ///    body edit whose surface diff is empty, #255.)
     /// 4. Otherwise re-resolve only the actual blast radius (dependents of
     ///    the changed classes + their descendants, plus Blade files of views
     ///    whose variable types changed) in the background, at bounded
@@ -6437,6 +6446,24 @@ impl LaravelLanguageServer {
             debug!("Failed to update Salsa on save for {}: {}", path_str, e);
         }
 
+        // Registration snapshot pair (#255) — a provider's macros / bindings /
+        // facade aliases live in `boot()`/`register()` BODIES, so a
+        // registration edit leaves the class-surface diff below empty and
+        // would never ripple to dependent call sites. One transactional call:
+        // `before` is the actor-kept baseline (last save), NOT the live
+        // inputs — the did_change debounce eagerly overwrites those on every
+        // typing pause, so a pre-save read here would already see the edited
+        // text and diff empty. `Some(text)` re-registers the saved buffer
+        // (provider input, or config/app.php's config input) before `after`
+        // is read, and advances the baseline. Taken before the per-file
+        // refresh so that pass already sees the fresh registries. Cheap for
+        // the non-provider majority: an untracked path yields empty defaults.
+        let (old_registrations, new_registrations) = self
+            .salsa
+            .file_provider_registrations(path.clone(), Some(text.to_string()))
+            .await
+            .unwrap_or_default();
+
         let changed_views = self.refresh_file_magic(&path, text).await;
 
         let new_surfaces = self
@@ -6444,15 +6471,27 @@ impl LaravelLanguageServer {
             .file_class_surfaces(path.clone())
             .await
             .unwrap_or_default();
-        let changed_classes =
+        let mut changed_classes =
             laravel_lsp::class_hierarchy_index::surface_map_diff(&old_surfaces, &new_surfaces);
+        // A body-only registration edit ripples through the same blast radius
+        // as a surface change: the emitted keys are what dependent call sites
+        // recorded in the reverse index (macro host FQCNs, binding/alias
+        // concretes, the provider's own path), and expand_class_descendants
+        // passes unknown seeds through unchanged into dependents_of (#255).
+        changed_classes.extend(registration_ripple_keys(
+            &old_registrations,
+            &new_registrations,
+            &path,
+        ));
 
         // The per-file refresh above already mutated the live indexes —
         // keep the disk cache converging regardless of ripple size.
         self.schedule_magic_cache_save().await;
 
         if changed_classes.is_empty() && changed_views.is_empty() {
-            return; // body-only edit — nothing beyond this file can change
+            // No surface, render, or registration change — nothing beyond
+            // this file can have changed.
+            return;
         }
 
         // The ripple runs in the background so did_save returns promptly. The
@@ -6461,11 +6500,14 @@ impl LaravelLanguageServer {
         let server = self.clone_for_spawn();
         let mut already_refreshed = HashSet::new();
         already_refreshed.insert(path.clone());
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             server
                 .refresh_magic_dependents(&already_refreshed, changed_classes, changed_views)
                 .await;
         });
+        // Kept awaitable for the save-path regression tests (#255) — mirrors
+        // `magic_rebuild_handle` on the watched-files batch.
+        *self.magic_ripple_handle.write().await = Some(handle);
     }
 
     /// Re-resolve the blast radius of a surface or render change: dependents
@@ -16952,6 +16994,7 @@ return [
             pending_rescans: self.pending_rescans.clone(),
             rescan_debounce_handle: self.rescan_debounce_handle.clone(),
             magic_rebuild_handle: self.magic_rebuild_handle.clone(),
+            magic_ripple_handle: self.magic_ripple_handle.clone(),
             magic_batch_state: self.magic_batch_state.clone(),
             file_exists_cache: self.file_exists_cache.clone(),
             cached_config: self.cached_config.clone(),
