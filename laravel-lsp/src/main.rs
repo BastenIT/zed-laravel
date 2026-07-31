@@ -4564,7 +4564,7 @@ impl LaravelLanguageServer {
     }
 
     /// Run a full cold reindex in response to the `laravel.reindexProject`
-    /// command (dispatched by the "Laravel: Reindex project" code action).
+    /// command (dispatched by the "Laravel CE: Reindex project" code action).
     ///
     /// "Cold" means every cached artifact is thrown away and rebuilt from
     /// source, in this order:
@@ -4636,7 +4636,7 @@ impl LaravelLanguageServer {
         let progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
             self.client.clone(),
             laravel_lsp::indexing_progress::INDEXING_TOKEN,
-            "Laravel",
+            laravel_lsp::indexing_progress::PROGRESS_TITLE,
             "Reindexing project…",
             Some(0),
         )
@@ -7726,7 +7726,7 @@ impl LaravelLanguageServer {
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
-                    source: Some("laravel".to_string()),
+                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                     message: "Unexpected leading '|' in validation rules".to_string(),
                     related_information: None,
                     tags: None,
@@ -7752,7 +7752,7 @@ impl LaravelLanguageServer {
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
-                    source: Some("laravel".to_string()),
+                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                     message: "Unexpected trailing '|' in validation rules".to_string(),
                     related_information: None,
                     tags: None,
@@ -7780,7 +7780,7 @@ impl LaravelLanguageServer {
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
-                        source: Some("laravel".to_string()),
+                        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                         message: "Empty validation rule between '||'".to_string(),
                         related_information: None,
                         tags: None,
@@ -7826,7 +7826,7 @@ impl LaravelLanguageServer {
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
-                        source: Some("laravel".to_string()),
+                        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                         message: format!("Unknown validation rule: '{}'", rule_name),
                         related_information: None,
                         tags: None,
@@ -7858,7 +7858,7 @@ impl LaravelLanguageServer {
                                 },
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 code: None,
-                                source: Some("laravel".to_string()),
+                                source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                 message: format!("Rule '{}' requires a table name", rule_name),
                                 related_information: None,
                                 tags: None,
@@ -7925,7 +7925,7 @@ impl LaravelLanguageServer {
                                         },
                                         severity: Some(DiagnosticSeverity::ERROR),
                                         code: None,
-                                        source: Some("laravel".to_string()),
+                                        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                         message: format!(
                                             "Table '{}' not found in database",
                                             table_name_ref
@@ -7965,7 +7965,9 @@ impl LaravelLanguageServer {
                                                 },
                                                 severity: Some(DiagnosticSeverity::ERROR),
                                                 code: None,
-                                                source: Some("laravel".to_string()),
+                                                source: Some(
+                                                    laravel_lsp::DIAGNOSTIC_SOURCE.to_string(),
+                                                ),
                                                 message: format!(
                                                     "Column '{}' not found in table '{}'",
                                                     column_param, table_name_ref
@@ -7996,7 +7998,7 @@ impl LaravelLanguageServer {
                             },
                             severity: Some(DiagnosticSeverity::ERROR),
                             code: None,
-                            source: Some("laravel".to_string()),
+                            source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                             message: format!(
                                 "Rule '{}' requires a table name parameter",
                                 rule_name
@@ -8109,7 +8111,7 @@ impl LaravelLanguageServer {
                         let _ = toast_client
                             .show_message_request(
                                 MessageType::INFO,
-                                "Laravel: database reconnected — DB-aware features re-enabled."
+                                "Laravel CE: database reconnected — DB-aware features re-enabled."
                                     .to_string(),
                                 Some(dismiss()),
                             )
@@ -15132,7 +15134,7 @@ return [
             },
             severity: Some(severity),
             code: None,
-            source: Some("laravel".to_string()),
+            source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
             message,
             related_information: None,
             tags: None,
@@ -15230,7 +15232,7 @@ return [
             },
             severity: Some(DiagnosticSeverity::WARNING),
             code: None,
-            source: Some("laravel".to_string()),
+            source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
             message,
             related_information: None,
             tags: None,
@@ -16760,7 +16762,7 @@ return [
         let progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
             self.client.clone(),
             laravel_lsp::indexing_progress::RENAME_TOKEN,
-            "Laravel",
+            laravel_lsp::indexing_progress::PROGRESS_TITLE,
             format!("Renaming {old_basename} → {new_basename}…"),
             None,
         )
@@ -17103,7 +17105,7 @@ return [
             },
             severity: Some(DiagnosticSeverity::INFORMATION),
             code: None,
-            source: Some("laravel".to_string()),
+            source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
             message: "Laravel dependencies not installed. Run 'composer install' for full validation autocomplete support.".to_string(),
             related_information: None,
             tags: None,
@@ -17201,7 +17203,7 @@ return [
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
-                    source: Some("laravel".to_string()),
+                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                     message: format!("Route not found in index: '{}'", r.name),
                     related_information: None,
                     tags: None,
@@ -17266,7 +17268,7 @@ return [
             },
             severity: Some(DiagnosticSeverity::ERROR),
             code: None,
-            source: Some("laravel".to_string()),
+            source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
             message: format!(
                 "Inertia page not found: '{}'\nExpected at: {}",
                 page_ref.name, expected_hint
@@ -17372,7 +17374,7 @@ return [
             },
             severity: Some(severity),
             code: None,
-            source: Some("laravel".to_string()),
+            source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
             message,
             related_information: None,
             tags: None,
@@ -17570,7 +17572,7 @@ return [
                         },
                         severity: Some(severity),
                         code: None,
-                        source: Some("laravel".to_string()),
+                        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                         message: format!(
                             "View file not found: '{}'\nExpected at: {}",
                             view_ref.name, expected_path
@@ -17710,7 +17712,7 @@ return [
                         },
                         severity: Some(severity),
                         code: None,
-                        source: Some("laravel".to_string()),
+                        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                         message,
                         related_information: None,
                         tags: None,
@@ -17742,7 +17744,7 @@ return [
                         },
                         severity: Some(DiagnosticSeverity::WARNING),
                         code: None,
-                        source: Some("laravel".to_string()),
+                        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                         message: format!(
                             "Avoid using env() outside of config files.\n\n\
                             When config is cached (`php artisan config:cache`), the .env file \
@@ -17801,7 +17803,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel".to_string()),
+                                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                     message: format!(
                                         "Middleware '{}' not found\nClass: {}\nExpected at: {}\n\nThe middleware alias is registered but the class file doesn't exist.\n💡 Click to view where the alias is defined.",
                                         middleware_name,
@@ -17866,7 +17868,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel".to_string()),
+                                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                     message: format!(
                                         "Middleware '{}' not found\nExpected at: {}\n\nCreate the middleware or add an alias in bootstrap/app.php",
                                         middleware_name,
@@ -17905,7 +17907,7 @@ return [
                                 },
                                 severity: Some(DiagnosticSeverity::INFORMATION),
                                 code: None,
-                                source: Some("laravel".to_string()),
+                                source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                 message: format!(
                                     "Middleware '{}' not found\n\nIf this middleware exists, add an alias in bootstrap/app.php",
                                     middleware_name
@@ -18017,7 +18019,7 @@ return [
                                         },
                                         severity: Some(DiagnosticSeverity::ERROR),
                                         code: None,
-                                        source: Some("laravel".to_string()),
+                                        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                         message,
                                         related_information: None,
                                         tags: None,
@@ -18089,7 +18091,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel".to_string()),
+                                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                     message: format!(
                                         "Container binding '{}' not found\n\nDefine this binding in a service provider's register() method",
                                         binding_name
@@ -18153,7 +18155,7 @@ return [
                                     // The app keeps running, so this is a WARNING.
                                     severity: Some(DiagnosticSeverity::WARNING),
                                     code: None,
-                                    source: Some("laravel".to_string()),
+                                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                     message: format!(
                                         "Feature class not found: '{}'\nExpected at: {}",
                                         feature_ref.feature_name,
@@ -18198,7 +18200,7 @@ return [
                                 // throw (see UnknownFeatureResolved). WARNING.
                                 severity: Some(DiagnosticSeverity::WARNING),
                                 code: None,
-                                source: Some("laravel".to_string()),
+                                source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                 message: format!(
                                     "Feature not found: '{}'\nExpected at: {}",
                                     feature_ref.feature_name,
@@ -18318,7 +18320,7 @@ return [
                                 },
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 code: None,
-                                source: Some("laravel".to_string()),
+                                source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                 message: format!(
                                     "View file not found: '{}'\nExpected at: {}",
                                     view_name, expected_path
@@ -18379,7 +18381,7 @@ return [
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
                 code: None,
-                source: Some("laravel".to_string()),
+                source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                 message: format!(
                     "Blade component not found: '{}'\nExpected at: {}",
                     comp_ref.name, expected_path
@@ -18434,7 +18436,7 @@ return [
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
-                    source: Some("laravel".to_string()),
+                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                     message: format!("Livewire component not found: '{}'", lw_ref.name),
                     related_information: None,
                     tags: None,
@@ -18516,7 +18518,7 @@ return [
                                     // throw (see UnknownFeatureResolved). WARNING.
                                     severity: Some(DiagnosticSeverity::WARNING),
                                     code: None,
-                                    source: Some("laravel".to_string()),
+                                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                                     message: format!(
                                         "Feature not found: '{}'\nExpected at: {}",
                                         feature_name,
@@ -18587,7 +18589,7 @@ return [
                     },
                     severity: Some(DiagnosticSeverity::HINT),
                     code: None,
-                    source: Some("laravel".to_string()),
+                    source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                     message: format!(
                         "Cannot resolve type for '{}'\n\nTo enable autocomplete, ensure the variable is passed from:\n- Controller with return view('...', compact('{}'))\n- Livewire component with public property or #[Computed] method\n- View component with constructor parameter\n- @props directive with type hint\n- @foreach loop where the iterable's type carries a generic element (e.g. `@return Collection<int, Audit>`)",
                         access.variable_name,
@@ -21274,7 +21276,7 @@ impl LaravelLanguageServer {
             out.push(Diagnostic {
                 range,
                 severity: Some(DiagnosticSeverity::WARNING),
-                source: Some("laravel-lsp".to_string()),
+                source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
                 message,
                 ..Default::default()
             });
@@ -21644,7 +21646,7 @@ impl LanguageServer for LaravelLanguageServer {
                 }),
 
                 // ✅ Code actions for quick fixes (create missing views, etc.)
-                // and the always-available "Laravel: Reindex project" action
+                // and the always-available "Laravel CE: Reindex project" action
                 // (a `source`-kind action carrying the reindex command).
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
 
@@ -21788,16 +21790,16 @@ impl LanguageServer for LaravelLanguageServer {
         tokio::spawn(async move {
             // Open a single LSP work-done progress token that spans the
             // full first-load indexing flow (config → files → warming).
-            // Title is just "Laravel" so the user can see at a glance
-            // which extension owns the status-bar entry — Zed's status
-            // bar can host multiple LSP progress entries simultaneously
-            // and an unbranded one would be ambiguous. The descriptive
-            // detail ("Indexing 12,345 of 40,589 files") lives in the
-            // `message` so the title stays short.
+            // Title is just the brand (`PROGRESS_TITLE`) so the user can
+            // see at a glance which extension owns the status-bar entry —
+            // Zed's status bar can host multiple LSP progress entries
+            // simultaneously and an unbranded one would be ambiguous. The
+            // descriptive detail ("Indexing 12,345 of 40,589 files") lives
+            // in the `message` so the title stays short.
             //
             // If the client doesn't support work-done-progress, `begin`
             // returns None and the rest of the flow just skips reports.
-            // Status bar stays brand-clean — `Laravel — Starting indexer…`.
+            // Status bar stays brand-clean — `Laravel CE — Starting indexer…`.
             // No emoji prefix: other status-bar entries don't carry one,
             // and a 🚀 here would stand out as gaudy rather than help.
             // The build hash lives in the startup banner (LSP logs) only;
@@ -21806,7 +21808,7 @@ impl LanguageServer for LaravelLanguageServer {
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
                 laravel_lsp::indexing_progress::INDEXING_TOKEN,
-                "Laravel",
+                laravel_lsp::indexing_progress::PROGRESS_TITLE,
                 "Starting indexer…",
                 Some(0),
             )
@@ -24192,7 +24194,7 @@ impl LanguageServer for LaravelLanguageServer {
             context.diagnostics.len()
         );
 
-        // The "Laravel: Reindex project" action is always offered for PHP/Blade
+        // The "Laravel CE: Reindex project" action is always offered for PHP/Blade
         // files (subject to the request's `only` filter), independent of cursor
         // position and diagnostics — that's how a Zed extension exposes a global
         // command. Seed the response with it, then append the diagnostic-driven
@@ -24208,9 +24210,12 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Process each diagnostic to see if we can offer a fix
         for diagnostic in &context.diagnostics {
-            // Query-chain diagnostics (source: laravel-lsp) carry a structured
-            // `data` payload — offer rename + create-migration quick-fixes.
-            if diagnostic.source.as_deref() == Some("laravel-lsp") {
+            // Query-chain diagnostics carry a structured `data` payload —
+            // offer rename + create-migration quick-fixes. This arm
+            // `continue`s, so the predicate must NOT match the path-based
+            // diagnostics handled below it; see `is_chain_diagnostic` for
+            // why `source` alone is no longer enough to tell them apart.
+            if laravel_lsp::query_chain::code_actions::is_chain_diagnostic(diagnostic) {
                 if let Some(action) =
                     laravel_lsp::query_chain::code_actions::rename_action(diagnostic, uri)
                 {
@@ -24238,8 +24243,8 @@ impl LanguageServer for LaravelLanguageServer {
                 continue;
             }
 
-            // Check if this is our diagnostic (source: laravel)
-            if diagnostic.source.as_deref() != Some("laravel") {
+            // Check if this is our diagnostic (vs. another server's).
+            if diagnostic.source.as_deref() != Some(laravel_lsp::DIAGNOSTIC_SOURCE) {
                 continue;
             }
 
@@ -24266,7 +24271,7 @@ impl LanguageServer for LaravelLanguageServer {
 
     /// Handle `workspace/executeCommand`. The only command we declare is
     /// `laravel.reindexProject` (see `execute_command_provider` in
-    /// `initialize`), dispatched by the "Laravel: Reindex project" code action.
+    /// `initialize`), dispatched by the "Laravel CE: Reindex project" code action.
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,

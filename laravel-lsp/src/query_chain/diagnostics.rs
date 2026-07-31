@@ -55,7 +55,7 @@ use crate::laravel_introspector::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 
 /// Column methods whose first string arg we deliberately DON'T validate.
 /// `having` filters on aggregate *aliases* (`having('total', '>', 5)` after a
@@ -68,15 +68,16 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range
 /// is flagged — which is exactly what we want.
 const COLUMN_DIAG_DENY: &[&str] = &["having"];
 
-/// Diagnostic codes — stable strings the code-action handler keys off to offer
-/// the matching quick-fix. Kept here so the producer and the consumer share a
-/// single source of truth.
-pub const CODE_UNKNOWN_COLUMN: &str = "laravel-lsp.unknown-column";
-pub const CODE_UNKNOWN_RELATION: &str = "laravel-lsp.unknown-relation";
-pub const CODE_UNKNOWN_TABLE: &str = "laravel-lsp.unknown-table";
-/// A bare column that exists on more than one accessible table (issue #24) —
-/// the query would be ambiguous at runtime, so the user must qualify it.
-pub const CODE_AMBIGUOUS_COLUMN: &str = "laravel-lsp.ambiguous-column";
+/// Every `kind` value the chain-diagnostic constructors in this module stamp
+/// into their `data` payload: the three [`DiagKind`] variants rendered by
+/// [`make_diagnostic`] (also used by the dynamic-`where` builder, which is
+/// always a column) plus [`ambiguous_column_diagnostic`]'s own kind.
+///
+/// This is the whitelist [`super::code_actions::is_chain_diagnostic`] routes
+/// on, so a new kind added below must be added here too or its quick-fixes
+/// never get offered. `every_chain_diagnostic_is_recognised_by_the_gate` in
+/// this module's tests fails on that drift.
+pub const CHAIN_DIAG_KINDS: &[&str] = &["column", "relation", "table", "ambiguous-column"];
 
 /// What kind of identifier a link's first string arg names. Derived from the
 /// link's `ArgKind`, collapsed to the three things we can validate.
@@ -771,8 +772,7 @@ fn make_dynamic_where_diagnostic(
     Diagnostic {
         range,
         severity: Some(severity),
-        code: Some(NumberOrString::String(CODE_UNKNOWN_COLUMN.to_string())),
-        source: Some("laravel-lsp".to_string()),
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
         ..Default::default()
@@ -958,7 +958,7 @@ fn needle_range(lit_span: (usize, usize), needle: &str, content: &str) -> Range 
     }
 }
 
-/// Build the `laravel-lsp.ambiguous-column` diagnostic for a bare column that
+/// Build the `ambiguous-column` diagnostic for a bare column that
 /// exists on more than one accessible table (issue #24). `tables` are the
 /// tables that define it; the message suggests qualifying with the first.
 fn ambiguous_column_diagnostic(
@@ -984,8 +984,7 @@ fn ambiguous_column_diagnostic(
     Diagnostic {
         range,
         severity: Some(severity),
-        code: Some(NumberOrString::String(CODE_AMBIGUOUS_COLUMN.to_string())),
-        source: Some("laravel-lsp".to_string()),
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
         ..Default::default()
@@ -1009,10 +1008,10 @@ fn make_diagnostic(
 ) -> Diagnostic {
     let range = needle_range(lit_span, needle, content);
 
-    let (code, data_kind) = match kind {
-        DiagKind::Column => (CODE_UNKNOWN_COLUMN, "column"),
-        DiagKind::Relation => (CODE_UNKNOWN_RELATION, "relation"),
-        DiagKind::Table => (CODE_UNKNOWN_TABLE, "table"),
+    let data_kind = match kind {
+        DiagKind::Column => "column",
+        DiagKind::Relation => "relation",
+        DiagKind::Table => "table",
     };
 
     // `subject` is the raw table name (Column), the model FQCN (Relation), or
@@ -1042,8 +1041,7 @@ fn make_diagnostic(
     Diagnostic {
         range,
         severity: Some(severity),
-        code: Some(NumberOrString::String(code.to_string())),
-        source: Some("laravel-lsp".to_string()),
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
         ..Default::default()

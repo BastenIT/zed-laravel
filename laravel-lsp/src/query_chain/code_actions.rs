@@ -39,10 +39,45 @@ struct ChainDiagData {
     tables: Vec<String>,
 }
 
+/// Is this one of *our* query-chain diagnostics — the kind that carries a
+/// structured payload and can be offered rename / qualify / create-migration
+/// quick-fixes?
+///
+/// Both halves matter. Every diagnostic this server publishes shares a single
+/// [`crate::DIAGNOSTIC_SOURCE`] (it's a brand string the user reads, so it
+/// can't also encode which engine produced it), so the `data` payload is the
+/// only thing separating a chain diagnostic from a path-based one such as
+/// "View file not found". `main.rs`'s `code_action` routes on this: its
+/// chain arm `continue`s, so if this ever returned `true` for a path-based
+/// diagnostic, the create-file quick-fixes below it would silently stop being
+/// offered — no compile error, no panic, just a lightbulb that never appears.
+///
+/// So the payload half is matched *positively*, against
+/// [`super::diagnostics::CHAIN_DIAG_KINDS`] — the exact `kind` values the
+/// producer stamps — not merely "has a `data` field". Today nothing else on
+/// this server attaches `data` to a diagnostic, but the day something does
+/// (for its own unrelated reason) a `data.is_some()` gate would swallow it
+/// into the chain arm and silently strip its quick-fixes. Recognising only
+/// our own kinds fails closed instead: an unknown payload falls through to
+/// the path-based arm, which is where every non-chain diagnostic belongs.
+///
+/// Extracted here (rather than inlined at the call site) precisely so that
+/// contract is pinned by tests: `code_action` is an async LSP trait method
+/// that can't be exercised without a live server.
+pub fn is_chain_diagnostic(diagnostic: &Diagnostic) -> bool {
+    diagnostic.source.as_deref() == Some(crate::DIAGNOSTIC_SOURCE)
+        && diagnostic
+            .data
+            .as_ref()
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            .is_some_and(|kind| super::diagnostics::CHAIN_DIAG_KINDS.contains(&kind))
+}
+
 /// Pull the `data` payload off a chain diagnostic. Returns `None` for any
 /// diagnostic that isn't one of ours (wrong source, missing/foreign data).
 fn parse(diagnostic: &Diagnostic) -> Option<ChainDiagData> {
-    if diagnostic.source.as_deref() != Some("laravel-lsp") {
+    if !is_chain_diagnostic(diagnostic) {
         return None;
     }
     let data = diagnostic.data.as_ref()?;

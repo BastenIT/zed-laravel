@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/logo.svg" width="128" height="128" alt="Laravel for Zed">
+  <img src="docs/logo.svg" width="128" height="128" alt="Laravel (Community Edition) for Zed">
 </p>
 
-<h1 align="center">Laravel for Zed</h1>
+<h1 align="center">Laravel (Community Edition) for Zed</h1>
 
 <p align="center">
 <strong>Cmd+Click your way through Laravel projects</strong>
@@ -23,8 +23,22 @@
 </p>
 
 <p align="center">
-<sub>A community extension — not affiliated with Laravel LLC</sub>
+<sub>A community extension — not affiliated with Laravel LLC.<br>
+Listed on the Zed marketplace as <strong>Laravel (Community Edition)</strong>; abbreviated to <strong>Laravel CE</strong> or <strong>laravel-ce</strong> wherever Zed's UI is tight (status bar, language-server list, progress titles).</sub>
 </p>
+
+## Contents
+
+- [❤️ Why we built this](#️-why-we-built-this)
+- [⚖️ Which one should you use?](#️-which-one-should-you-use)
+- [✨ Features](#-features)
+- [📦 Install](#-install)
+- [⚙️ Configuration](#️-configuration)
+- [🩺 Troubleshooting](#-troubleshooting)
+- [🚧 Planned Features](#-planned-features)
+- [🤝 Contributing](#-contributing)
+
+📚 [Full documentation index](docs/README.md)
 
 ## ❤️ Why we built this
 
@@ -38,18 +52,22 @@ Everything is parsed statically with tree-sitter: the extension reads your files
 
 **⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since they were last indexed get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
 
+## ⚖️ Which one should you use?
 
-### Laravel across editors
+Laravel now ships an **official Zed extension** of its own. Both are good tools that answer the same questions in different ways: the official server boots your app via `artisan tinker` and asks the framework directly; this one reads your code and never runs it. Pick on that split — it's the part that won't change. Feature lists on both sides move every release.
 
-Laravel developers are spoiled for choice — every major editor has a strong way to work with the framework. Here's roughly where things stand and what each needs, so you can pick whatever fits how you work:
+> ⚠️ **You probably shouldn't run both at the same time.** Both register a language server for PHP and Blade, and both answer the same requests for the same patterns. Zed merges what every attached server returns, so running the pair tends to show you everything twice: two hover cards on one `view()` call, duplicate completion entries, two diagnostics for a single missing view. Nothing breaks — it's just noisy, the same way running three PHP LSPs at once is. If you'd rather keep both installed, disable one with a `"!"` prefix in your PHP / Blade [`language_servers`](docs/configuration.md) list.
 
-| Editor | Laravel-aware tooling | Cost |
-|---|---|---|
-| **PHPStorm** | Laravel support built in, powered by the [Laravel Idea](https://laravel-idea.com/) plugin | Paid IDE (free for non-commercial use) |
-| **VS Code** | [Official Laravel extension](https://github.com/laravel/vs-code-extension), maintained by the Laravel team | Free |
-| **Zed** | This extension, in addition to companion extensions:  [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade), [PHP](https://github.com/zed-extensions/php) (Intelephense), [phpcs](https://github.com/mike-bronner/zed-phpcs-lsp), and [phpmd](https://github.com/mike-bronner/zed-phpmd-lsp) | Free |
+| Choose **Laravel CE** — reads your code, never runs it | Choose the **official extension** — asks your running app directly |
+|---|---|
+| You spend time on branches where the app isn't always runnable: a half-applied migration, a missing `.env`, an unregistered provider, a database you're not connected to. Parsing carries on regardless. | Your app boots cleanly on demand, and you'd like Laravel itself to be the source of truth |
+| You open packages, libraries, and shared component sets — repos with no application at the root | You work on full applications, where running the app is already part of the loop |
+| You like knowing your editor only ever reads: no provider `boot()`, no container, nothing executed on your behalf | You're glad to have the editor run `artisan tinker` for you — it's what you'd type by hand to answer the same question |
+| You want what's **written** — the code on disk right now, including edits you haven't run yet | You want what's **resolved** — runtime-registered routes, computed config, and container state only a booted kernel can report |
+| You want re-indexing to stay cheap and incremental: an mtime-based cache, only changed files re-parsed | You want each index gathered fresh from the framework, so what you see matches what your app would do right now |
+| You want tooling that works the moment you clone a repo, with no PHP runtime to locate first | Your PHP environment is set up and humming (Herd / Valet / Sail / Lando / DDEV), and you want tooling that runs on the very same runtime your app does |
 
-<sub>A high-level snapshot as of 2026-05-30 — not a feature-by-feature scorecard. Every option here is capable and actively developed. (As of 2025, the Laravel Idea plugin is bundled free with PhpStorm.) Corrections welcome via PR.</sub>
+⚖️ **[Full comparison →](docs/comparison.md)** — Laravel tooling across editors, plus architecture, LSP capabilities, and a feature-by-feature snapshot against the official extension.
 
 ## ✨ Features
 
@@ -70,7 +88,9 @@ Each feature has a focused reference under [`docs/`](docs/) — click through to
 
 ## 📦 Install
 
-Search **"Laravel"** in Zed Extensions and click Install.
+Search **"Laravel"** in Zed Extensions and install **Laravel (Community Edition)**.
+
+The official **Laravel** extension shows up in the same search results — you'll [probably want just one of the two](#️-which-one-should-you-use).
 
 ### 🤝 Recommended companions
 
@@ -86,174 +106,17 @@ Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: in
 
 ## ⚙️ Configuration
 
-The extension works out of the box with **zero configuration** — it auto-discovers your view paths, component namespaces, route files, and service providers. Everything below is optional.
+The extension works out of the box with **zero configuration** — it auto-discovers your view paths, component namespaces, route files, and service providers. Everything else is optional.
 
-> ⚠️ **One conditional requirement.** If you set an explicit `language_servers` list for PHP or Blade (common when pinning a PHP LSP), that list *replaces* Zed's defaults — you **must** include `"laravel-lsp"` or the extension won't attach. Symptom: features work in `.env` files but do nothing in `.php` / `.blade.php`. The block below shows the correct form.
+> ⚠️ **The one thing that trips people up.** If you set an explicit `language_servers` list for PHP or Blade (common when pinning a PHP LSP), that list *replaces* Zed's defaults — you **must** include `"laravel-lsp"` or the extension won't attach. Symptom: features work in `.env` files but do nothing in `.php` / `.blade.php`.
 
-### 🎛️ All settings
-
-Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inline comments below are valid — copy what you need. Every value is shown at its **default**; delete a line to keep that default.
-
-```jsonc
-{
-  "lsp": {
-    // ── This extension's own settings ──────────────────────────────────
-    "laravel-lsp": {
-      "settings": {
-        // Delay (ms) before autocomplete refreshes after a keystroke.
-        // Lower 50–100 = snappier; higher 300–500 = less CPU.   Default: 200
-        "autoCompleteDebounce": 200,
-
-        "blade": {
-          // Space between a directive and its parentheses.
-          // false → @if($x)    true → @if ($x)                  Default: false
-          "directiveSpacing": false
-        },
-
-        "codeLens": {
-          // Reference-count lenses + unused-symbol diagnostic (opt-in while
-          // the feature matures). Guide: docs/code-lens.md.     Default: false
-          "enabled": false
-        },
-
-        "diagnostics": {
-          // Severity for query-chain diagnostics (unknown column / relation /
-          // table in Eloquent & DB::table() chains). Silent without a live DB
-          // connection. One of: "error" | "warning" | "info" | "off".
-          "severity": "warning"   // Default: "warning"
-        }
-      }
-    },
-
-    // ── Optional third-party language-server tweaks ────────────────────
-    // Silence shellcheck SC2034 "APP_NAME appears unused" on .env lines
-    // (Zed lints .env as Shell Script). The bashIde wrapper is required.
-    // Trade-offs & alternatives: docs/environment.md.
-    "bash-language-server": {
-      "settings": {
-        "bashIde": { "shellcheckArguments": ["--exclude=SC2034"] }
-      }
-    },
-
-    // Trim Intelephense goto-definition noise. This extension resolves facades,
-    // macros & mixins to their concrete implementation, so the generated IDE-helper
-    // stubs (and the PhpStorm meta file) only add duplicate facade/Eloquent hits to
-    // the goto multibuffer. Excluding them lets our resolution stand alone.
-    // Trade-off: Intelephense then loses completion for *package-added* facade
-    // methods (Scout, Telescope, Spatie…); core facade completion is unaffected
-    // (it reads framework docblocks, not the helper). Full rationale, the cache
-    // caveat, and a per-project `.intelephense.json` variant: docs/tuning-intelephense.md.
-    // Restart after editing (Cmd+Shift+P → "lsp: restart").
-    "intelephense": {
-      "settings": {
-        "files": {
-          "exclude": [
-            "**/stubs/**",            // scaffold templates (Jetstream, Filament…), never run
-            "**/_ide_helper*.php",    // barryvdh/laravel-ide-helper facade + model stubs
-            "**/.phpstorm.meta.php"   // PhpStorm container-binding type hints
-          ]
-        }
-      }
-    }
-  },
-
-  // ── Zed per-language toggles that unlock our features ───────────────
-  "languages": {
-    "PHP": {
-      // An explicit list REPLACES Zed's defaults, so "laravel-lsp" must appear
-      // or this extension won't attach; "..." re-expands the remaining defaults.
-      // Prefix a server with "!" to DISABLE it — pick ONE PHP LSP (Intelephense
-      // here) and turn the rest off, because running several PHP servers at once
-      // produces duplicate completions, hovers, and diagnostics.
-      "language_servers": ["laravel-lsp", "intelephense", "!phpactor", "!phptools", "..."],
-      // LSP outlines: our route-file outline + your PHP LSP's class outline.
-      // "on" | "off"                                            Default: "off"
-      "document_symbols": "on"
-    },
-    "Blade": {
-      // Same rules as PHP. "!phpactor" stops the PHP-oriented Phpactor server
-      // from also attaching to .blade.php files and double-reporting.
-      "language_servers": ["laravel-lsp", "!phpactor", "..."],
-      // Our Blade outline (@extends / @section / <x-*> / <livewire:*> …).
-      "document_symbols": "on",
-      // Highlight custom inline @directive() macros tree-sitter can't see
-      // (e.g. a @money($x) Blade::directive). Requires Zed semantic-token
-      // support; "combined" overlays them on the Blade extension's colors.
-      "semantic_tokens": "combined"
-    }
-  }
-}
-```
-
-### 🗄️ Database connection
-
-**Database autocomplete** (`exists:` / `unique:` rules, Eloquent properties) and query-chain diagnostics only work with a live database connection. Configure it in your `.env`:
-
-```env
-DB_CONNECTION=mysql
-DB_HOST=127.0.0.1
-DB_DATABASE=myapp
-DB_USERNAME=root
-DB_PASSWORD=secret
-```
-
-Supports MySQL, PostgreSQL, SQLite, and SQL Server.
-
-### 🗺️ Outline panel
-
-The extension populates Zed's outline panel and breadcrumbs with Laravel-specific structure that no PHP language server understands:
-
-- **Route files** — every `Route::get/post/...` call labelled `METHOD URI [name=...]`, with nested `Route::group(...)` calls becoming hierarchical containers labelled `group [prefix=..., name=...]`. Prefix and name chains propagate to children. Covers all Route methods including `resource`, `apiResource`, `singleton`, `livewire`, `view`, `redirect`, `fallback`, etc.
-- **Blade templates** — `@extends`, `@section`, `@push`, `@yield`, `@stack`, `@include*`, `@props`, plus the modern tag syntax: `<x-component>`, `<livewire:counter>`, `<flux:icon>`, `<x-slot:name>`. Paired tags nest their children; self-closing tags appear as leaves.
-
-PHP class outlines (controllers, models, Livewire components, jobs, services) come from whatever PHP language server you have installed — those servers have real semantic understanding of PHP that a tree-sitter walker can't match. The official [**PHP**](https://github.com/zed-extensions/php) Zed extension registers Intelephense, Phpactor, and PhpTools; install it and pick whichever LSP you prefer.
-
-**Requirements**
-
-| Outline | Requires |
-|---|---|
-| Route files | This extension, plus `document_symbols: on` for `PHP` (route files use the `PHP` language). |
-| Blade templates | This extension, the [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension (for the `Blade` language definition), plus `document_symbols: on` for `Blade`. |
-| PHP class files | A PHP language server (the [PHP](https://github.com/zed-extensions/php) extension provides Intelephense / Phpactor / PhpTools), plus `document_symbols: on` for `PHP`. |
-
-Zed defaults to tree-sitter outlines, which don't call any LSP — the `document_symbols: "on"` toggles in the [settings block above](#-all-settings) opt you into LSP outlines (`PHP` unlocks our route outline *and* your PHP LSP's class outline; `Blade` unlocks our Blade outline). This opt-in is a Zed quirk ([`zed#48780`](https://github.com/zed-industries/zed/pull/48780)) — clients that always request `textDocument/documentSymbol`, like Helix or Neovim, don't need it.
-
-> **Quirks worth knowing** — Zed colors outline labels by word-matching them against the source buffer's tree-sitter highlights, which produces slightly inconsistent colors on multi-segment URLs (e.g., `/cra-details` may color `cra` and `details` differently if they match different tokens elsewhere in the file). Route names appear in the LSP `detail` field, which Zed's outline panel doesn't currently render (VSCode and Sublime/LSP do). Both are tracked upstream: [zed#57576](https://github.com/zed-industries/zed/issues/57576).
+⚙️ **[Full settings reference →](docs/configuration.md)** — every option at its default (autocomplete debounce, Blade directive spacing, code lens, diagnostic severity), the third-party LSP tweaks, database-connection setup, and the outline-panel toggles.
 
 ## 🩺 Troubleshooting
 
-**The extension installed but nothing happens — no features, no Laravel entry in the language-server list.** Work through these in order; each is a real cause we've seen.
+**Installed, but nothing happens?** The usual causes, in order: Zed older than **0.205** (the minimum this extension builds against), the file isn't classified as PHP / Blade, or a `language_servers` override that omits `laravel-lsp`.
 
-### 1. Is your Zed new enough?
-
-The extension is built against `zed_extension_api 0.7.0`, which requires **Zed 0.205 or newer**. Older versions silently refuse to load it — the extension appears installed but never activates, and the log stays quiet. Check `Zed → About Zed` (or `zed --version`) and update if you're behind.
-
-### 2. Does Zed recognize the file as PHP / Blade?
-
-The language server only attaches to files Zed has classified as **PHP**, **Blade**, **XML**, or `.env` (Shell Script). Open a `.php` file and check the **bottom-right status bar**:
-
-- Says **"PHP"** → good, the language is registered.
-- Says **"Plain Text"** → install the official [**PHP**](https://github.com/zed-extensions/php) extension (and [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) for `.blade.php`). Without a language registered, no language server — ours included — can attach.
-
-### 3. Did you override `language_servers` for PHP or Blade?
-
-If features work in `.env` files but not in `.php` / `.blade.php`, you've almost certainly set an explicit `language_servers` list that omits `laravel-lsp`. See [the settings block](#-all-settings) for the fix — include `"laravel-lsp"` in the list.
-
-### 4. Check the language-server log
-
-The running servers show under the **lightning-bolt icon** in the status bar. For the full log: `Cmd+Shift+P → "open language server logs"` and look for **Laravel**. If it's missing entirely, the server never started (revisit steps 1–3). If it's present but erroring, the log will say why — please [open an issue](https://github.com/mike-bronner/zed-laravel/issues) with that output.
-
-### 5. Manual binary fallback
-
-The extension downloads its server binary from GitHub releases on first use. If that download is blocked (proxy, firewall, offline), drop the binary on your `PATH` instead — Zed will find it there. Grab the archive for your platform from the [latest release](https://github.com/mike-bronner/zed-laravel/releases/latest), then (macOS x86_64 shown):
-
-```bash
-tar -xzf ~/Downloads/laravel-lsp-macos-x64.tar.gz
-mkdir -p ~/.local/bin && mv laravel-lsp-macos-x64 ~/.local/bin/laravel-lsp
-chmod +x ~/.local/bin/laravel-lsp
-xattr -d com.apple.quarantine ~/.local/bin/laravel-lsp 2>/dev/null
-# ensure ~/.local/bin is on your PATH, then fully restart Zed
-```
+🩺 **[Troubleshooting guide →](docs/troubleshooting.md)** — the full five-step decision tree, how to read the language-server log, and the manual binary fallback for blocked downloads.
 
 ## 🚧 Planned Features
 
