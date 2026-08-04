@@ -67,6 +67,132 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve a directory's real git "common dir" — the directory holding the
+/// repository's shared object database and refs.
+///
+/// For an ordinary checkout this is just `<root>/.git`. For a **linked
+/// worktree** (`git worktree add`), `.git` is a *file* (not a directory)
+/// containing a `gitdir: <path>` pointer into the main checkout's
+/// `.git/worktrees/<name>/` admin directory, which itself contains a
+/// `commondir` file naming the actual shared `.git` directory (typically
+/// `../..`, relative to that admin directory). Following both hops and
+/// canonicalizing lands on the same path for every worktree of one repo,
+/// linked or main.
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let meta = fs::symlink_metadata(&dot_git).ok()?;
+
+    let git_dir = if meta.is_dir() {
+        dot_git
+    } else {
+        let contents = fs::read_to_string(&dot_git).ok()?;
+        let pointer = contents.trim().strip_prefix("gitdir:")?.trim();
+        let pointer_path = PathBuf::from(pointer);
+        if pointer_path.is_absolute() {
+            pointer_path
+        } else {
+            root.join(pointer_path)
+        }
+    };
+
+    let commondir_file = git_dir.join("commondir");
+    let common_dir = if commondir_file.is_file() {
+        let contents = fs::read_to_string(&commondir_file).ok()?;
+        let relative = PathBuf::from(contents.trim());
+        if relative.is_absolute() {
+            relative
+        } else {
+            git_dir.join(relative)
+        }
+    } else {
+        git_dir
+    };
+
+    common_dir.canonicalize().ok()
+}
+
+/// True if `a` and `b` are two worktrees (linked or main) of the same git
+/// repository.
+///
+/// Every worktree is a full checkout, so it carries its own `composer.json`
+/// and `artisan` — indistinguishable, by [`find_project_root`]'s markers
+/// alone, from a genuinely separate nested Laravel project. This check lets
+/// callers tell the two apart: a discovered root that's just another
+/// worktree of the project already open should never be treated as a
+/// distinct project root.
+pub fn is_same_git_repo(a: &Path, b: &Path) -> bool {
+    match (git_common_dir(a), git_common_dir(b)) {
+        (Some(dir_a), Some(dir_b)) => dir_a == dir_b,
+        _ => false,
+    }
+}
+
+/// The main worktree root for `path`'s repository — the checkout `git
+/// worktree add` was run from, found by taking [`git_common_dir`]'s parent
+/// (the shared `.git` directory always lives directly under the main
+/// worktree). Returns `None` when `path` isn't a git repo at all, or is
+/// already the main worktree itself (nothing to fall back to).
+fn git_main_worktree_root(path: &Path) -> Option<PathBuf> {
+    let main_root = git_common_dir(path)?.parent()?.to_path_buf();
+    let path_canonical = path.canonicalize().ok()?;
+    if path_canonical == main_root {
+        None
+    } else {
+        Some(main_root)
+    }
+}
+
+/// True if `path` is the MAIN worktree of its repository (not a linked one).
+///
+/// Only meaningful once the caller already knows `path` is *some* worktree
+/// of a repo whose identity matters — e.g. after [`is_same_git_repo`]
+/// confirmed two candidates share a repo, this tells them apart. Used to
+/// prefer the main checkout over a linked worktree when both resolve the
+/// same project: a linked worktree only gets what its branch happened to
+/// have at creation time (issue: a model class added on `main` after a
+/// Claude Code agent worktree branched off was invisible from inside that
+/// worktree — `git worktree add` is a point-in-time snapshot, not a live
+/// mirror), so once the active root drifts onto a linked worktree it should
+/// self-correct back to main, never the other way around.
+pub fn is_main_worktree(path: &Path) -> bool {
+    git_main_worktree_root(path).is_none()
+}
+
+/// Resolve `relative` under `root`, falling back to the same relative path
+/// under the main worktree root when `root` is a linked worktree and the
+/// file isn't present locally.
+///
+/// A linked worktree only gets git-tracked files — `git worktree add` never
+/// copies anything gitignored, so local dev config the project deliberately
+/// keeps untracked (`.env`, `docker-compose.override.yml`) is simply absent
+/// from a fresh worktree, even though the project it belongs to has one.
+/// Falling back to the main worktree's copy is safe specifically *because*
+/// the file is untracked: there's no tracked-file divergence between
+/// branches to accidentally paper over, only a copy that was never there to
+/// begin with.
+///
+/// Returns `root.join(relative)` unchanged when that exists, or when no
+/// fallback applies (not a worktree, or absent everywhere) — every existing
+/// caller's "file missing" handling keeps working as before.
+pub fn resolve_worktree_fallback(root: &Path, relative: &str) -> PathBuf {
+    let local = root.join(relative);
+    if local.exists() {
+        return local;
+    }
+
+    match git_main_worktree_root(root) {
+        Some(main_root) => {
+            let shared = main_root.join(relative);
+            if shared.exists() {
+                shared
+            } else {
+                local
+            }
+        }
+        None => local,
+    }
+}
+
 /// Load Blade component aliases from all known sources.
 ///
 /// Three independent sources are merged into a single `HashMap<alias, view-dot-path>`,

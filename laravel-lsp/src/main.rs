@@ -24,7 +24,7 @@ use laravel_lsp::cache_manager::{
 };
 use laravel_lsp::command_index::{build_command_index, CommandIndex};
 use laravel_lsp::completion_format::CompletionDoc;
-use laravel_lsp::config::find_project_root;
+use laravel_lsp::config::{find_project_root, is_same_git_repo};
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
 use laravel_lsp::path_containment::{
@@ -4130,6 +4130,41 @@ impl LaravelLanguageServer {
         Some(items)
     }
 
+    /// Fetch (or populate) the per-project-root cache of parsed Eloquent +
+    /// Query builder methods, sourced straight from the project's own
+    /// `vendor/laravel/framework` — no `ide-helper` stubs required. Shared by
+    /// `Model::|` completion and builder-method hover (M6.x): first checks
+    /// the read lock; on miss, parses synchronously off the executor thread,
+    /// then takes the write lock to insert. Two concurrent first-misses can
+    /// race — the second parse is wasted work but the insert overwrites
+    /// cleanly, so correctness is fine. `None` when `vendor/` doesn't have
+    /// either Builder file (the user probably hasn't run `composer install`).
+    async fn get_builder_method_index(
+        &self,
+        root: &Path,
+    ) -> Option<Arc<laravel_lsp::laravel_introspector::BuilderMethodIndex>> {
+        let cached = {
+            let cache = self.builder_method_index_cache.read().await;
+            cache.get(root).cloned()
+        };
+        if let Some(arc) = cached {
+            return Some(arc);
+        }
+        let root_for_parse = root.to_path_buf();
+        let parsed = tokio::task::spawn_blocking(move || {
+            laravel_lsp::laravel_introspector::parse_builder_methods(&root_for_parse)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        let arc = Arc::new(parsed);
+        self.builder_method_index_cache
+            .write()
+            .await
+            .insert(root.to_path_buf(), arc.clone());
+        Some(arc)
+    }
+
     /// Method-name completion at `Model::|` (and partial-typed variants
     /// like `Model::wher|`).
     ///
@@ -4220,32 +4255,7 @@ impl LaravelLanguageServer {
         }
 
         // 5. Fetch (or populate) the per-project-root builder method index.
-        // First check the read lock; on miss, parse synchronously off the
-        // executor thread, then take the write lock to insert. Two
-        // concurrent first-misses can race — the second parse is wasted
-        // work but the insert overwrites cleanly, so correctness is fine.
-        let index = {
-            let cache = self.builder_method_index_cache.read().await;
-            cache.get(&root).cloned()
-        };
-        let index = match index {
-            Some(arc) => arc,
-            None => {
-                let root_for_parse = root.clone();
-                let parsed = tokio::task::spawn_blocking(move || {
-                    laravel_lsp::laravel_introspector::parse_builder_methods(&root_for_parse)
-                })
-                .await
-                .ok()
-                .flatten()?;
-                let arc = Arc::new(parsed);
-                self.builder_method_index_cache
-                    .write()
-                    .await
-                    .insert(root.clone(), arc.clone());
-                arc
-            }
-        };
+        let index = self.get_builder_method_index(&root).await?;
 
         // 6. Render items. Builder methods + local scopes from the
         // resolved model (and its parents/traits). Scope extraction
@@ -5610,13 +5620,27 @@ impl LaravelLanguageServer {
     /// and incremental updates automatically.
     ///
     /// Priority: .env.example=0, .env.local=1, .env=2 (higher wins)
+    ///
+    /// Each path runs through `resolve_worktree_fallback`: `.env`/`.env.local`
+    /// are gitignored, so a linked worktree never has its own copy — fall
+    /// back to the main worktree's file rather than resolving env() calls
+    /// against nothing.
     async fn register_env_files_with_salsa(&self, root: &Path) {
         // Define env files with their priorities
         // Priority: 0=.env.example, 1=.env.local, 2=.env
         let env_files = [
-            (root.join(".env.example"), 0u8),
-            (root.join(".env.local"), 1u8),
-            (root.join(".env"), 2u8),
+            (
+                laravel_lsp::config::resolve_worktree_fallback(root, ".env.example"),
+                0u8,
+            ),
+            (
+                laravel_lsp::config::resolve_worktree_fallback(root, ".env.local"),
+                1u8,
+            ),
+            (
+                laravel_lsp::config::resolve_worktree_fallback(root, ".env"),
+                2u8,
+            ),
         ];
 
         let documents = self.documents.read().await;
@@ -7507,32 +7531,73 @@ impl LaravelLanguageServer {
                 true
             }
             Some(current) => {
-                // Check if file is outside current root
-                let file_outside_root = !file_path.starts_with(current);
-
-                // Check if discovered root is more specific (nested within current root)
-                let more_specific =
-                    discovered_root.starts_with(current) && discovered_root != *current;
-
-                if file_outside_root {
-                    info!(
-                        "File {:?} is outside current root {:?}, switching to discovered root: {:?}",
-                        file_path, current, discovered_root
-                    );
-                    true
-                } else if more_specific {
-                    info!(
-                        "Discovered more specific Laravel root {:?} (current: {:?})",
-                        discovered_root, current
-                    );
-                    true
+                // A linked git worktree is a full checkout, so it carries its
+                // own composer.json + artisan — indistinguishable, by marker
+                // alone, from a genuinely separate/nested Laravel project.
+                // Without this check, opening a file inside a worktree (e.g.
+                // one of Claude Code's `.claude/worktrees/<name>/`, or any
+                // manually-created sibling worktree) would look like either
+                // "more specific" or "outside root" below and hijack the
+                // active project root, forcing a full re-index and aborting
+                // any in-flight DB connection for no reason: it's the same
+                // project.
+                if is_same_git_repo(&discovered_root, current) {
+                    // Same repo, different worktree — don't thrash between
+                    // them (that's the case above). But an asymmetric
+                    // exception: self-correct BACK to the main worktree if
+                    // the active root has drifted onto a linked one. A
+                    // linked worktree is a point-in-time snapshot — a class
+                    // added on `main` after the worktree branched off is
+                    // invisible from inside it (confirmed live: a model
+                    // class only main had went unresolved for every hover/
+                    // goto while root sat on a Claude Code agent worktree),
+                    // so once stuck there nothing else would ever pull it
+                    // back. Never the other direction: switching FROM main
+                    // TO a linked worktree is exactly the original
+                    // disruptive hijack this guard exists to prevent.
+                    if !laravel_lsp::config::is_main_worktree(current)
+                        && laravel_lsp::config::is_main_worktree(&discovered_root)
+                    {
+                        info!(
+                            "Discovered root {:?} is the main worktree — correcting back from linked worktree {:?}",
+                            discovered_root, current
+                        );
+                        true
+                    } else {
+                        debug!(
+                            "Discovered root {:?} is a worktree of the current repo {:?} — keeping current root",
+                            discovered_root, current
+                        );
+                        false
+                    }
                 } else {
-                    // File is within current root and discovered isn't more specific
-                    debug!(
-                        "Keeping current root {:?} for file {:?}",
-                        current, file_path
-                    );
-                    false
+                    // Check if file is outside current root
+                    let file_outside_root = !file_path.starts_with(current);
+
+                    // Check if discovered root is more specific (nested within current root)
+                    let more_specific =
+                        discovered_root.starts_with(current) && discovered_root != *current;
+
+                    if file_outside_root {
+                        info!(
+                            "File {:?} is outside current root {:?}, switching to discovered root: {:?}",
+                            file_path, current, discovered_root
+                        );
+                        true
+                    } else if more_specific {
+                        info!(
+                            "Discovered more specific Laravel root {:?} (current: {:?})",
+                            discovered_root, current
+                        );
+                        true
+                    } else {
+                        // File is within current root and discovered isn't more specific
+                        debug!(
+                            "Keeping current root {:?} for file {:?}",
+                            current, file_path
+                        );
+                        false
+                    }
                 }
             }
         };
@@ -18786,13 +18851,32 @@ return [
         let Ok(path) = uri.to_file_path() else {
             return String::new();
         };
+        // Builder-method hover (`orderByDesc`, `where`, …) needs the project's
+        // parsed vendor Builder surface — fetch/populate the cached index for
+        // the current root so `resolve_and_classify` can fall back to it when
+        // nothing in the model's own hierarchy declares the member. `None`
+        // when there's no root yet or vendor/ is missing; the Salsa side
+        // degrades to today's behavior (no card) in that case.
+        let root = self.root_path.read().await.clone();
+        let builder_index = match &root {
+            Some(root) => self.get_builder_method_index(root).await,
+            None => None,
+        };
+        info!(
+            "🪄 hover_for_magic_member: root={:?} builder_index={}",
+            root,
+            builder_index.is_some()
+        );
         let data = match self
             .salsa
-            .resolve_magic_member_at(path, member_ref.line, member_ref.column)
+            .resolve_magic_member_at(path, member_ref.line, member_ref.column, builder_index)
             .await
         {
             Ok(Some(d)) => d,
-            _ => return String::new(),
+            other => {
+                info!("🪄 hover_for_magic_member: resolve_magic_member_at -> {other:?}");
+                return String::new();
+            }
         };
         // Method-backed member (relationship / scope / accessor / facade method):
         // read the declaring file (usually a different file — the model, or a
@@ -18827,6 +18911,14 @@ return [
                 .filter(|s| !s.is_empty()),
             _ => None,
         };
+        // Builder-forwarded method: no decl_file to slice (there's no
+        // project-local declaration), so the general snippet extraction above
+        // always yields `None` for this kind — fill in from the pre-extracted
+        // vendor signature/summary instead. `builder_signature`/`_summary` are
+        // `Some` only for `MagicMemberKind::BuilderMethod`, so this can't
+        // clobber any other kind's real snippet/description.
+        let definition = definition.or_else(|| data.builder_signature.clone());
+        let facade_description = facade_description.or_else(|| data.builder_summary.clone());
 
         // Columns (M6.2): confirm + type via migrations-first, DB fallback. A
         // *tentative* column (the resolver couldn't classify it — a plain,
@@ -18959,12 +19051,18 @@ return [
         use laravel_lsp::salsa_impl::MagicMemberKind;
         let data = self
             .salsa
-            .resolve_magic_member_at(file_path.to_path_buf(), member.line, member.column)
+            // Goto-definition never wants the builder-method fallback — a
+            // vendor-forwarded method has no project-local declaration to
+            // jump to.
+            .resolve_magic_member_at(file_path.to_path_buf(), member.line, member.column, None)
             .await
             .ok()
             .flatten()?;
 
-        if matches!(data.kind, MagicMemberKind::PlainMember) {
+        if matches!(
+            data.kind,
+            MagicMemberKind::PlainMember | MagicMemberKind::BuilderMethod
+        ) {
             return None;
         }
 
@@ -19133,7 +19231,14 @@ return [
         // 1. Identify the column under the cursor: model FQCN + column name.
         let data = self
             .salsa
-            .resolve_magic_member_at(file_path.to_path_buf(), position.line, position.character)
+            // Column rename only ever matches `MagicMemberKind::Column` below —
+            // no builder-method fallback needed here.
+            .resolve_magic_member_at(
+                file_path.to_path_buf(),
+                position.line,
+                position.character,
+                None,
+            )
             .await
             .ok()
             .flatten()?;
@@ -23197,7 +23302,9 @@ impl LanguageServer for LaravelLanguageServer {
         // `email`.
         if let Ok(Some(data)) = self
             .salsa
-            .resolve_magic_member_at(file_path.clone(), position.line, position.character)
+            // Prepare-rename only matches `Column` below — no builder-method
+            // fallback needed here.
+            .resolve_magic_member_at(file_path.clone(), position.line, position.character, None)
             .await
         {
             if matches!(data.kind, laravel_lsp::salsa_impl::MagicMemberKind::Column) {
