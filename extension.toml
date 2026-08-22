@@ -15,4 +15,5 @@ version = "0.7.1"
 name = "Laravel CE"
 # XML: for phpunit.xml env var autocomplete
 # Shell Script: Zed treats .env files as Shell Script (see bash/config.toml path_suffixes)
-languages = ["PHP", "Blade", "XML", "Shell Script"]
+# env: .env files remapped to the "env" extension's language via a user file_types setting
+languages = ["PHP", "Blade", "XML", "Shell Script", "env"]

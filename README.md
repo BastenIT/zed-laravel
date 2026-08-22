@@ -85,6 +85,7 @@ Each feature has a focused reference under [`docs/`](docs/) — click through to
 | [⚡ Quick Actions](docs/quick-actions.md) | One-click create missing views, components, middleware, features, and migrations |
 | [🎨 Blade Editing](docs/blade-editing.md) | Directive autocomplete, smart bracket expansion, closing-tag navigation |
 | [🗺️ Outline Panel](docs/outline.md) | Laravel-aware route + Blade structure in Zed's outline and breadcrumbs |
+| [🌱 Quiet `.env` files](docs/environment.md) | Auto-mutes shellcheck's false "appears unused" warning on every `.env` line in Laravel worktrees — your own shellcheck arguments are preserved, opt-out available |
 
 ## 📦 Install
 

@@ -6,23 +6,37 @@ Open a `.env` in Zed and every single line lights up with a warning:
 
 > `APP_NAME appears unused. Verify use (or export if used externally)`
 
-Nothing is wrong with your file, and it isn't this extension. The message is shellcheck's [SC2034](https://www.shellcheck.net/wiki/SC2034). Zed classifies `.env` files as the **Shell Script** language and runs its bundled shell language server, which calls shellcheck. SC2034 flags any variable that's assigned but never *referenced in the same file* — and a `.env` is nothing but assignments that Laravel reads at runtime through `config()` / `env()`, never inside the file itself. So shellcheck flags **every line**. It's shell-script linting applied to a data file.
+Nothing is wrong with your file. The message is shellcheck's [SC2034](https://www.shellcheck.net/wiki/SC2034). Zed classifies `.env` files as the **Shell Script** language and runs its bundled bash language server on them, which calls shellcheck. SC2034 flags any variable that's assigned but never *referenced in the same file* — and a `.env` is nothing but assignments that Laravel reads at runtime through `config()` / `env()`, never inside the file itself. So shellcheck flags **every line**. It's shell-script linting applied to a data file.
 
-This is Zed's own built-in behavior — there's no extension of yours in the loop and nothing to uninstall. There are two ways to quiet it, and they trade off against each other:
+## ✅ Fixed automatically in Laravel projects (v0.7.2+)
 
-| | **Approach 1** — silence the rule | **Approach 2** — reclassify `.env` |
-|---|---|---|
-| `.env` keeps bash highlighting | ✅ yes (stays a shell file) | ❌ no (becomes Ini / Plain Text) |
-| Your real `.sh` scripts | ⚠️ also lose SC2034 (within scope) | ✅ untouched |
-| What you change | a shellcheck arg, or a `.shellcheckrc` | one `file_types` mapping |
+This extension quiets the noise for you. In any worktree whose `composer.json` depends on the `laravel/*` or `illuminate/*` vendor namespaces (full apps **and** packages — detection doesn't rely on `artisan` existing), the extension injects `--exclude=SC2034` into the bash language server's shellcheck arguments.
 
-Pick **Approach 1** if you want `.env` to keep shell highlighting and you don't rely on SC2034 in your own scripts. Pick **Approach 2** if you'd rather leave shellcheck fully intact for real scripts and only change how `.env` is treated.
+- **Your own arguments are preserved.** Anything you've set under `lsp.bash-language-server.settings.bashIde.shellcheckArguments` is kept, with the exclusion appended — and if your arguments already mention `SC2034` (excluded *or* deliberately kept), they pass through untouched.
+- **Scope:** shellcheck configuration is per-server, not per-file, so SC2034 is muted for every shell file in that worktree — real `.sh` scripts included. Every *other* shellcheck rule still applies to them. Non-Laravel worktrees are never touched.
+- **Works on every Zed version**, including releases where `lsp.bash-language-server.settings` itself is silently dropped (see the warning below) — the injection travels through Zed's extension hook for configuring *other* language servers, which is delivered independently.
 
-## Approach 1 — silence SC2034 (keep `.env` as a shell file)
+Opt out per-project or globally:
 
-### Zed setting (no project file)
+```json
+{
+  "lsp": {
+    "laravel-lsp": {
+      "settings": {
+        "shellcheck": { "suppressUnusedVarWarnings": false }
+      }
+    }
+  }
+}
+```
 
-Pass `--exclude=SC2034` to shellcheck through Zed's shell language server in your `settings.json`:
+The approaches below remain useful for non-Laravel worktrees, opted-out setups, and editors other than Zed.
+
+## 🔧 Manual approaches
+
+### 1. Silence the rule via Zed settings
+
+> ⚠️ **Broken on Zed 1.8.2 and older.** Zed's built-in bash adapter never forwarded `lsp.bash-language-server.settings` to the server — a correctly-written block below is silently ignored (the server's config parser falls back to defaults without an error). Fixed upstream in [zed#57487](https://github.com/zed-industries/zed/pull/57487); on affected versions use the `.shellcheckrc` route instead.
 
 ```json
 {
@@ -38,11 +52,11 @@ Pass `--exclude=SC2034` to shellcheck through Zed's shell language server in you
 }
 ```
 
-> ⚠️ **The `bashIde` wrapper is required.** Unlike some Zed servers (e.g. Intelephense, where Zed adds the namespace for you), the bash server does **not** wrap your settings — it only reads config from a `bashIde` section, so you must nest it yourself. Drop the wrapper and the setting is silently ignored. (`shellcheckArguments` takes an array; the server adds `--shell` / `--format` on its own.)
+> The `bashIde` wrapper is required — the bash server only reads config nested under that key; without it the setting is silently ignored. (`shellcheckArguments` takes an array; the server adds `--shell` / `--format` on its own.)
 
-This applies to every shell file Zed lints, in every project. It takes effect without restarting — if it doesn't, the wrapper is almost always the reason.
+This applies to every shell file Zed lints, in every project.
 
-### `.shellcheckrc` (project-scoped, editor-agnostic)
+### 2. `.shellcheckrc` (editor-agnostic, works on every Zed version)
 
 Drop a `.shellcheckrc` in your project root (or `~/.shellcheckrc` for all projects) containing:
 
@@ -50,49 +64,51 @@ Drop a `.shellcheckrc` in your project root (or `~/.shellcheckrc` for all projec
 disable=SC2034
 ```
 
-shellcheck reads this file directly, so it works in any editor — not just Zed. Scope is the whole project tree, so real `.sh` scripts there also stop getting SC2034.
+shellcheck reads this file directly — the server pipes your buffer to shellcheck with the project root as working directory, and shellcheck walks up from there (falling back to `~/.shellcheckrc`). Works in any editor. Scope is the whole tree, so real `.sh` scripts there also lose SC2034.
 
-### Per-file directive (surgical)
-
-Add a comment to the top of a specific file to scope the suppression to just that file:
+For a single file, a comment at the top works too:
 
 ```bash
 # shellcheck disable=SC2034
 ```
 
-The cost is a stray comment line in each `.env` you apply it to — fine for one file, tedious across `.env`, `.env.example`, etc.
+### 3. Disable the shell language server — syntax highlighting stays
 
-## Approach 2 — reclassify `.env` away from Shell Script
+Highlighting comes from Zed's built-in tree-sitter bash grammar, not from the language server — so you can switch the server off entirely and `.env` (and `.sh`) files keep their colors:
+
+```json
+{
+  "languages": {
+    "Shell Script": {
+      "language_servers": ["!bash-language-server", "..."]
+    }
+  }
+}
+```
+
+No shellcheck, no bash completions/hover, no shfmt formatting — for **all** Shell Script files, not just `.env`. Highlighting, brackets, and indentation are untouched. Use `.zed/settings.json` to scope it to one project.
+
+### 4. Reclassify `.env` away from Shell Script
 
 Map `.env` files to a non-shell language in `settings.json`. A `.env` is `KEY=value` with `#` comments — structurally INI — so the **Ini** language highlights it cleanly and never invokes shellcheck:
 
 ```json
 {
   "file_types": {
-    "Ini": [".env*"]
+    "Ini": [".env", ".env.*"]
   }
 }
 ```
 
-Install the Ini extension (`zed: extensions`, search "INI") if you don't already have it; it's tiny. To avoid any extra install, map to the built-in **Plain Text** instead — the warnings disappear, but `.env` renders without highlighting:
+Install the Ini extension (`zed: extensions`, search "INI") if you don't already have it. To avoid any extra install, map to the built-in **Plain Text** instead — the warnings disappear, but `.env` renders without highlighting. There's also a dedicated [env extension](https://github.com/zarifpour/zed-env) with a purpose-built dotenv grammar (keys, values, booleans, URLs, `${interpolations}`) — map to `"env"` after installing it.
 
-```json
-{
-  "file_types": {
-    "Plain Text": [".env*"]
-  }
-}
-```
-
-The `.env*` glob covers `.env` plus every variant (`.env.local`, `.env.production`, `.env.example`). For a stricter match that won't also catch unrelated files like `.envrc` or `.environment`, use `[".env", ".env.*"]`.
+> Heads-up: this extension's `.env` features (reference-count lens, hover, go-to) attach to the **Shell Script** and **env** languages. Remapping to Ini or Plain Text detaches them.
 
 ## Per-project
 
 Any of the `settings.json` blocks above also work in `.zed/settings.json` at the project root, scoping the change to one project instead of all of Zed. (The `.shellcheckrc` approach is already project-scoped by nature.)
 
-## Why this extension can't do it for you
+## What the extension can — and can't — do for you
 
-Every lever here lives in *your* settings or *your* project — none of it is something a Zed extension can ship:
-
-- **Approach 1** lives in your Zed `settings.json` or a `.shellcheckrc` in your repo. The extension's WASM sandbox can't write either, and silently dropping files into your project would be worse than the warning.
-- **Approach 2** depends on Zed's language-detection precedence. Zed resolves a file's language by tier — a `file_types` setting (`UserConfigured`) outranks a language's `path_suffixes` (`PathOrContent`). Zed's *default settings* already claim `.env.*` for Shell Script at the `UserConfigured` tier, and the Zed extension manifest has **no `file_types` field** — so no extension can register a competing claim. Only your own `file_types` (user settings beat default settings) can override it. That's why this is one line in *your* config, not something the extension does automatically.
+- **Can (and does):** configure the bash language server. Zed lets one extension contribute *additional workspace configuration* to another server, merged into that server's own config — that's how the automatic fix above is delivered, and why it works even on Zed versions that drop your own `bash-language-server` settings.
+- **Can't:** change how Zed classifies files. The extension manifest has no `file_types` field, and Zed's default settings claim `.env*` for Shell Script at a tier only *your* `file_types` setting can override. That's why approach 4 is one line in your config, not something the extension ships.
