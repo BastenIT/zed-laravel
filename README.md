@@ -117,7 +117,7 @@ The extension works out of the box with **zero configuration** — it auto-disco
 
 **Installed, but nothing happens?** The usual causes, in order: Zed older than **0.205** (the minimum this extension builds against), the file isn't classified as PHP / Blade, or a `language_servers` override that omits `laravel-lsp`.
 
-🩺 **[Troubleshooting guide →](docs/troubleshooting.md)** — the full five-step decision tree, how to read the language-server log, and the manual binary fallback for blocked downloads.
+🩺 **[Troubleshooting guide →](docs/troubleshooting.md)** — the full seven-step decision tree, the duplicate-results fix when a second PHP LSP is attached, why `F2` rename on a class name can go missing next to PHPantom, how to read the language-server log, and the manual binary fallback for blocked downloads.
 
 ## 🚧 Planned Features
 

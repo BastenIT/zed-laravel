@@ -37,7 +37,7 @@ Every guide for **Laravel (Community Edition) for Zed**, grouped by what you're 
 
 | Guide | What it covers |
 |---|---|
-| [🩺 Troubleshooting](troubleshooting.md) | The extension installed but nothing happens — the decision tree, log inspection, and the manual binary fallback |
+| [🩺 Troubleshooting](troubleshooting.md) | The extension installed but nothing happens — or happens twice, or one feature goes missing. The decision tree, the duplicate-results fix, the PHPantom rename conflict, log inspection, and the manual binary fallback |
 
 ## 🔬 Design notes
 

@@ -89,18 +89,26 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
     "PHP": {
       // An explicit list REPLACES Zed's defaults, so "laravel-lsp" must appear
       // or this extension won't attach; "..." re-expands the remaining defaults.
-      // Prefix a server with "!" to DISABLE it — pick ONE PHP LSP (Intelephense
-      // here) and turn the rest off, because running several PHP servers at once
-      // produces duplicate completions, hovers, and diagnostics.
-      "language_servers": ["laravel-lsp", "intelephense", "!phpactor", "!phptools", "..."],
+      // Prefix a server with "!" to DISABLE it — pick ONE PHP LSP and turn the
+      // rest off, because running several PHP servers at once produces duplicate
+      // completions, hovers, and diagnostics. The official PHP extension ships
+      // FOUR of them (intelephense, phpactor, phpantom, phptools), so disabling
+      // three is the norm — Intelephense kept here.
+      // "!phpantom" additionally matters for a NON-duplicate reason: rename is
+      // answered by one server only, and this extension claims class names, so
+      // running PHPantom alongside breaks class/namespace rename outright.
+      // Disable it. Details: docs/troubleshooting.md step 5, issue #282.
+      "language_servers": ["laravel-lsp", "intelephense", "!phpactor", "!phpantom", "!phptools", "..."],
       // LSP outlines: our route-file outline + your PHP LSP's class outline.
       // "on" | "off"                                            Default: "off"
       "document_symbols": "on"
     },
     "Blade": {
-      // Same rules as PHP. "!phpactor" stops the PHP-oriented Phpactor server
-      // from also attaching to .blade.php files and double-reporting.
-      "language_servers": ["laravel-lsp", "!phpactor", "..."],
+      // Same rules as PHP. The "!" entries stop the PHP-oriented servers from
+      // also attaching to .blade.php files and double-reporting. The Blade
+      // extension currently wires only phpactor/phptools (and emmet) to Blade;
+      // "!phpantom" is future-proofing for when that list grows.
+      "language_servers": ["laravel-lsp", "!phpactor", "!phpantom", "!phptools", "..."],
       // Our Blade outline (@extends / @section / <x-*> / <livewire:*> …).
       "document_symbols": "on",
       // Highlight custom inline @directive() macros tree-sitter can't see
