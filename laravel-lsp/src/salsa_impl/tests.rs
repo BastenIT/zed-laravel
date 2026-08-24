@@ -4982,3 +4982,28 @@ async fn both_constructors_agree_on_php_use_class_refs() {
         "warm and on-demand constructors disagree"
     );
 }
+
+// ─── loadViewsFrom() __DIR__-relative path resolution ──────────────────────
+//
+// The `LOAD_VIEWS_RE` capture keeps the leading slash of the concatenated
+// fragment (`__DIR__ . '/../resources/views'` captures "/../resources/views"),
+// and `Path::join` REPLACES its receiver when handed an absolute path — so
+// every `loadViewsFrom(__DIR__.'…')` registration silently resolved to a
+// root-relative nonsense path and the namespace never worked.
+
+#[test]
+fn load_views_relative_fragment_resolves_against_provider_dir() {
+    let provider_dir = PathBuf::from("/pkg/src/Providers");
+    assert_eq!(
+        resolve_load_views_relative(&provider_dir, "/../../resources/views"),
+        PathBuf::from("/pkg/src/Providers/../../resources/views")
+    );
+    assert_eq!(
+        resolve_load_views_relative(&provider_dir, "/views"),
+        PathBuf::from("/pkg/src/Providers/views")
+    );
+    assert_eq!(
+        resolve_load_views_relative(&provider_dir, "./views"),
+        PathBuf::from("/pkg/src/Providers/views")
+    );
+}
