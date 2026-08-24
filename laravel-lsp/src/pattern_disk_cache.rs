@@ -121,7 +121,16 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        but wastefully) never gets trimmed since restored entries aren't
 ///        re-parsed. Bump so every on-disk vendor entry is rebuilt through
 ///        the new, slimmer path.
-const SCHEMA_VERSION: u32 = 14;
+///   v15 — a class's `protected string $view = '…';` property (the Filament
+///        `Page`/`Widget` convention) is now a render site: `member_context`'s
+///        `view_renders` gained a plan for it, and `ViewRenderPlanData` grew a
+///        `surface` field carrying the class's typed surface. `#[serde(default)]`
+///        would decode a v13 entry's `ViewRenderPlanData`s without error (no
+///        shape change there), but its `view_renders` list itself lacks the new
+///        plan entirely — a restored Filament-page file would keep resolving
+///        its Blade template's vars as empty until an unrelated edit. Bump to
+///        force a re-parse that captures it.
+const SCHEMA_VERSION: u32 = 15;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

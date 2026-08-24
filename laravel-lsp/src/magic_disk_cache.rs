@@ -68,7 +68,15 @@ use crate::view_var_index::ViewRender;
 /// path), so a warm v3 cache is discarded and the project re-indexed with the
 /// corrected resolver rather than trusting stale entries. Parsing did not
 /// change, so the pattern/config disk caches are intentionally NOT bumped.
-const SCHEMA_VERSION: u32 = 5;
+/// v5: a class's `protected string $view = '…';` property (the Filament
+/// `Page`/`Widget` convention) is now a controller-equivalent render site —
+/// `view_renders_in_file`/`evaluate_render_plans` can now produce a `ViewRender`
+/// for such a class. A v4 cache's `view_renders` was written before this
+/// extraction existed, so a Filament page's Blade template would keep
+/// resolving its view vars as empty until an unrelated edit forces a
+/// re-resolve. `ViewRender`'s shape didn't change — this bump is the v10-style
+/// "output changed, not the envelope" case (see the pattern cache's history).
+const SCHEMA_VERSION: u32 = 6;
 
 const CACHE_FILENAME: &str = "magic_cache.bin";
 
