@@ -135,6 +135,41 @@ impl ViewVarIndex {
             .unwrap_or_default()
     }
 
+    /// Every file that currently contributes a render site for `view_name` —
+    /// the reverse of `by_file`'s per-file contribution. A Filament-style
+    /// `$view`-property page and any controller `view(...)` call site that
+    /// renders the same view both show up here, letting a Blade-goto/hover
+    /// fallback jump straight from the template into whichever class(es)
+    /// declare its variables.
+    pub fn render_source_files(&self, view_name: &str) -> Vec<PathBuf> {
+        self.by_file
+            .iter()
+            .filter(|(_, renders)| renders.iter().any(|r| r.view_name == view_name))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Every variable `view_name` has a render site for, as `(name, sorted
+    /// FQCN types)` — the same union-across-render-sites [`Self::var_types`]
+    /// exposes, but for every variable at once (feeds `$`-completion). Pairs
+    /// are sorted by variable name for deterministic completion ordering;
+    /// empty when the view was never rendered.
+    pub fn vars_for_view(&self, view_name: &str) -> Vec<(String, Vec<String>)> {
+        let Some(vars) = self.forward.get(view_name) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, Vec<String>)> = vars
+            .iter()
+            .map(|(name, types)| {
+                let mut sorted: Vec<String> = types.iter().cloned().collect();
+                sorted.sort();
+                (name.clone(), sorted)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Clear everything — called at the start of a warm rebuild.
     pub fn clear(&mut self) {
         self.forward.clear();
@@ -177,6 +212,42 @@ pub fn view_name_for_path(file: &Path, view_roots: &[PathBuf]) -> Option<String>
         return Some(stem.replace(['/', '\\'], "."));
     }
     None
+}
+
+/// Namespace-aware sibling of [`view_name_for_path`]: also given the
+/// project's registered view namespaces (`loadViewsFrom()` prefix → absolute
+/// view directory — module/package views), a file under one of those
+/// directories maps to `ns::dotted.rel` instead of falling through to the
+/// plain view roots. A namespace directory wins over a plain root when a file
+/// matches both — the namespace registration is the more specific one — so
+/// namespace dirs are checked first, longest-first (mirroring
+/// `view_name_for_path`'s longest-root preference).
+pub fn view_name_for_path_namespaced(
+    file: &Path,
+    view_roots: &[PathBuf],
+    namespaces: &HashMap<String, PathBuf>,
+) -> Option<String> {
+    let mut dirs: Vec<(&String, &PathBuf)> = namespaces.iter().collect();
+    dirs.sort_by_key(|(_, dir)| std::cmp::Reverse(dir.components().count()));
+
+    for (name, dir) in dirs {
+        let Ok(rel) = file.strip_prefix(dir) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy();
+        let Some(stem) = rel_str
+            .strip_suffix(".blade.php")
+            .or_else(|| rel_str.strip_suffix(".php"))
+        else {
+            continue;
+        };
+        if stem.is_empty() {
+            continue;
+        }
+        return Some(format!("{name}::{}", stem.replace(['/', '\\'], ".")));
+    }
+
+    view_name_for_path(file, view_roots)
 }
 
 /// Resolve the property-form member accesses captured in a Blade file into
@@ -529,9 +600,36 @@ pub fn volt_property_types(
     };
     let bytes = front.as_bytes();
     let aliases = extract_use_aliases(&tree, front);
+    class_surface_types(
+        tree.root_node(),
+        bytes,
+        &aliases,
+        resolver,
+        classviews,
+        project_root,
+    )
+}
+
+/// Walk a class-like root node's members into `prop → FQCN`, applying the same
+/// precedence [`volt_property_types`] always has: a typed public property is
+/// authoritative (plain `insert`); `mount()`/`with()`/`render()`/`state()`,
+/// their functional-API equivalents, and `$x = computed(...)` all fall back
+/// with `or_insert` (first-wins). Shared by the Volt front-matter walk (`root`
+/// = the front-matter's own parse) and a Filament-style
+/// `protected string $view = '…';` class file (`root` = the whole file's
+/// parse) — both are "one class's declared surface", differing only in which
+/// subtree is walked.
+fn class_surface_types(
+    root: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
 
-    let mut stack = vec![tree.root_node()];
+    let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         match n.kind() {
             // Typed public property — authoritative, so plain `insert`.
@@ -541,13 +639,13 @@ pub fn volt_property_types(
                     property_element_name(n, bytes),
                 ) {
                     if let Some(fqcn) = clean_type(ty.utf8_text(bytes).unwrap_or("")) {
-                        out.insert(name, resolve_class_name(&fqcn, &aliases));
+                        out.insert(name, resolve_class_name(&fqcn, aliases));
                     }
                 }
             }
             // Class-API `public function mount(User $u) { $this->u = $u; }`.
             "method_declaration" if method_name_is(n, bytes, "mount") => {
-                collect_mount_assignments(n, bytes, &aliases, &mut out);
+                collect_mount_assignments(n, bytes, aliases, &mut out);
             }
             // Class-API `public function with(): array { return [...]; }`.
             "method_declaration" if method_name_is(n, bytes, "with") => {
@@ -556,7 +654,7 @@ pub fn volt_property_types(
                     collect_vars(
                         ret,
                         bytes,
-                        &aliases,
+                        aliases,
                         resolver,
                         classviews,
                         project_root,
@@ -568,7 +666,7 @@ pub fn volt_property_types(
             // Class-API `public function render() { return view('…', [...]); }`.
             "method_declaration" if method_name_is(n, bytes, "render") => {
                 let temp =
-                    render_method_vars(n, bytes, &aliases, resolver, classviews, project_root);
+                    render_method_vars(n, bytes, aliases, resolver, classviews, project_root);
                 fold_or_insert(&mut out, temp);
             }
             // `#[Computed] public function users(): Collection { return User::…->get(); }`
@@ -588,7 +686,7 @@ pub fn volt_property_types(
                             resolve_expression_type(
                                 ret,
                                 bytes,
-                                &aliases,
+                                aliases,
                                 resolver,
                                 classviews,
                                 project_root,
@@ -598,7 +696,7 @@ pub fn volt_property_types(
                         .or_else(|| {
                             n.child_by_field_name("return_type")
                                 .and_then(|rt| clean_type(rt.utf8_text(bytes).ok()?))
-                                .map(|t| resolve_class_name(&t, &aliases))
+                                .map(|t| resolve_class_name(&t, aliases))
                         });
                     if let Some(fqcn) = fqcn {
                         out.entry(name.to_string()).or_insert(fqcn);
@@ -608,7 +706,7 @@ pub fn volt_property_types(
             // Functional-API `mount(function (User $u) { $this->u = $u; });`.
             "function_call_expression" if call_function_name(n, bytes) == Some("mount") => {
                 if let Some(closure) = first_closure_arg(n) {
-                    collect_mount_assignments(closure, bytes, &aliases, &mut out);
+                    collect_mount_assignments(closure, bytes, aliases, &mut out);
                 }
             }
             // Functional-API `state(['user' => User::first()]);`.
@@ -619,7 +717,7 @@ pub fn volt_property_types(
                         collect_vars(
                             *data,
                             bytes,
-                            &aliases,
+                            aliases,
                             resolver,
                             classviews,
                             project_root,
@@ -637,7 +735,7 @@ pub fn volt_property_types(
                         collect_vars(
                             ret,
                             bytes,
-                            &aliases,
+                            aliases,
                             resolver,
                             classviews,
                             project_root,
@@ -650,7 +748,7 @@ pub fn volt_property_types(
             // Functional-API `$user = computed(fn (): User => …);`.
             "assignment_expression" => {
                 if let Some((var, fqcn)) =
-                    computed_assignment(n, bytes, &aliases, resolver, classviews, project_root)
+                    computed_assignment(n, bytes, aliases, resolver, classviews, project_root)
                 {
                     out.entry(var).or_insert(fqcn);
                 }
@@ -1091,6 +1189,11 @@ fn clean_type(raw: &str) -> Option<String> {
 /// Extract every `view('name', data)` render site in `source`, resolving each
 /// passed variable's type in the file's scope. Handles the data forms:
 /// `['user' => $expr]`, `compact('user', …)`, and `view(...)->with('user', $expr)`.
+/// Also treats a Filament-style `protected string $view = '…';` (or
+/// `protected static string $view = '…';`) class property as its own render
+/// site: the class's typed surface (typed public properties, `#[Computed]`
+/// methods, `mount()` typed-param assignments) becomes that view's variables,
+/// exactly as a controller's `view()` call data would.
 pub fn view_renders_in_file(
     source: &str,
     resolver: &impl ClassFileResolver,
@@ -1119,7 +1222,56 @@ pub fn view_renders_in_file(
             stack.push(ch);
         }
     }
+    if let Some(view_name) = declared_view_literal(tree.root_node(), bytes) {
+        let vars = class_surface_types(
+            tree.root_node(),
+            bytes,
+            &aliases,
+            resolver,
+            classviews,
+            project_root,
+        );
+        out.push(ViewRender { view_name, vars });
+    }
     out
+}
+
+/// The literal view name declared by a Filament-style
+/// `protected string $view = '…';` (or `protected static string $view = '…';`)
+/// class property — the convention `Page`/`Widget` subclasses use instead of
+/// calling `view()`. Visibility and `static` don't matter, only the
+/// property's NAME and a plain string-literal initializer. `None` when the
+/// class declares no `$view` property, or its value isn't a literal (a
+/// constant reference, a `config()` call, …) — such a class isn't a resolvable
+/// render site.
+fn declared_view_literal(root: Node, bytes: &[u8]) -> Option<String> {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "property_declaration" {
+            let mut c = n.walk();
+            for element in n.children(&mut c) {
+                if element.kind() != "property_element" {
+                    continue;
+                }
+                let is_view = element
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(bytes).ok())
+                    .map(|t| t.trim_start_matches('$') == "view")
+                    .unwrap_or(false);
+                if !is_view {
+                    continue;
+                }
+                return element
+                    .child_by_field_name("default_value")
+                    .and_then(|d| string_literal_value(d, bytes));
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
 }
 
 /// Build a [`ViewRender`] from a `view('name', data)` call, also folding in any
@@ -1345,7 +1497,9 @@ use tree_sitter::Tree;
 // ─── Capture: controller view() renders (pass 1) ───────────────────────────
 
 /// Compile every `view('name', […])` render site into a [`ViewRenderPlanData`]
-/// — the parse-time form of [`view_renders_in_file`].
+/// — the parse-time form of [`view_renders_in_file`]. Also compiles a
+/// Filament-style `$view`-property render site (the same function's other
+/// live half), whose plan carries the class's surface instead of `items`.
 pub(crate) fn capture_render_plans(
     source: &str,
     tree: &Tree,
@@ -1365,6 +1519,17 @@ pub(crate) fn capture_render_plans(
             stack.push(ch);
         }
     }
+    if let Some(view_name) = declared_view_literal(tree.root_node(), bytes) {
+        let items = capture_class_surface_items(tree.root_node(), bytes, aliases);
+        out.push(ViewRenderPlanData {
+            view_name,
+            items: Vec::new(),
+            surface: Some(VoltSurfaceData {
+                items,
+                aliases: aliases.clone(),
+            }),
+        });
+    }
     out
 }
 
@@ -1383,7 +1548,11 @@ fn render_plan_from_view_call(
         items.extend(collect_var_plan_items(*data, bytes, aliases));
     }
     collect_with_chain_plans(call, bytes, aliases, &mut items);
-    Some(ViewRenderPlanData { view_name, items })
+    Some(ViewRenderPlanData {
+        view_name,
+        items,
+        surface: None,
+    })
 }
 
 /// The plan form of [`collect_vars`]: `(key, plan)` pairs in traversal order.
@@ -1476,7 +1645,10 @@ fn collect_with_chain_plans(
 }
 
 /// Pass-1 replacement: build [`ViewRender`]s from captured plans without
-/// re-reading/re-parsing the controller.
+/// re-reading/re-parsing the controller. A `$view`-property plan carries its
+/// vars in `surface` instead of `items` (see [`capture_render_plans`]) —
+/// folded in with `or_insert` so it can never disturb `items`' own last-wins
+/// semantics (in practice one of the two is always empty per plan).
 pub fn evaluate_render_plans(
     plans: &[ViewRenderPlanData],
     aliases: &UseAliases,
@@ -1486,11 +1658,20 @@ pub fn evaluate_render_plans(
 ) -> Vec<ViewRender> {
     plans
         .iter()
-        .map(|plan| ViewRender {
-            view_name: plan.view_name.clone(),
+        .map(|plan| {
             // Resolve-gated last-wins over the site's items (an unresolvable
             // later value never overwrites an earlier resolved one).
-            vars: eval_value_items(&plan.items, aliases, resolver, classviews, project_root),
+            let mut vars =
+                eval_value_items(&plan.items, aliases, resolver, classviews, project_root);
+            if let Some(surface) = &plan.surface {
+                for (k, v) in evaluate_volt_surface(surface, resolver, classviews, project_root) {
+                    vars.entry(k).or_insert(v);
+                }
+            }
+            ViewRender {
+                view_name: plan.view_name.clone(),
+                vars,
+            }
         })
         .collect()
 }
@@ -1507,9 +1688,22 @@ pub(crate) fn capture_volt_surface(source: &str) -> Option<VoltSurfaceData> {
     let tree = parse_php(front).ok()?;
     let bytes = front.as_bytes();
     let aliases = extract_use_aliases(&tree, front);
+    let items = capture_class_surface_items(tree.root_node(), bytes, &aliases);
+    Some(VoltSurfaceData { items, aliases })
+}
+
+/// The plan form of [`class_surface_types`] — same traversal, same node
+/// branches, emitting a replayable [`VoltPropPlanData`] item per match instead
+/// of resolving immediately. Shared by the Volt front-matter capture and the
+/// Filament-style `$view`-property class capture ([`capture_render_plans`]).
+fn capture_class_surface_items(
+    root: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> Vec<VoltPropPlanData> {
     let mut items: Vec<VoltPropPlanData> = Vec::new();
 
-    let mut stack = vec![tree.root_node()];
+    let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         match n.kind() {
             "property_declaration" if is_public(n, bytes) => {
@@ -1520,25 +1714,25 @@ pub(crate) fn capture_volt_surface(source: &str) -> Option<VoltSurfaceData> {
                     if let Some(fqcn) = clean_type(ty.utf8_text(bytes).unwrap_or("")) {
                         items.push(VoltPropPlanData::TypedProp {
                             name,
-                            fqcn: resolve_class_name(&fqcn, &aliases),
+                            fqcn: resolve_class_name(&fqcn, aliases),
                         });
                     }
                 }
             }
             "method_declaration" if method_name_is(n, bytes, "mount") => {
-                collect_mount_assignment_plans(n, bytes, &aliases, &mut items);
+                collect_mount_assignment_plans(n, bytes, aliases, &mut items);
             }
             "method_declaration" if method_name_is(n, bytes, "with") => {
                 if let Some(ret) = function_return_expr(n) {
                     items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
-                        ret, bytes, &aliases,
+                        ret, bytes, aliases,
                     )));
                 }
             }
             "method_declaration" if method_name_is(n, bytes, "render") => {
                 if let Some(ret) = function_return_expr(n) {
                     if let Some(view_call) = find_view_call(ret, bytes) {
-                        if let Some(plan) = render_plan_from_view_call(view_call, bytes, &aliases) {
+                        if let Some(plan) = render_plan_from_view_call(view_call, bytes, aliases) {
                             items.push(VoltPropPlanData::OrInsertGroup(plan.items));
                         }
                     }
@@ -1549,13 +1743,12 @@ pub(crate) fn capture_volt_surface(source: &str) -> Option<VoltSurfaceData> {
                     .child_by_field_name("name")
                     .and_then(|nm| nm.utf8_text(bytes).ok())
                 {
-                    let body = function_return_expr(n).map(|ret| {
-                        crate::member_resolver::compile_value_expr(ret, bytes, &aliases)
-                    });
+                    let body = function_return_expr(n)
+                        .map(|ret| crate::member_resolver::compile_value_expr(ret, bytes, aliases));
                     let declared = n
                         .child_by_field_name("return_type")
                         .and_then(|rt| clean_type(rt.utf8_text(bytes).ok()?))
-                        .map(|t| resolve_class_name(&t, &aliases));
+                        .map(|t| resolve_class_name(&t, aliases));
                     items.push(VoltPropPlanData::Computed {
                         name: name.to_string(),
                         body,
@@ -1565,14 +1758,14 @@ pub(crate) fn capture_volt_surface(source: &str) -> Option<VoltSurfaceData> {
             }
             "function_call_expression" if call_function_name(n, bytes) == Some("mount") => {
                 if let Some(closure) = first_closure_arg(n) {
-                    collect_mount_assignment_plans(closure, bytes, &aliases, &mut items);
+                    collect_mount_assignment_plans(closure, bytes, aliases, &mut items);
                 }
             }
             "function_call_expression" if call_function_name(n, bytes) == Some("state") => {
                 if let Some(args) = n.child_by_field_name("arguments") {
                     if let Some(data) = positional_args(args).first() {
                         items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
-                            *data, bytes, &aliases,
+                            *data, bytes, aliases,
                         )));
                     }
                 }
@@ -1581,13 +1774,13 @@ pub(crate) fn capture_volt_surface(source: &str) -> Option<VoltSurfaceData> {
                 if let Some(closure) = first_closure_arg(n) {
                     if let Some(ret) = function_return_expr(closure) {
                         items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
-                            ret, bytes, &aliases,
+                            ret, bytes, aliases,
                         )));
                     }
                 }
             }
             "assignment_expression" => {
-                if let Some((var, plan)) = compile_computed_assignment(n, bytes, &aliases) {
+                if let Some((var, plan)) = compile_computed_assignment(n, bytes, aliases) {
                     items.push(VoltPropPlanData::OrInsert { name: var, plan });
                 }
             }
@@ -1598,7 +1791,7 @@ pub(crate) fn capture_volt_surface(source: &str) -> Option<VoltSurfaceData> {
             stack.push(ch);
         }
     }
-    Some(VoltSurfaceData { items, aliases })
+    items
 }
 
 /// Resolve a handler's ordered `(name, plan)` items into a `var → FQCN` map,

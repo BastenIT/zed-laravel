@@ -454,3 +454,139 @@ fn reverse_none_for_non_livewire_file() {
 
     assert!(livewire_name_for_path(&path, &cfg, LivewireVersion::V4).is_none());
 }
+
+// ---- wire_attribute_target_at --------------------------------------------
+
+#[test]
+fn wire_click_method_call() {
+    let line = r#"<button wire:click="enterEditMode">Edit</button>"#;
+    let cursor = line.find("enterEditMode").unwrap() as u32 + 3;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("enterEditMode".to_string()))
+    );
+}
+
+#[test]
+fn wire_poll_with_modifier_and_method_call_with_args() {
+    let line = r#"<div wire:poll.2000ms="checkPrefillStatus"></div>"#;
+    let cursor = line.find("checkPrefillStatus").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("checkPrefillStatus".to_string()))
+    );
+}
+
+#[test]
+fn wire_submit_prevent_method_call_with_arguments() {
+    let line = r#"<form wire:submit.prevent="save('draft')">"#;
+    let cursor = line.find("save(").unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("save".to_string()))
+    );
+}
+
+#[test]
+fn wire_model_targets_the_first_dot_segment_as_a_property() {
+    let line = r#"<input wire:model="contractData.title">"#;
+    let cursor = line.find("contractData").unwrap() as u32 + 2;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Property("contractData".to_string()))
+    );
+}
+
+#[test]
+fn wire_model_live_modifier_still_targets_the_property() {
+    let line = r#"<input wire:model.live.debounce.500ms="filters.search">"#;
+    let cursor = line.find("filters").unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Property("filters".to_string()))
+    );
+}
+
+#[test]
+fn wire_click_js_expression_has_no_target() {
+    let line = r#"<button wire:click="$wire.count++">+</button>"#;
+    let cursor = line.find("count").unwrap() as u32;
+    assert!(wire_attribute_target_at(line, cursor).is_none());
+}
+
+#[test]
+fn cursor_outside_the_quoted_value_has_no_target() {
+    let line = r#"<button wire:click="enterEditMode">Edit</button>"#;
+    let cursor = line.find("wire:click").unwrap() as u32;
+    assert!(wire_attribute_target_at(line, cursor).is_none());
+}
+
+#[test]
+fn no_wire_attribute_on_line_has_no_target() {
+    let line = r#"<button class="btn">Edit</button>"#;
+    assert!(wire_attribute_target_at(line, 10).is_none());
+}
+
+#[test]
+fn wire_completion_context_empty_value_is_method_kind() {
+    let line = r#"<button wire:click="">"#;
+    let col = line.find('"').unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Method, String::new()))
+    );
+}
+
+#[test]
+fn wire_completion_context_partial_value_carries_prefix() {
+    let line = r#"<div wire:poll.2000ms="check">"#;
+    let col = (line.find("check").unwrap() + "check".len()) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Method, "check".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_model_is_property_kind() {
+    let line = r#"<input wire:model="contract">"#;
+    let col = (line.find("contract").unwrap() + 3) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Property, "con".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_unclosed_quote_still_matches() {
+    let line = r#"<button wire:click="sa"#;
+    let col = line.len() as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Method, "sa".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_rejects_expression_values() {
+    let line = r#"<button wire:click="$wire.count++">"#;
+    let col = (line.find("count").unwrap() + 2) as u32;
+    assert_eq!(wire_attribute_completion_context(line, col), None);
+}
+
+#[test]
+fn wire_completion_context_non_member_attribute_is_none() {
+    let line = r#"<div wire:key="row-1">"#;
+    let col = (line.find("row").unwrap() + 1) as u32;
+    assert_eq!(wire_attribute_completion_context(line, col), None);
+}
+
+#[test]
+fn wire_target_show_and_text_bind_properties() {
+    let line = r#"<span wire:text="prefillStatus">"#;
+    let col = (line.find("prefill").unwrap() + 2) as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, col),
+        Some(WireTarget::Property("prefillStatus".to_string()))
+    );
+}

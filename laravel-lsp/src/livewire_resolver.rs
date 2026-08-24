@@ -139,6 +139,196 @@ pub fn extract_blade_variable_at_cursor(
     None
 }
 
+/// The Livewire binding target of a `wire:` attribute, extracted from its
+/// quoted value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireTarget {
+    /// A method-call binding (`wire:click`, `wire:submit.prevent`,
+    /// `wire:poll.2000ms`, ...) — the bare identifier before any `(`.
+    Method(String),
+    /// `wire:model[.modifiers]` binds a PROPERTY, not a method call — the
+    /// target is the first dot-segment of the value (`contractData.title`
+    /// → `contractData`).
+    Property(String),
+}
+
+/// If the cursor sits inside a `wire:*="value"` attribute's quoted value on
+/// `line`, extract its goto/hover target.
+///
+/// Returns `None` when the cursor isn't inside such a value, or the value
+/// isn't a resolvable PHP identifier (`wire:click="$wire.foo++"` has no
+/// member target — a Blade/JS expression, not a bound method).
+///
+/// `cursor_col` is treated as a byte offset into `line`, matching
+/// [`extract_blade_variable_at_cursor`]'s convention.
+pub fn wire_attribute_target_at(line: &str, cursor_col: u32) -> Option<WireTarget> {
+    let cursor = cursor_col as usize;
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+
+    while let Some(rel) = line[search_from..].find("wire:") {
+        let attr_start = search_from + rel;
+        let mut i = attr_start + "wire:".len();
+        // Attribute name, modifiers included (`wire:poll.2000ms`, `wire:model.live`).
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'.'
+                || bytes[i] == b'-'
+                || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+        let attr_name = &line[attr_start..i];
+        search_from = i;
+
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let Some(&quote) = bytes.get(j).filter(|b| **b == b'"' || **b == b'\'') else {
+            continue;
+        };
+        let value_start = j + 1;
+        let Some(rel_end) = line[value_start..].find(quote as char) else {
+            continue;
+        };
+        let value_end = value_start + rel_end;
+        search_from = value_end + 1;
+
+        if cursor < value_start || cursor > value_end {
+            continue;
+        }
+        let value = &line[value_start..value_end];
+        let base = attr_name.strip_prefix("wire:")?.split('.').next()?;
+        return match wire_value_kind(base) {
+            Some(WireValueKind::Property) => {
+                let prop = value.split('.').next().unwrap_or("").trim();
+                is_php_identifier(prop).then(|| WireTarget::Property(prop.to_string()))
+            }
+            Some(WireValueKind::Method) => {
+                let ident = value.split('(').next().unwrap_or("").trim();
+                is_php_identifier(ident).then(|| WireTarget::Method(ident.to_string()))
+            }
+            None => None,
+        };
+    }
+
+    None
+}
+
+/// What kind of component member a `wire:{base}` attribute's value names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireValueKind {
+    /// The value is an action — a public method (`wire:click`, `wire:poll`,
+    /// `wire:submit`, any DOM-event binding).
+    Method,
+    /// The value binds a public property (`wire:model`, `wire:show`,
+    /// `wire:text`).
+    Property,
+}
+
+/// Classify a `wire:` attribute's base name (modifiers stripped) by what its
+/// value names. `None` for attributes whose value is not a component member
+/// at all (`wire:key`, `wire:target`, `wire:ignore`, ...). Everything not
+/// explicitly listed is treated as a DOM-event action binding, since Livewire
+/// accepts `wire:{any-dom-event}`.
+fn wire_value_kind(base: &str) -> Option<WireValueKind> {
+    match base {
+        "model" | "show" | "text" => Some(WireValueKind::Property),
+        "key" | "id" | "ignore" | "loading" | "dirty" | "offline" | "target" | "stream"
+        | "replace" | "transition" | "navigate" | "cloak" | "current" | "confirm" => None,
+        _ => Some(WireValueKind::Method),
+    }
+}
+
+/// If the cursor sits inside a `wire:*="…"` quoted value on `line`, return
+/// the completion context: what member kind the attribute binds and the
+/// (possibly empty) identifier prefix typed before the cursor.
+///
+/// Unlike [`wire_attribute_target_at`] this accepts empty and partial
+/// values — that's the completion moment. `None` when the typed text is
+/// already something other than a plain identifier (a JS expression, a
+/// nested `wire:model` path past its first segment), so richer expressions
+/// fall through to other completion providers.
+pub fn wire_attribute_completion_context(
+    line: &str,
+    cursor_col: u32,
+) -> Option<(WireValueKind, String)> {
+    let cursor = cursor_col as usize;
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+
+    while let Some(rel) = line[search_from..].find("wire:") {
+        let attr_start = search_from + rel;
+        let mut i = attr_start + "wire:".len();
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'.'
+                || bytes[i] == b'-'
+                || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+        let attr_name = &line[attr_start..i];
+        search_from = i;
+
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let Some(&quote) = bytes.get(j).filter(|b| **b == b'"' || **b == b'\'') else {
+            continue;
+        };
+        let value_start = j + 1;
+        // The closing quote may not be typed yet — treat end-of-line as the
+        // value end in that case.
+        let value_end = line[value_start..]
+            .find(quote as char)
+            .map(|rel_end| value_start + rel_end)
+            .unwrap_or(line.len());
+        search_from = value_end + 1;
+
+        if cursor < value_start || cursor > value_end {
+            continue;
+        }
+        let typed = line[value_start..cursor].trim();
+        let kind = wire_value_kind(attr_name.strip_prefix("wire:")?.split('.').next()?)?;
+        return if typed.is_empty() || is_php_identifier(typed) {
+            Some((kind, typed.to_string()))
+        } else {
+            None
+        };
+    }
+
+    None
+}
+
+/// A bare PHP identifier: `[A-Za-z_][A-Za-z0-9_]*`, nothing else. Used to
+/// reject `wire:` values that are JS/Blade expressions rather than a plain
+/// method or property name (`$wire.foo++`, `save() && close()`).
+fn is_php_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 // ============================================================================
 // Component resolution (Phase 3)
 // ============================================================================
@@ -207,7 +397,17 @@ pub fn resolve_component(
     let sub = parents_to_path(parents);
 
     let base_dirs: Vec<&PathBuf> = match namespace {
-        Some(ns) => vec![config.component_namespaces.get(ns)?],
+        Some(ns) => {
+            // A namespace may map to a view directory (config
+            // `component_namespaces`), a registered class namespace
+            // (`Livewire::addNamespace` — checked in the class fallback
+            // below), or both. Unknown namespaces resolve to nothing.
+            let view_dir = config.component_namespaces.get(ns);
+            if view_dir.is_none() && !config.class_namespaces.contains_key(ns) {
+                return None;
+            }
+            view_dir.into_iter().collect()
+        }
         None => config.component_locations.iter().collect(),
     };
 
@@ -238,12 +438,22 @@ pub fn resolve_component(
         }
     }
 
-    // V3 class-based fallback. Class lookups don't go through namespaces —
-    // those are a view-co-located concept. So only the un-namespaced names
-    // ever fall through here.
-    if namespace.is_none() {
-        if let Some(c) = try_v3_class(bare, config) {
-            return Some(c);
+    // Class-based fallback. Un-namespaced names use the global class_path;
+    // a namespaced name resolves through a class namespace registered via
+    // `Livewire::addNamespace(...)` when one exists (see
+    // [`crate::livewire_namespaces`]).
+    match namespace {
+        None => {
+            if let Some(c) = try_v3_class(bare, config) {
+                return Some(c);
+            }
+        }
+        Some(ns) => {
+            if let Some(reg) = config.class_namespaces.get(ns) {
+                if let Some(c) = try_namespaced_class(bare, reg) {
+                    return Some(c);
+                }
+            }
         }
     }
 
@@ -314,6 +524,17 @@ fn candidate_livewire_names(path: &Path, config: &LivewireConfig) -> Vec<String>
             if let Some(stem) = rel.to_str().and_then(|s| s.strip_suffix(".php")) {
                 if let Some(name) = kebab_dotted(stem.split(['/', '\\']), "") {
                     out.push(name);
+                }
+            }
+        }
+        // Registered class namespaces (`Livewire::addNamespace`) — same
+        // shape, prefixed with the namespace.
+        for (ns, reg) in &config.class_namespaces {
+            if let Ok(rel) = path.strip_prefix(&reg.class_path) {
+                if let Some(stem) = rel.to_str().and_then(|s| s.strip_suffix(".php")) {
+                    if let Some(name) = kebab_dotted(stem.split(['/', '\\']), "") {
+                        out.push(format!("{ns}::{name}"));
+                    }
                 }
             }
         }
@@ -424,6 +645,26 @@ fn try_volt(parent_dir: &Path, leaf: &str, require_signature: bool) -> Option<Li
     Some(LivewireComponent {
         kind: LivewireComponentKind::Volt,
         paths: vec![candidate],
+    })
+}
+
+/// Class lookup for a namespaced name registered via
+/// `Livewire::addNamespace` — `{class_path}/{Pascal}.php`, dotted parents
+/// mapping to subdirectories exactly like the global class path.
+fn try_namespaced_class(
+    bare: &str,
+    reg: &crate::livewire_namespaces::LivewireClassNamespace,
+) -> Option<LivewireComponent> {
+    let class_file = reg
+        .class_path
+        .join(naming::dotted_to_class_path(bare))
+        .with_extension("php");
+    if !class_file.is_file() {
+        return None;
+    }
+    Some(LivewireComponent {
+        kind: LivewireComponentKind::V3Class,
+        paths: vec![class_file],
     })
 }
 

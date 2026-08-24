@@ -3675,10 +3675,21 @@ pub enum ValueExprPlanData {
 
 /// One `view('name', […])` render site's compiled plan (pass 1). `items` are in
 /// traversal order so the resolve replay reproduces last-wins map semantics.
+///
+/// A Filament-style `protected string $view = '…';` class property is also a
+/// render site (see `view_var_index::declared_view_literal`), but its vars come
+/// from the class's declared surface (typed props / `#[Computed]` / `mount()`)
+/// rather than a `view()` call's data argument — `surface` carries that plan
+/// instead, with `items` left empty. `#[serde(default)]` so a pattern-cache
+/// entry from before this field existed deserializes with `None` rather than
+/// failing — harmless since the schema bump below already forces those entries
+/// to re-parse regardless.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ViewRenderPlanData {
     pub view_name: String,
     pub items: Vec<(String, ValueExprPlanData)>,
+    #[serde(default)]
+    pub surface: Option<VoltSurfaceData>,
 }
 
 /// A Volt front-matter property plan, replayed in declaration order.

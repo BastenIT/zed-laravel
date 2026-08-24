@@ -109,7 +109,16 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        restoring it would under-report references — and, for the
 ///        unused-symbol diagnostic, resurrect the "possibly dead" false
 ///        positive on a component the string scan now sees.
-const SCHEMA_VERSION: u32 = 13;
+///   v14 — a class's `protected string $view = '…';` property (the Filament
+///        `Page`/`Widget` convention) is now a render site: `member_context`'s
+///        `view_renders` gained a plan for it, and `ViewRenderPlanData` grew a
+///        `surface` field carrying the class's typed surface. `#[serde(default)]`
+///        would decode a v13 entry's `ViewRenderPlanData`s without error (no
+///        shape change there), but its `view_renders` list itself lacks the new
+///        plan entirely — a restored Filament-page file would keep resolving
+///        its Blade template's vars as empty until an unrelated edit. Bump to
+///        force a re-parse that captures it.
+const SCHEMA_VERSION: u32 = 14;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

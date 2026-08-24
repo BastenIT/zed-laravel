@@ -97,6 +97,182 @@ fn no_view_calls_yields_empty() {
     assert!(r.is_empty());
 }
 
+// ---- Filament `$view` property render site --------------------------------
+//
+// `protected string $view = '…';` (Filament `Page`) / `protected static
+// string $view = '…';` (Filament `Widget`) declares which Blade view the
+// class renders — the class-property counterpart of a controller's
+// `view('name', […])` call. The class's typed surface becomes that view's
+// variables.
+
+#[test]
+fn view_property_typed_public_property_is_render_site() {
+    let src = r#"<?php
+namespace App\Filament\Pages;
+use App\Models\User;
+class ContractViewPage {
+    public ?User $user = null;
+    protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].view_name,
+        "legal-contractmanagement::filament.pages.contract-edit-page"
+    );
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_computed_method_is_render_var() {
+    let src = r#"<?php
+use App\Models\User;
+class ReportPage {
+    protected string $view = 'pages.report';
+
+    #[Computed]
+    public function user(): User { return User::first(); }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_mount_assignment_is_render_var() {
+    let src = r#"<?php
+use App\Models\User;
+class ProfilePage {
+    protected string $view = 'pages.profile';
+    public $user;
+
+    public function mount(User $injected) {
+        $this->user = $injected;
+    }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_static_variant_is_render_site() {
+    // Filament `Widget`s declare `$view` as `static`.
+    let src = r#"<?php
+class StatsWidget {
+    protected static string $view = 'widgets.stats';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "widgets.stats");
+}
+
+#[test]
+fn view_property_non_literal_is_skipped() {
+    // `self::VIEW` isn't a string literal — no resolvable render site.
+    let src = r#"<?php
+class DynamicPage {
+    const VIEW = 'pages.dynamic';
+    protected string $view = self::VIEW;
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn captured_view_property_render_matches_live() {
+    // Plan capture/eval (`capture_render_plans` + `evaluate_render_plans`) must
+    // reproduce the live `view_renders_in_file` result exactly, across a typed
+    // property AND a `#[Computed]` method on the same class.
+    let p = blade_project();
+    let controller = r#"<?php
+namespace App\Filament\Pages;
+use App\Models\User;
+class ContractViewPage {
+    public ?User $user = null;
+
+    #[Computed]
+    public function admin(): User { return User::first(); }
+
+    protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+}
+"#;
+    let (live, captured) = render_both_ways(&p.index, &p.root, controller);
+    assert_eq!(
+        live, captured,
+        "captured $view render plan diverged from live"
+    );
+    assert_eq!(live.len(), 1, "got {live:?}");
+    assert_eq!(
+        live[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+    assert_eq!(
+        live[0].vars.get("admin").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_real_world_filament_page_shape() {
+    // Mirrors ContractViewPage.php's actual shape: a `#[Validate(...)]`
+    // attribute directly above the typed property, an untyped `#[Locked]`
+    // property, a non-class builtin-typed property, a protected (non-public)
+    // typed property, and a namespace-qualified `$view` literal — none of
+    // which should confuse the typed-property scan.
+    let src = r#"<?php
+namespace App\Legal\ContractManagement\Filament\Pages;
+
+use Filament\Pages\Page;
+use Livewire\Attributes\Locked;
+use Livewire\Attributes\Validate;
+use Livewire\Features\SupportFileUploads\TemporaryUploadedFile;
+
+class ContractViewPage extends Page
+{
+    #[Locked]
+    public ?string $contractId = null;
+
+    public bool $isEditMode = false;
+
+    #[Validate('file|max:10240|mimes:pdf', as: ['uploadedFile' => 'Contract document'], translate: true)]
+    public ?TemporaryUploadedFile $uploadedFile = null;
+
+    protected string $contractService;
+
+    protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].view_name,
+        "legal-contractmanagement::filament.pages.contract-edit-page"
+    );
+    assert_eq!(
+        r[0].vars.get("uploadedFile").map(String::as_str),
+        Some("Livewire\\Features\\SupportFileUploads\\TemporaryUploadedFile")
+    );
+    // Builtins, `#[Locked]`-only, and non-public props contribute nothing.
+    assert!(!r[0].vars.contains_key("contractId"));
+    assert!(!r[0].vars.contains_key("isEditMode"));
+    assert!(!r[0].vars.contains_key("contractService"));
+}
+
 // ---- ViewVarIndex --------------------------------------------------------
 
 use std::collections::HashMap;
@@ -170,6 +346,66 @@ fn index_clear_empties() {
     assert_eq!(idx.view_count(), 0);
 }
 
+#[test]
+fn render_source_files_returns_every_contributing_file() {
+    let mut idx = ViewVarIndex::new();
+    let controller = PathBuf::from("/proj/UserController.php");
+    let page = PathBuf::from("/proj/Filament/UserPage.php");
+    idx.insert_file(
+        controller.clone(),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    idx.insert_file(
+        page.clone(),
+        &[render("users.show", &[("account", "App\\Models\\Account")])],
+    );
+    idx.insert_file(
+        PathBuf::from("/proj/OtherController.php"),
+        &[render("other.view", &[("x", "App\\X")])],
+    );
+
+    let mut sources = idx.render_source_files("users.show");
+    sources.sort();
+    let mut expected = vec![controller, page];
+    expected.sort();
+    assert_eq!(sources, expected);
+    assert!(idx.render_source_files("missing.view").is_empty());
+}
+
+#[test]
+fn vars_for_view_returns_every_variable_sorted() {
+    let mut idx = ViewVarIndex::new();
+    idx.insert_file(
+        PathBuf::from("/proj/UserController.php"),
+        &[render(
+            "dash",
+            &[
+                ("user", "App\\Models\\User"),
+                ("posts", "App\\Models\\Post"),
+            ],
+        )],
+    );
+    idx.insert_file(
+        PathBuf::from("/proj/AdminController.php"),
+        &[render("dash", &[("user", "App\\Models\\Admin")])],
+    );
+
+    assert_eq!(
+        idx.vars_for_view("dash"),
+        vec![
+            ("posts".to_string(), vec!["App\\Models\\Post".to_string()]),
+            (
+                "user".to_string(),
+                vec![
+                    "App\\Models\\Admin".to_string(),
+                    "App\\Models\\User".to_string()
+                ]
+            ),
+        ]
+    );
+    assert!(idx.vars_for_view("missing.view").is_empty());
+}
+
 // ---- view_name_for_path --------------------------------------------------
 
 #[test]
@@ -211,6 +447,65 @@ fn view_name_longest_root_wins() {
             &roots
         ),
         Some("button".to_string())
+    );
+}
+
+// ---- view_name_for_path_namespaced ----------------------------------------
+
+#[test]
+fn view_name_namespaced_directory_maps_to_prefixed_name() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ns_dir = dir
+        .path()
+        .join("modules/legal-contractmanagement/resources/views");
+    let file = ns_dir.join("filament/pages/contract-edit-page.blade.php");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "").unwrap();
+
+    let mut namespaces = HashMap::new();
+    namespaces.insert("legal-contractmanagement".to_string(), ns_dir);
+    let roots = vec![dir.path().join("resources/views")];
+
+    assert_eq!(
+        view_name_for_path_namespaced(&file, &roots, &namespaces),
+        Some("legal-contractmanagement::filament.pages.contract-edit-page".to_string())
+    );
+}
+
+#[test]
+fn view_name_namespace_wins_over_plain_root_when_both_match() {
+    // A namespace dir NESTED under a plain view root (e.g. a module's views
+    // published under resources/views/modules/legal) must still key with the
+    // namespace prefix, not the plain-root-relative name.
+    let dir = tempfile::TempDir::new().unwrap();
+    let plain_root = dir.path().join("resources/views");
+    let ns_dir = plain_root.join("modules/legal");
+    let file = ns_dir.join("show.blade.php");
+    fs::create_dir_all(&ns_dir).unwrap();
+    fs::write(&file, "").unwrap();
+
+    let mut namespaces = HashMap::new();
+    namespaces.insert("legal".to_string(), ns_dir);
+    let roots = vec![plain_root];
+
+    assert_eq!(
+        view_name_for_path_namespaced(&file, &roots, &namespaces),
+        Some("legal::show".to_string())
+    );
+}
+
+#[test]
+fn view_name_namespaced_falls_back_to_plain_roots() {
+    // No namespace matches — falls through to `view_name_for_path`.
+    let roots = vec![PathBuf::from("/proj/resources/views")];
+    let namespaces: HashMap<String, PathBuf> = HashMap::new();
+    assert_eq!(
+        view_name_for_path_namespaced(
+            Path::new("/proj/resources/views/users/show.blade.php"),
+            &roots,
+            &namespaces,
+        ),
+        Some("users.show".to_string())
     );
 }
 
