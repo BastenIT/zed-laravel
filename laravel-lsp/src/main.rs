@@ -11065,31 +11065,57 @@ impl LaravelLanguageServer {
 
         let root = self.root_path.read().await.clone()?;
 
-        let (target_path, declaration_position) = match property {
+        let target = match &property {
             // $var → component file + property declaration line for $var
             None => {
-                let component_path = self.find_livewire_component_php(&root, path)?;
-                let component_content = std::fs::read_to_string(&component_path).ok()?;
-                let pos = laravel_lsp::php_class::find_property_declaration_position(
-                    &component_content,
-                    &var_name,
-                )?;
-                (component_path, pos)
+                let via_component =
+                    self.find_livewire_component_php(&root, path)
+                        .and_then(|component_path| {
+                            let component_content =
+                                std::fs::read_to_string(&component_path).ok()?;
+                            let pos = laravel_lsp::php_class::find_property_declaration_position(
+                                &component_content,
+                                &var_name,
+                            )?;
+                            Some((component_path, pos))
+                        });
+                match via_component {
+                    Some(t) => Some(t),
+                    // Project-wide fallback: a Filament `$view`-property page
+                    // or Livewire component the checks above don't reach —
+                    // `$var` itself is the member name to locate.
+                    None => self
+                        .locate_in_backing_class_files(&file_path, &var_name)
+                        .await
+                        .map(|(p, loc)| (p, (loc.line, loc.start_column, loc.end_column))),
+                }
             }
             // $var->prop → class file (whatever type $var resolves to) + prop line
             Some(prop_name) => {
-                let var_type = self
-                    .resolve_blade_variable_type(uri, &format!("${}", var_name))
-                    .await?;
-                let class_path = laravel_lsp::class_locator::find_php_class_file(&var_type, &root)?;
-                let class_content = std::fs::read_to_string(&class_path).ok()?;
-                let pos = laravel_lsp::php_class::find_property_declaration_position(
-                    &class_content,
-                    &prop_name,
-                )?;
-                (class_path, pos)
+                let via_resolved_type = async {
+                    let var_type = self
+                        .resolve_blade_variable_type(uri, &format!("${}", var_name))
+                        .await?;
+                    let class_path =
+                        laravel_lsp::class_locator::find_php_class_file(&var_type, &root)?;
+                    let class_content = std::fs::read_to_string(&class_path).ok()?;
+                    let pos = laravel_lsp::php_class::find_property_declaration_position(
+                        &class_content,
+                        prop_name,
+                    )?;
+                    Some((class_path, pos))
+                }
+                .await;
+                match via_resolved_type {
+                    Some(t) => Some(t),
+                    None => self
+                        .locate_in_backing_class_files(&file_path, prop_name)
+                        .await
+                        .map(|(p, loc)| (p, (loc.line, loc.start_column, loc.end_column))),
+                }
             }
         };
+        let (target_path, declaration_position) = target?;
 
         let (line, start_col, end_col) = declaration_position;
         let target_uri = Url::from_file_path(&target_path).ok()?;
@@ -11107,6 +11133,42 @@ impl LaravelLanguageServer {
                 },
             },
         }))
+    }
+
+    /// Goto-definition for a `wire:*="value"` attribute in a Blade template:
+    /// extract the binding target ([`livewire_resolver::wire_attribute_target_at`])
+    /// and locate it in whichever `.php` file backs this view.
+    ///
+    /// Returns `None` when the cursor isn't inside a `wire:` value, the value
+    /// isn't a resolvable identifier (`wire:click="$wire.foo++"`), or no
+    /// backing class declares the target member.
+    async fn wire_attribute_goto_definition(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::livewire_resolver::WireTarget;
+
+        let file_path = uri.to_file_path().ok()?;
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let line_text = content.lines().nth(position.line as usize)?;
+        let target = laravel_lsp::livewire_resolver::wire_attribute_target_at(
+            line_text,
+            position.character,
+        )?;
+        let member = match &target {
+            WireTarget::Method(m) => m,
+            WireTarget::Property(p) => p,
+        };
+        let (class_path, loc) = self
+            .locate_in_backing_class_files(&file_path, member)
+            .await?;
+        Self::goto_link(&class_path, loc.line, loc.start_column, loc.end_column)
     }
 
     /// Resolve the type of a property `prop` on a given class. Uses the class
@@ -11423,6 +11485,66 @@ impl LaravelLanguageServer {
                             php_type,
                             source: "slot".to_string(),
                         });
+                    }
+                }
+            }
+        }
+
+        // 7. Project-wide render index fallback (lowest priority — everything
+        // above already claimed its names via `seen`). Covers render-site
+        // shapes the per-source checks above don't — any class whose render
+        // site was captured into the index (controllers, and `$view`-property
+        // pages once #295 lands). Namespace-aware reverse mapping arrives
+        // with the #295 branch; until then plain view roots resolve here.
+        let view_paths_config = self
+            .cached_config
+            .try_read()
+            .ok()
+            .map(|g| match g.as_ref() {
+                Some(config) => config.view_paths.clone(),
+                None => vec![root.join("resources/views")],
+            });
+        if let Some(view_paths) = view_paths_config {
+            if let Some(vn) =
+                laravel_lsp::view_var_index::view_name_for_path(&file_path, &view_paths)
+            {
+                let source_files = if let Ok(idx) = self.view_vars.read() {
+                    for (name, types) in idx.vars_for_view(&vn) {
+                        if seen.insert(name.clone()) {
+                            variables.push(BladeVariableInfo {
+                                name,
+                                php_type: types
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or_else(|| "mixed".to_string()),
+                                source: "component".to_string(),
+                            });
+                        }
+                    }
+                    idx.render_source_files(&vn)
+                } else {
+                    Vec::new()
+                };
+
+                // The render index keeps only class-typed properties (scalars
+                // have no members to resolve), but a template reads scalar
+                // and untyped publics as bare `$vars` too — enumerate every
+                // public property of the contributing class files so
+                // `$`-completion offers the full surface.
+                for class_file in source_files {
+                    let Ok(class_source) = std::fs::read_to_string(&class_file) else {
+                        continue;
+                    };
+                    for (name, php_type) in
+                        laravel_lsp::component_member_locator::public_property_types(&class_source)
+                    {
+                        if seen.insert(name.clone()) {
+                            variables.push(BladeVariableInfo {
+                                name,
+                                php_type,
+                                source: "component".to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -12514,6 +12636,86 @@ impl LaravelLanguageServer {
         }
 
         self.view_path_to_livewire_class_path(root, blade_path)
+    }
+
+    /// Every `.php` file backing `blade_path`'s rendered content — the union
+    /// of two independent sources:
+    ///   1. The project-wide render index's contributors for the file's
+    ///      namespaced view name (a Filament-style `$view`-property page, or
+    ///      any controller `view(...)` call site).
+    ///   2. The conventionally-resolved Livewire component class, when
+    ///      `blade_path` is a Livewire view — so goto/hover `$this->member`
+    ///      and `wire:` fallbacks work for plain Livewire components too, not
+    ///      just Filament pages.
+    ///
+    /// Resolution for (2) goes through `livewire_name_for_path` +
+    /// `resolve_component` (the reverse-then-forward resolver), not
+    /// `find_livewire_component_php`'s file heuristics — a V4 SFC or Volt
+    /// component's class lives inline in the `.blade.php` itself, which has
+    /// no separate `.php` source for `component_member_locator` to parse, so
+    /// those legitimately contribute nothing here.
+    ///
+    /// Deduped; only paths that exist on disk and end in a plain `.php`
+    /// extension (not `.blade.php`) are kept.
+    async fn blade_backing_class_files(&self, blade_path: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+
+        let (view_paths, view_namespaces) = match self.cached_config.read().await.as_ref() {
+            Some(config) => (config.view_paths.clone(), config.view_namespaces.clone()),
+            None => (Vec::new(), HashMap::new()),
+        };
+        if let Some(view_name) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
+            blade_path,
+            &view_paths,
+            &view_namespaces,
+        ) {
+            if let Ok(idx) = self.view_vars.read() {
+                out.extend(idx.render_source_files(&view_name));
+            }
+        }
+
+        if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
+            if let Some(name) = laravel_lsp::livewire_resolver::livewire_name_for_path(
+                blade_path, &lw_config, lw_version,
+            ) {
+                if let Some(component) =
+                    laravel_lsp::livewire_resolver::resolve_component(&name, &lw_config, lw_version)
+                {
+                    out.extend(component.paths);
+                }
+            }
+        }
+
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        out.retain(|p| {
+            let is_plain_php = p.extension().and_then(|e| e.to_str()) == Some("php")
+                && !p.to_string_lossy().ends_with(".blade.php");
+            is_plain_php && p.is_file() && seen.insert(p.clone())
+        });
+        out
+    }
+
+    /// Locate `member` (a property or method name) in whichever `.php`
+    /// file(s) back `blade_path` (see [`Self::blade_backing_class_files`]).
+    /// Returns the first hit's file plus its declaration position.
+    async fn locate_in_backing_class_files(
+        &self,
+        blade_path: &Path,
+        member: &str,
+    ) -> Option<(
+        PathBuf,
+        laravel_lsp::component_member_locator::MemberLocation,
+    )> {
+        for class_path in self.blade_backing_class_files(blade_path).await {
+            let Ok(source) = std::fs::read_to_string(&class_path) else {
+                continue;
+            };
+            if let Some(loc) = laravel_lsp::component_member_locator::locate_member(&source, member)
+            {
+                return Some((class_path, loc));
+            }
+        }
+        None
     }
 
     /// Given a Livewire-view iterable expression (e.g. "$this->audits") and the view's path,
@@ -19055,6 +19257,21 @@ return [
                 // Fall through so `{{ $user->posts()->count() }}` keeps the
                 // variable hover it had before call-form capture (#77).
                 if card.is_empty() && uri.path().ends_with(".blade.php") {
+                    // `$this->member` refers to the component backing this
+                    // view (Filament `$view`-property page, Livewire
+                    // component) — `hover_for_magic_member` doesn't resolve
+                    // it (there's no receiver class to classify against), so
+                    // try the backing-class lookup before the generic
+                    // Blade-variable fallback.
+                    if member_ref.receiver.trim() == "$this" {
+                        if let Ok(path) = uri.to_file_path() {
+                            if let Some(rendered) =
+                                self.this_member_hover_card(&path, &member_ref.member).await
+                            {
+                                return Some(rendered);
+                            }
+                        }
+                    }
                     if let Some((var_name, property)) = self
                         .blade_variable_at_position(uri, member_ref.line, member_ref.column)
                         .await
@@ -19419,6 +19636,33 @@ return [
             Err(_) => (data.decl_line.unwrap_or(0), 0, 0),
         };
         Self::goto_link(&decl_file, line, start, end)
+    }
+
+    /// Minimal hover card for `$this->member` in a Blade template whose
+    /// backing class is known (a Filament `$view`-property page, a Livewire
+    /// component): header `ClassName::member` (methods) or `ClassName::$member`
+    /// (properties), plus a source link to the declaration. `None` when no
+    /// backing class declares `member`.
+    async fn this_member_hover_card(&self, blade_path: &Path, member: &str) -> Option<String> {
+        use laravel_lsp::component_member_locator::MemberKind;
+        use laravel_lsp::hover;
+
+        let (class_path, loc) = self
+            .locate_in_backing_class_files(blade_path, member)
+            .await?;
+        let class_name = laravel_lsp::php_class::extract_class_fqn(&class_path)
+            .unwrap_or_else(|| "Component".to_string());
+        let header = match loc.kind {
+            MemberKind::Method => format!("{class_name}::{member}()"),
+            MemberKind::Property => format!("{class_name}::${member}"),
+        };
+        let link = self.source_link(&class_path, Some(loc.line + 1)).await;
+        let rendered = hover::render(&hover::HoverContent {
+            header: Some(&header),
+            source_link: Some(&link),
+            ..Default::default()
+        });
+        (!rendered.is_empty()).then_some(rendered)
     }
 
     /// The Blade variable (and optional property) under a position, read from
@@ -23198,6 +23442,17 @@ impl LanguageServer for LaravelLanguageServer {
                     return Ok(Some(slot_location));
                 }
 
+                // `wire:` attribute fallback: cmd-click on a `wire:click="save"` /
+                // `wire:model="contractData.title"` value jumps into the
+                // backing component's method / property. Tried before the
+                // Blade-variable fallback since a `wire:` value isn't a `$var`
+                // reference and would never match it anyway.
+                if uri.path().ends_with(".blade.php") {
+                    if let Some(loc) = self.wire_attribute_goto_definition(&uri, position).await {
+                        return Ok(Some(loc));
+                    }
+                }
+
                 // Blade-variable fallback: when the cursor sits on a `$var` or
                 // `$var->prop` reference in a `.blade.php` file, jump to the
                 // declaration site instead of returning nothing.
@@ -23363,6 +23618,27 @@ impl LanguageServer for LaravelLanguageServer {
                 // Blade-variable goto rather than swallowing a position that
                 // jumped before call-form capture existed.
                 if location.is_none() && file_path.to_string_lossy().ends_with(".blade.php") {
+                    // `$this->member` in a template refers to the component
+                    // backing this view (a Filament `$view`-property page, a
+                    // Livewire component) rather than any Blade-scoped `$var`
+                    // — jump straight into the backing class before falling
+                    // through to the generic Blade-variable fallback, which
+                    // only understands bare `$var` / `$var->prop`.
+                    if member.receiver.trim() == "$this" {
+                        if let Some((class_path, loc)) = self
+                            .locate_in_backing_class_files(&file_path, &member.member)
+                            .await
+                        {
+                            if let Some(resp) = Self::goto_link(
+                                &class_path,
+                                loc.line,
+                                loc.start_column,
+                                loc.end_column,
+                            ) {
+                                return Ok(Some(resp));
+                            }
+                        }
+                    }
                     return Ok(self.blade_variable_goto_definition(&uri, position).await);
                 }
                 location
@@ -24953,6 +25229,73 @@ impl LanguageServer for LaravelLanguageServer {
             // Check for variable name context in Blade files (typing $user, $u, etc.)
             // This must come BEFORE model property context to avoid conflicts
             if uri.path().ends_with(".blade.php") {
+                // `wire:*` attribute value completion: actions (public
+                // methods) for event bindings, public properties for
+                // `wire:model`/`wire:show`/`wire:text` — sourced from the
+                // template's backing component class (Filament `$view` page
+                // or conventional Livewire component).
+                if let Some((wire_kind, typed_prefix)) =
+                    laravel_lsp::livewire_resolver::wire_attribute_completion_context(
+                        line_text,
+                        position.character,
+                    )
+                {
+                    if let Ok(blade_path) = uri.to_file_path() {
+                        let mut items: Vec<CompletionItem> = Vec::new();
+                        let mut seen_members = std::collections::HashSet::new();
+                        for class_file in self.blade_backing_class_files(&blade_path).await {
+                            let Ok(class_source) = std::fs::read_to_string(&class_file) else {
+                                continue;
+                            };
+                            match wire_kind {
+                                laravel_lsp::livewire_resolver::WireValueKind::Property => {
+                                    for (name, php_type) in
+                                        laravel_lsp::component_member_locator::public_property_types(
+                                            &class_source,
+                                        )
+                                    {
+                                        if name.starts_with(&typed_prefix)
+                                            && seen_members.insert(name.clone())
+                                        {
+                                            items.push(CompletionItem {
+                                                label: name,
+                                                kind: Some(CompletionItemKind::FIELD),
+                                                detail: Some(php_type),
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                }
+                                laravel_lsp::livewire_resolver::WireValueKind::Method => {
+                                    for name in
+                                        laravel_lsp::component_member_locator::public_action_method_names(
+                                            &class_source,
+                                        )
+                                    {
+                                        if name.starts_with(&typed_prefix)
+                                            && seen_members.insert(name.clone())
+                                        {
+                                            items.push(CompletionItem {
+                                                label: name,
+                                                kind: Some(CompletionItemKind::METHOD),
+                                                detail: Some("Livewire action".to_string()),
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !items.is_empty() {
+                            items.sort_by(|a, b| a.label.cmp(&b.label));
+                            return Ok(Some(CompletionResponse::List(CompletionList {
+                                is_incomplete: false,
+                                items,
+                            })));
+                        }
+                    }
+                }
+
                 // Alpine.js magic completion (`@click="$dis|"`, `x-data="{… $st|"`).
                 // Must precede the Blade `$variable` context below so a magic
                 // inside an Alpine expression wins over plain variable suggestions
