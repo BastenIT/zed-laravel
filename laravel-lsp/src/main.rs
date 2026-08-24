@@ -920,7 +920,10 @@ fn generate_directive_description(_directive: &str, source_file: &str) -> String
 }
 
 /// Scan for custom Blade directives registered via Blade::directive()
-fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
+fn scan_custom_blade_directives(
+    project_root: &Path,
+    module_dirs: &[PathBuf],
+) -> Vec<BladeDirectiveInfo> {
     use regex::Regex;
 
     let mut directives = Vec::new();
@@ -933,6 +936,24 @@ fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> 
     let app_providers = project_root.join("app/Providers");
     if app_providers.exists() {
         scan_directory_for_directives(&app_providers, &directive_re, "app", &mut directives);
+    }
+
+    // Module providers (`modules.paths`) register directives the same way
+    // the app's own providers do.
+    for path in laravel_lsp::config::module_provider_files(module_dirs) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for cap in directive_re.captures_iter(&content) {
+                if let Some(name) = cap.get(1) {
+                    directives.push(BladeDirectiveInfo {
+                        name: name.as_str().to_string(),
+                        description: "Custom directive from app module".to_string(),
+                        has_params: true,
+                        closing: None,
+                        source: "app".to_string(),
+                    });
+                }
+            }
+        }
     }
 
     // Scan vendor packages for service providers
@@ -1009,9 +1030,12 @@ fn scan_directory_for_directives(
 }
 
 /// Get all Blade directives (Laravel built-in + custom)
-fn get_all_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
+fn get_all_blade_directives(
+    project_root: &Path,
+    module_dirs: &[PathBuf],
+) -> Vec<BladeDirectiveInfo> {
     let mut all_directives = scan_laravel_blade_directives(project_root);
-    let custom_directives = scan_custom_blade_directives(project_root);
+    let custom_directives = scan_custom_blade_directives(project_root, module_dirs);
 
     // Add custom directives, avoiding duplicates
     for custom in custom_directives {
@@ -4819,7 +4843,10 @@ impl LaravelLanguageServer {
         let directives = {
             let root_guard = self.root_path.read().await;
             match root_guard.as_ref() {
-                Some(root) => get_all_blade_directives(root),
+                Some(root) => {
+                    let module_dirs = self.module_dirs_for(root).await;
+                    get_all_blade_directives(root, &module_dirs)
+                }
                 None => get_fallback_blade_directives(),
             }
         };
@@ -25475,7 +25502,10 @@ impl LanguageServer for LaravelLanguageServer {
                     let directives = {
                         let root_guard = self.root_path.read().await;
                         match root_guard.as_ref() {
-                            Some(root) => get_all_blade_directives(root),
+                            Some(root) => {
+                                let module_dirs = self.module_dirs_for(root).await;
+                                get_all_blade_directives(root, &module_dirs)
+                            }
                             None => get_fallback_blade_directives(),
                         }
                     };
