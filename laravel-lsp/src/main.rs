@@ -20000,33 +20000,79 @@ return [
     /// (outer quotes stripped) in a plain code block, link to the lang file.
     async fn hover_for_translation(&self, key: &str, root: Option<&Path>) -> String {
         use laravel_lsp::hover;
-        let locale = "en";
-        let resolution = match root {
-            Some(r) => {
-                let vendor_map = self.vendor_translation_namespaces_for(r).await;
-                let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
-                laravel_lsp::translation_lookup::resolve_translation_detailed(
-                    r, key, locale, map_ref,
-                )
+        let Some(r) = root else {
+            return hover::translation_card(key, "en", None, None);
+        };
+        let vendor_map = self.vendor_translation_namespaces_for(r).await;
+        let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
+
+        // Every locale that could define the key: the locale directories
+        // (and `{locale}.json` catalogues) of the key's lang dir(s) — the
+        // published vendor override plus the registered namespace dir for
+        // namespaced keys, the project lang dirs otherwise.
+        let mut lang_dirs: Vec<PathBuf> = Vec::new();
+        if let Some((namespace, _)) = key.split_once("::") {
+            lang_dirs.push(r.join("lang/vendor").join(namespace));
+            if let Some(dir) = map_ref.and_then(|m| m.get(namespace)) {
+                lang_dirs.push(dir.clone());
             }
-            None => None,
-        };
-        let link = match &resolution {
-            Some(res) => Some(self.source_link(&res.source_file, None).await),
-            None => None,
-        };
-        // Translation values are PHP literals (`'foo'`) — strip the outer
-        // quotes and cap the length for in-block display.
-        let value = resolution.as_ref().map(|r| {
-            let v = r.value.trim();
-            let unquoted = v
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-                .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                .unwrap_or(v);
-            hover::truncate_for_display(unquoted, 200)
-        });
-        hover::translation_card(key, locale, value.as_deref(), link.as_deref())
+        } else {
+            lang_dirs.push(r.join("lang"));
+            lang_dirs.push(r.join("resources/lang"));
+        }
+        let mut locales: Vec<String> = Vec::new();
+        for dir in &lang_dirs {
+            let Ok(dir_entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in dir_entries.flatten() {
+                let path = entry.path();
+                let locale = if path.is_dir() {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string)
+                } else if path.extension().is_some_and(|e| e == "json") {
+                    path.file_stem()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                if let Some(locale) = locale {
+                    if locale != "vendor" && !locales.contains(&locale) {
+                        locales.push(locale);
+                    }
+                }
+            }
+        }
+        locales.sort();
+        if locales.is_empty() {
+            locales.push("en".to_string());
+        }
+
+        let mut entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        for locale in &locales {
+            let resolution = laravel_lsp::translation_lookup::resolve_translation_detailed(
+                r, key, locale, map_ref,
+            );
+            let link = match &resolution {
+                Some(res) => Some(self.source_link(&res.source_file, None).await),
+                None => None,
+            };
+            // Translation values are PHP literals (`'foo'`) — strip the outer
+            // quotes and cap the length for in-block display.
+            let value = resolution.as_ref().map(|res| {
+                let v = res.value.trim();
+                let unquoted = v
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+                    .unwrap_or(v);
+                hover::truncate_for_display(unquoted, 200)
+            });
+            entries.push((locale.clone(), value, link));
+        }
+        hover::translation_card_locales(key, &entries)
     }
 
     /// Middleware — header is the alias's class FQN (the new info beyond
