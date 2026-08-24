@@ -136,12 +136,12 @@ fn registration_options_round_trip_through_serde() {
     );
 
     // We constructed exactly 1 (controllers) + 1 (routes) + 1 (migrations)
-    // + 2 (view blade + php) + 1 (livewire) + 2 (vendor php + blade)
-    // + 4 (Inertia page extensions: vue/tsx/jsx/svelte)
+    // + 1 (config) + 2 (view blade + php) + 1 (livewire) + 2 (vendor php +
+    // blade) + 4 (Inertia page extensions: vue/tsx/jsx/svelte)
     // + 6 (lang catalogues: php/json/vendor-php across both lang roots,
-    //   issue #293) = 18 watchers. If the construction changes, this
+    //   issue #293) = 19 watchers. If the construction changes, this
     // assertion will flag it for review.
-    assert_eq!(parsed.watchers.len(), 18);
+    assert_eq!(parsed.watchers.len(), 19);
 }
 
 #[test]

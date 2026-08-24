@@ -1201,3 +1201,64 @@ fn outermost_project_fails_closed_outside_the_workspace() {
         "a directory outside the workspace is never outermost within it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// expand_module_dirs / config_group_files (`modules.paths`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expand_module_dirs_matches_star_segments_in_pattern_order() {
+    let (_tmp, root, module) = modular_workspace();
+    let common = root.join("app/Common/UI");
+    fs::create_dir_all(common.join("config")).unwrap();
+
+    let patterns = vec!["app/Common/*".to_string(), "app/*/*".to_string()];
+    let dirs = expand_module_dirs(&root, &patterns);
+
+    let common_pos = dirs.iter().position(|d| d == &common).unwrap();
+    let module_pos = dirs.iter().position(|d| d == &module).unwrap();
+    assert!(
+        common_pos < module_pos,
+        "earlier pattern keeps its (lower-precedence) position"
+    );
+    // Dedup: Common/UI also matches app/*/* but must appear once.
+    assert_eq!(dirs.iter().filter(|d| *d == &common).count(), 1);
+}
+
+#[test]
+fn expand_module_dirs_empty_patterns_is_off() {
+    let (_tmp, root, _module) = modular_workspace();
+    assert!(expand_module_dirs(&root, &[]).is_empty());
+}
+
+#[test]
+fn expand_module_dirs_rejects_escaping_patterns() {
+    let (_tmp, root, _module) = modular_workspace();
+    let dirs = expand_module_dirs(&root, &["../*".to_string()]);
+    assert!(dirs.is_empty());
+}
+
+#[test]
+fn config_group_files_orders_root_before_modules() {
+    let (_tmp, root, module) = modular_workspace();
+    fs::write(root.join("config/app.php"), "<?php return [];").unwrap();
+    fs::write(module.join("config/app.php"), "<?php return [];").unwrap();
+    fs::write(
+        module.join("config/legal-guaranteelabel.php"),
+        "<?php return [];",
+    )
+    .unwrap();
+
+    let module_dirs = vec![module.clone()];
+    let app_files = config_group_files(&root, &module_dirs, "app");
+    assert_eq!(
+        app_files,
+        vec![root.join("config/app.php"), module.join("config/app.php")]
+    );
+
+    let module_only = config_group_files(&root, &module_dirs, "legal-guaranteelabel");
+    assert_eq!(
+        module_only,
+        vec![module.join("config/legal-guaranteelabel.php")]
+    );
+}

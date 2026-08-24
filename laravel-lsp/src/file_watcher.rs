@@ -113,10 +113,10 @@ pub fn build_watchers(
     // could leave it None; we pass it explicitly for clarity.
     let kind = Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete);
 
-    // 5 fixed (controllers, routes, migrations, vendor php + blade) + 4 Inertia
-    // page-extension globs + 6 lang-catalogue globs (3 per lang root) + 1
-    // optional livewire + 2 per view path + 1 per PSR-4 source root.
-    let mut watchers = Vec::with_capacity(16 + 2 * view_paths.len() + psr4_roots.len());
+    // 6 fixed (controllers, routes, migrations, config, vendor php + blade)
+    // + 4 Inertia page-extension globs + 6 lang-catalogue globs (3 per lang
+    // root) + 1 optional livewire + 2 per view path + 1 per PSR-4 source root.
+    let mut watchers = Vec::with_capacity(17 + 2 * view_paths.len() + psr4_roots.len());
 
     // Controllers — current default path. If a project moves them, we
     // miss those changes until a future improvement makes this glob
@@ -144,6 +144,16 @@ pub fn build_watchers(
             "{}/database/migrations/**/*.php",
             root.display()
         )),
+        kind,
+    });
+
+    // Config files — external edits (git pull, artisan config publishes)
+    // must invalidate the cached config layer and the file-existence cache
+    // that `config()` goto/diagnostics consult. Module config dirs
+    // (`modules.paths`) are covered by the PSR-4 `app/**` glob below when
+    // composer maps `app/`, and this root glob is their floor otherwise.
+    watchers.push(FileSystemWatcher {
+        glob_pattern: GlobPattern::String(format!("{}/config/**/*.php", root.display())),
         kind,
     });
 

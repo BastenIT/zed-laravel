@@ -1114,6 +1114,114 @@ pub fn kebab_to_pascal_case(s: &str) -> String {
 }
 
 // ============================================================================
+// Modular-monolith support (`modules.paths` LSP setting)
+// ============================================================================
+
+/// Expand the configured module-directory patterns against the project root.
+///
+/// Patterns are relative to `root`; a `*` segment matches every child
+/// directory (one level, no recursion), any other segment must match
+/// literally. Results keep the pattern order (ascending config-merge
+/// precedence); within one `*` expansion children are sorted for
+/// determinism; a directory matched by several patterns keeps its first
+/// position. Only existing directories are returned, and anything escaping
+/// the root (e.g. via `..`) is dropped.
+pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for pattern in patterns {
+        let mut current: Vec<PathBuf> = vec![root.to_path_buf()];
+        for segment in pattern.split('/').filter(|s| !s.is_empty()) {
+            if segment == ".." {
+                current.clear();
+                break;
+            }
+            let mut next = Vec::new();
+            if segment == "*" {
+                for dir in &current {
+                    let Ok(entries) = fs::read_dir(dir) else {
+                        continue;
+                    };
+                    let mut children: Vec<PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    children.sort();
+                    next.extend(children);
+                }
+            } else {
+                for dir in &current {
+                    let candidate = dir.join(segment);
+                    if candidate.is_dir() {
+                        next.push(candidate);
+                    }
+                }
+            }
+            current = next;
+        }
+        for dir in current {
+            if dir != *root && dir.starts_with(root) && seen.insert(dir.clone()) {
+                out.push(dir);
+            }
+        }
+    }
+
+    out
+}
+
+/// Service-provider files inside the configured module directories: any
+/// `*ServiceProvider.php` up to a few levels deep, skipping nested vendor
+/// and node_modules trees. Modules register their providers via composer
+/// `extra.laravel.providers` (merged manifests), not
+/// `bootstrap/providers.php`, so the filename convention is the static
+/// discovery signal — mirroring the vendor provider scan.
+pub fn module_provider_files(module_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for module_dir in module_dirs {
+        for entry in walkdir::WalkDir::new(module_dir)
+            .max_depth(6)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                name != "vendor" && name != "node_modules"
+            })
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("ServiceProvider.php"))
+            {
+                out.push(path.to_path_buf());
+            }
+        }
+    }
+    out
+}
+
+/// All files that contribute to the config group `group` (the top-level
+/// `config('group.…')` key), in **ascending merge precedence**: the project
+/// `config/{group}.php` first, then each module's `config/{group}.php` in
+/// module order. Mirrors the runtime pattern where a module service
+/// provider `array_replace_recursive`s its config files over the existing
+/// repository state. Only existing files are returned.
+pub fn config_group_files(root: &Path, module_dirs: &[PathBuf], group: &str) -> Vec<PathBuf> {
+    let file_name = format!("{group}.php");
+    std::iter::once(root.join("config").join(&file_name))
+        .chain(
+            module_dirs
+                .iter()
+                .map(|m| m.join("config").join(&file_name)),
+        )
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

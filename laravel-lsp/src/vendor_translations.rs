@@ -150,6 +150,30 @@ pub fn namespaces_in_source(
     out
 }
 
+/// Extract translation namespaces from an explicit list of provider files —
+/// the module providers discovered via the `modules.paths` setting, which
+/// live outside `app/Providers/` (e.g. `app/{Parent}/{Module}/app/Providers/`)
+/// and register per-module namespaces with `loadTranslationsFrom`.
+pub fn scan_provider_files_translation_namespaces(
+    root: &Path,
+    provider_files: &[PathBuf],
+) -> HashMap<String, PathBuf> {
+    let mut namespaces: HashMap<String, PathBuf> = HashMap::new();
+
+    for path in provider_files {
+        let Ok(source) = fs::read_to_string(path) else {
+            continue;
+        };
+        if !source.contains("loadTranslationsFrom") && !source.contains("hasTranslations") {
+            continue;
+        }
+
+        process_provider_file(&source, path, root, &mut namespaces);
+    }
+
+    namespaces
+}
+
 /// Run both extraction passes over a single provider file: the AST-based
 /// `loadTranslationsFrom(...)` walk and the regex-based builder convention.
 fn process_provider_file(
@@ -239,7 +263,7 @@ fn classify_load_translations_call(
 /// `dirname(__DIR__).'/rel'`, `lang_path('…')`, and `base_path('…')`, plus a
 /// bare `__DIR__`. Anything else (a variable, an unrecognized helper) yields
 /// `None` and the registration is skipped.
-fn resolve_path_arg(
+pub(crate) fn resolve_path_arg(
     node: tree_sitter::Node,
     bytes: &[u8],
     provider_dir: &Path,
@@ -322,7 +346,7 @@ fn first_argument(call: tree_sitter::Node) -> Option<tree_sitter::Node> {
 /// The value expression of a call argument. tree-sitter-php wraps each argument
 /// in an `argument` node; for a named argument the parameter label is the
 /// `name` field, so the value is the other child.
-fn argument_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
+pub(crate) fn argument_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
     if arg.kind() != "argument" {
         return Some(arg);
     }
@@ -333,7 +357,7 @@ fn argument_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
 }
 
 /// Whether `object` is the `$this` receiver of a `$this->method(...)` call.
-fn is_this_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
+pub(crate) fn is_this_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
     object.utf8_text(bytes).ok() == Some("$this")
 }
 
@@ -341,7 +365,7 @@ fn is_this_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
 /// Descends to the `string_content` child, matching the rest of the LSP; an
 /// empty literal has no such child, so fall back to stripping a surrounding
 /// quote pair.
-fn string_literal_text(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+pub(crate) fn string_literal_text(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     if !matches!(node.kind(), "string" | "encapsed_string") {
         return None;
     }
