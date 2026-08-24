@@ -5952,6 +5952,23 @@ impl LaravelLanguageServer {
         if cache.has_cached_data() {
             // 1. Store cached Laravel config directly in memory (bypasses Salsa)
             if let Some(cached_config) = cache.get_laravel_config() {
+                // A cache written while the root was hijacked by a nested
+                // module directory (composer-merge-plugin layouts) would
+                // re-pin that module as the root forever. A cached root
+                // strictly inside the workspace root that is not a
+                // standalone app of its own is poisoned — discard it and
+                // fall through to a fresh rescan.
+                let cached_root_nested =
+                    cached_config.root != root && cached_config.root.starts_with(root);
+                let cached_root_standalone = cached_config.root.join("artisan").exists()
+                    || cached_config.root.join("vendor").is_dir();
+                if cached_root_nested && !cached_root_standalone {
+                    warn!(
+                        "📂 Cached Laravel root {:?} is a nested non-standalone directory inside {:?} — discarding poisoned cache and rescanning",
+                        cached_config.root, root
+                    );
+                    return vec![RescanType::Vendor, RescanType::App, RescanType::NodeModules];
+                }
                 info!(
                     "📋 Loading cached Laravel config: {} view paths, root: {:?}",
                     cached_config.view_paths.len(),
@@ -7585,11 +7602,26 @@ impl LaravelLanguageServer {
                         );
                         true
                     } else if more_specific {
-                        info!(
-                            "Discovered more specific Laravel root {:?} (current: {:?})",
-                            discovered_root, current
-                        );
-                        true
+                        // A nested directory only replaces an established
+                        // root when it is a standalone app of its own
+                        // (artisan or an installed vendor/ tree). Merged
+                        // module manifests (composer-merge-plugin layouts
+                        // like app/{Parent}/{Module}/composer.json) must
+                        // never re-root the whole server.
+                        let standalone = discovered_root.join("artisan").exists()
+                            || discovered_root.join("vendor").is_dir();
+                        if standalone {
+                            info!(
+                                "Discovered more specific Laravel root {:?} (current: {:?})",
+                                discovered_root, current
+                            );
+                        } else {
+                            debug!(
+                                "Ignoring nested non-standalone root candidate {:?} — keeping current root {:?}",
+                                discovered_root, current
+                            );
+                        }
+                        standalone
                     } else {
                         // File is within current root and discovered isn't more specific
                         debug!(
