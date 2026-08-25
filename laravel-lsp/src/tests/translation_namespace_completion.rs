@@ -144,3 +144,19 @@ fn translation_call_context_passes_namespace_prefix_through_unmangled() {
         "legal-contractmanagement::contract-management.details."
     );
 }
+
+/// Regression: values longer than 50 characters with a multibyte character
+/// straddling the truncation index must not panic (`&s[..47]` was a byte
+/// slice; index 47 landing inside 'č' aborted the whole server the first
+/// time namespaced catalogues — full of non-ASCII values — were enumerated
+/// for completion).
+#[test]
+fn translation_value_truncation_is_char_boundary_safe() {
+    // 46 ASCII chars, then a two-byte 'č' occupying bytes 46..48, then
+    // padding past the 50-char threshold.
+    let value: String = "a".repeat(46) + "čééééééé";
+    let line = format!("'key' => '{}',", value);
+    let display = LaravelLanguageServer::extract_translation_value(&line);
+    assert!(display.ends_with("..."));
+    assert!(display.chars().count() <= 50);
+}
