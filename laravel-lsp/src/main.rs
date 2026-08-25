@@ -6915,13 +6915,11 @@ impl LaravelLanguageServer {
                     {
                         continue;
                     }
-                    if let Some(name) =
-                        laravel_lsp::view_var_index::view_name_for_path_namespaced(
-                            p,
-                            &view_paths,
-                            &view_namespaces,
-                        )
-                    {
+                    if let Some(name) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
+                        p,
+                        &view_paths,
+                        &view_namespaces,
+                    ) {
                         if changed.contains(name.as_str()) {
                             work.insert(p.clone());
                         }
