@@ -1096,7 +1096,7 @@ fn no_indexed_resource_name_ever_starts_with_slash() {
     // Belt-and-suspenders: across a realistic mix, assert the slash bug is gone.
     let (_tmp, index) = index_routes(&[(
         "routes/web.php",
-        "<?php\nRoute::name('api.')->group(function () {\n    Route::resource('/leads', LeadController::class);\n    Route::apiResource('/photos/', PhotoController::class);\n});\nRoute::resource('/bare', BareController::class);\n",
+        "<?php\nRoute::name('api.')->group(function () {\n    Route::resource('/leads', LeadController::class);\n    Route::apiResource('/photos/', PhotoController::class);\n});\nRoute::resource('/bare', BareController::class);\nRoute::resource('/admin/account-manager/accounts', AccountsController::class);\n",
     )]);
 
     for name in index.routes.keys() {
@@ -1113,6 +1113,49 @@ fn no_indexed_resource_name_ever_starts_with_slash() {
     assert!(index.get("api.leads.index").is_some());
     assert!(index.get("api.photos.store").is_some());
     assert!(index.get("bare.show").is_some());
+    // A multi-segment URI is what actually exercises the invariant above —
+    // single-segment fixtures pass it even when interior slashes are kept.
+    assert!(index.get("accounts.index").is_some());
+}
+
+#[test]
+fn resource_with_multi_segment_uri_names_only_the_last_segment() {
+    // Laravel sends any slashed resource name through
+    // `ResourceRegistrar::prefixedResource`, which keeps only the final segment
+    // as the route name and treats the rest as a URI prefix. Indexing the whole
+    // path made every CRUD route of such a resource unresolvable.
+    let src = r#"<?php
+Route::resource('/admin/account-manager/accounts', AccountsController::class)->only(['index', 'show']);
+"#;
+    let mut names = names_of(src);
+    names.sort();
+    assert_eq!(names, vec!["accounts.index", "accounts.show"]);
+}
+
+#[test]
+fn resource_with_multi_segment_uri_keeps_the_full_uri_for_display() {
+    // The prefix is dropped from the NAME only — hover still shows the path
+    // the developer wrote.
+    let path = PathBuf::from("/fake/routes/web.php");
+    let results = extract_named_routes(
+        "<?php\nRoute::apiResource('admin/photos', PhotoController::class)->only(['index']);\n",
+        &path,
+        PRIORITY_APP,
+        &[],
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.as_deref(), Some("photos.index"));
+    assert_eq!(results[0].1.uri.as_deref(), Some("admin/photos"));
+}
+
+#[test]
+fn resource_with_multi_segment_uri_composes_with_group_prefix() {
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    Route::resource('account-manager/users', UsersController::class)->only(['index']);
+});
+"#;
+    assert_eq!(names_of(src), vec!["admin.users.index"]);
 }
 
 #[test]
@@ -1258,4 +1301,127 @@ fn folio_named_page_surfaces_in_handler_route_index() {
     // is caught at this layer.
     assert_eq!(route.uri.as_deref(), Some("/users/{id}"));
     assert_eq!(route.method.as_deref(), Some("get"));
+}
+
+// ============================================================================
+// Comment / heredoc blindness (the byte-scan bug the AST parse retired)
+// ============================================================================
+//
+// The previous scanner matched braces, parens and quotes over raw bytes with no
+// notion of PHP comments. Real route files carry commented-out route code and
+// English prose, both of which silently corrupted every group boundary that
+// followed: a stray `{` from `// Route::get('/x', function () {` pushed a
+// group's closing brace hundreds of lines late, and a lone apostrophe in
+// "it's" opened a phantom string literal that swallowed the braces after it.
+// Routes then inherited a prefix from a group they were never inside.
+
+#[test]
+fn commented_out_route_is_not_indexed() {
+    let src = r#"<?php
+// Route::get('/ghost', [GhostController::class, 'index'])->name('ghost');
+Route::get('/real')->name('real');
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["real"],
+        "a commented-out route is not a route"
+    );
+}
+
+#[test]
+fn commented_out_resource_is_not_indexed() {
+    let src = r#"<?php
+// Route::resource('ghosts', GhostController::class);
+Route::resource('reals', RealController::class)->only(['index']);
+"#;
+    assert_eq!(names_of(src), vec!["reals.index"]);
+}
+
+#[test]
+fn commented_out_closure_brace_does_not_extend_group_body() {
+    // The decisioncloud shape: a commented-out route leaves an unmatched `{`
+    // inside the group. Byte-scanning counted it, so the group's closing brace
+    // was never found and its prefix vanished from the routes inside it.
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    // Route::get('/legacy', function () {
+    Route::get('/users')->name('users.index');
+});
+Route::name('api.')->group(function () {
+    Route::get('/posts')->name('posts.index');
+});
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["admin.users.index", "api.posts.index"],
+        "an unmatched brace in a comment must not move the group boundary"
+    );
+}
+
+#[test]
+fn apostrophe_in_comment_does_not_shift_group_boundary() {
+    // A lone `it's` opens a phantom string literal for a quote-tracking byte
+    // scanner, hiding every brace up to the next quote — here, the group's own
+    // closing `}`, which then swallowed the sibling group below it.
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    Route::get('/users')->name('users.index');
+    // the closing brace is below, it's important
+});
+Route::name('api.')->group(function () {
+    Route::get('/posts')->name('posts.index');
+});
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["admin.users.index", "api.posts.index"],
+        "a prose apostrophe must not shift the group boundary"
+    );
+}
+
+#[test]
+fn block_comment_braces_do_not_shift_group_boundary() {
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    /*
+     * Route::get('/old', function () {
+     */
+    Route::get('/users')->name('users.index');
+});
+Route::get('/login')->name('login');
+"#;
+    assert_eq!(names_of(src), vec!["admin.users.index", "login"]);
+}
+
+#[test]
+fn heredoc_braces_do_not_shift_group_boundary() {
+    // A `}` inside heredoc text closed the group early, so the route below it
+    // lost the `admin.` prefix entirely.
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    $sql = <<<'SQL'
+} this brace is data, not code
+SQL;
+    Route::get('/users')->name('users.index');
+});
+Route::get('/login')->name('login');
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["admin.users.index", "login"],
+        "heredoc content must not be parsed as code"
+    );
+}
+
+#[test]
+fn group_name_setter_is_not_itself_a_route() {
+    // `->name('admin.')` on a chain that ends in `->group(...)` configures the
+    // children's prefix; it does not register a route of its own. The byte scan
+    // indexed it as the bogus route `admin.`.
+    let src = r#"<?php
+Route::prefix('/admin')->name('admin.')->group(function () {
+    Route::get('/users')->name('users.index');
+});
+"#;
+    assert_eq!(names_of(src), vec!["admin.users.index"]);
 }
