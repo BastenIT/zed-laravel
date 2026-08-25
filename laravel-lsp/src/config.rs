@@ -8,33 +8,125 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-/// Find the Laravel project root by walking up from a file path
+/// Does this directory look like the root of a Laravel project or package?
 ///
-/// Looks for Laravel-specific markers:
-/// - composer.json + artisan (Laravel app)
-/// - composer.json + app/ + resources/ (Laravel app)
-/// - composer.json + src/ + vendor/ (Laravel package)
+/// The three marker sets the extension has always recognised, unchanged:
 ///
-/// Returns None if no Laravel project root is found.
-pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
-    let mut current = file_path;
+/// - `composer.json` + `artisan` — a Laravel app
+/// - `composer.json` + `app/` + `resources/` — a Laravel app
+/// - `composer.json` + `src/` + `vendor/` — a Laravel package
+///
+/// Every signal except `vendor/` is committed to the repository, so a fresh
+/// clone that has never run `composer install` still identifies correctly
+/// through `artisan` or the `app/` + `resources/` pair. `vendor/` is only
+/// consulted for the package shape, where nothing else distinguishes a package
+/// checkout from any directory that happens to hold a `composer.json` and a
+/// `src/`.
+pub fn looks_like_laravel_project(dir: &Path) -> bool {
+    if !dir.join("composer.json").exists() {
+        return false;
+    }
+    dir.join("artisan").exists()
+        || (dir.join("app").is_dir() && dir.join("resources").is_dir())
+        || (dir.join("src").is_dir() && dir.join("vendor").is_dir())
+}
 
-    // If it's a file, start from its parent directory
-    if current.is_file() {
-        current = current.parent()?;
+/// Find the Laravel project root for a file.
+///
+/// Two strategies, chosen by whether the file sits inside the editor's
+/// workspace:
+///
+/// **Inside the workspace** — walk *down* from `workspace_root` toward the
+/// file and take the **outermost** directory that [`looks_like_laravel_project`].
+/// In a modular monolith (composer-merge-plugin layouts, `app/{Parent}/{Module}/`
+/// with per-module manifests merged into the workspace manifest) every module
+/// matches the same markers as the workspace itself, so "first match walking
+/// up" hands the whole server to a module directory — `.env` resolution, the
+/// route/migration/command indexes, DB config, the vendor scan and the file
+/// watchers all silently retarget a subdirectory (issue #286). Outermost-wins
+/// cannot make that mistake, because the workspace root always matches before
+/// any module nested inside it does.
+///
+/// The workspace root is the fence, and it matters: with `/` as the starting
+/// point instead, one stray `composer.json` beside an `app/` and a `resources/`
+/// in a home directory would silently re-root every project opened beneath it.
+///
+/// **Outside the workspace, or no workspace at all** — vendor files, globally
+/// installed packages, a file opened by absolute path — fall back to walking
+/// *up* from the file. There is no fence to walk down from, so the nearest
+/// enclosing project wins, with one refinement from #286: a
+/// `composer.json` + `app/` + `resources/` match that has no `vendor/` of its
+/// own is only *tentative*, since that is exactly the shape of a merged module.
+/// The walk continues and prefers any ancestor that is unambiguously a root,
+/// returning the tentative match only when no stronger ancestor exists.
+///
+/// Returns `None` if no Laravel project root is found.
+pub fn find_project_root(file_path: &Path, workspace_root: Option<&Path>) -> Option<PathBuf> {
+    let mut start = file_path;
+    if start.is_file() {
+        start = start.parent()?;
     }
 
-    // A composer.json + app/ + resources/ match without its own dependency
-    // tree is only *tentative*: module directories in modular monoliths
-    // (e.g. app/{Parent}/{Module}/ with a composer.json merged into the
-    // workspace manifest via composer-merge-plugin) match the same markers.
-    // Keep walking and prefer any ancestor that is unambiguously a project
-    // root; fall back to the tentative match only when no ancestor is one.
+    if let Some(workspace_root) = workspace_root {
+        if let Some(root) = outermost_project_from(workspace_root, start) {
+            info!(
+                "Found Laravel project root at {:?} (outermost match within workspace {:?})",
+                root, workspace_root
+            );
+            return Some(root);
+        }
+    }
+
+    find_project_root_upward(start)
+}
+
+/// Walk down from `workspace_root` toward `start`, returning the first
+/// directory on that path that [`looks_like_laravel_project`].
+///
+/// Returns `None` when `start` is not inside `workspace_root` (nothing to walk)
+/// or when no directory along the way looks like a project — a monorepo whose
+/// top-level `composer.json` only pins dev tooling, for instance, is skipped in
+/// favour of the real app further down.
+fn outermost_project_from(workspace_root: &Path, start: &Path) -> Option<PathBuf> {
+    let relative = start.strip_prefix(workspace_root).ok()?;
+    let mut candidate = workspace_root.to_path_buf();
+    if looks_like_laravel_project(&candidate) {
+        return Some(candidate);
+    }
+    for component in relative.components() {
+        candidate.push(component);
+        if looks_like_laravel_project(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Is `dir` the outermost Laravel project on its own path within
+/// `workspace_root`?
+///
+/// The question every "may this nested directory be the root?" check actually
+/// wants to ask. It reuses [`find_project_root`]'s own descent, so the answer
+/// cannot drift from the rule that produced the root in the first place — and
+/// unlike a marker-counting heuristic it consults no gitignored state, so it
+/// returns the same answer before and after `composer install`.
+///
+/// Fails closed: a `dir` outside `workspace_root`, or one no descent reaches,
+/// is not outermost. A wrong `true` re-roots the entire server; a wrong `false`
+/// merely keeps the root already in use.
+pub fn is_outermost_project(workspace_root: &Path, dir: &Path) -> bool {
+    outermost_project_from(workspace_root, dir).as_deref() == Some(dir)
+}
+
+/// The pre-workspace-fence strategy: walk up from `start` and take the nearest
+/// enclosing project, treating a vendor-less `composer.json` + `app/` +
+/// `resources/` match as tentative. See [`find_project_root`] for when this
+/// applies and why.
+fn find_project_root_upward(start: &Path) -> Option<PathBuf> {
+    let mut current = start;
     let mut tentative: Option<PathBuf> = None;
 
-    // Walk up the directory tree
     loop {
-        // Check for Laravel markers
         let has_composer = current.join("composer.json").exists();
         let has_artisan = current.join("artisan").exists();
         let has_app = current.join("app").is_dir();
@@ -42,7 +134,6 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
         let has_src = current.join("src").is_dir();
         let has_vendor = current.join("vendor").is_dir();
 
-        // If we find composer.json + artisan, it's very likely a Laravel app
         if has_composer && has_artisan {
             info!(
                 "Found Laravel project root at {:?} (composer.json + artisan)",
@@ -51,8 +142,6 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
             return Some(current.to_path_buf());
         }
 
-        // Or if we find composer.json + src/ + vendor/ (Laravel package)
-        // This pattern recognizes Laravel package development
         if has_composer && has_src && has_vendor {
             info!(
                 "Found Laravel package root at {:?} (composer.json + src + vendor)",
@@ -61,9 +150,6 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
             return Some(current.to_path_buf());
         }
 
-        // composer.json + app/ + resources/ (Laravel app). With a vendor/
-        // of its own it is a real installed root; without one it could be
-        // a merged nested module, so only record it and keep walking.
         if has_composer && has_app && has_resources {
             if has_vendor {
                 info!(
@@ -77,7 +163,6 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
             }
         }
 
-        // Move up one directory
         match current.parent() {
             Some(parent) => current = parent,
             None => break,

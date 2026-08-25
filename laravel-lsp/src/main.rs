@@ -1889,6 +1889,15 @@ struct LaravelLanguageServer {
     documents: Arc<RwLock<HashMap<Url, (String, i32)>>>,
     /// The root path of the Laravel project
     root_path: Arc<RwLock<Option<PathBuf>>>,
+    /// The editor's workspace root, as sent in `initialize`'s `root_uri`.
+    ///
+    /// Distinct from [`Self::root_path`], which *drifts*: discovery re-points
+    /// it at whichever Laravel root a newly-opened file resolves to. This one
+    /// is written once and never moved, because it is the fence
+    /// [`find_project_root`] walks down from — an outermost-match search needs
+    /// a fixed left edge, and a drifting one would reintroduce exactly the
+    /// nested-module hijack it exists to prevent (issues #286, #289).
+    workspace_root: Arc<RwLock<Option<PathBuf>>>,
     /// Store diagnostics per file (for hover filtering)
     diagnostics: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Pending debounced diagnostic tasks (uri -> task handle)
@@ -4327,6 +4336,7 @@ impl LaravelLanguageServer {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             root_path: Arc::new(RwLock::new(None)),
+            workspace_root: Arc::new(RwLock::new(None)),
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
             pending_diagnostics: Arc::new(RwLock::new(HashMap::new())),
             debounce_delay_ms: 200, // 200ms for diagnostics
@@ -5960,9 +5970,9 @@ impl LaravelLanguageServer {
                 // fall through to a fresh rescan.
                 let cached_root_nested =
                     cached_config.root != root && cached_config.root.starts_with(root);
-                let cached_root_standalone = cached_config.root.join("artisan").exists()
-                    || cached_config.root.join("vendor").is_dir();
-                if cached_root_nested && !cached_root_standalone {
+                let cached_root_is_outermost =
+                    laravel_lsp::config::is_outermost_project(root, &cached_config.root);
+                if cached_root_nested && !cached_root_is_outermost {
                     warn!(
                         "📂 Cached Laravel root {:?} is a nested non-standalone directory inside {:?} — discarding poisoned cache and rescanning",
                         cached_config.root, root
@@ -7511,7 +7521,8 @@ impl LaravelLanguageServer {
     /// - This handles both nested Laravel projects and files outside initial workspace
     async fn try_discover_from_file(&self, file_path: &Path) {
         // Always try to find the Laravel project root from this file
-        let Some(discovered_root) = find_project_root(file_path) else {
+        let workspace_root = self.workspace_root.read().await.clone();
+        let Some(discovered_root) = find_project_root(file_path, workspace_root.as_deref()) else {
             debug!(
                 "Could not find Laravel project root from file: {:?}",
                 file_path
@@ -7595,6 +7606,29 @@ impl LaravelLanguageServer {
                     let more_specific =
                         discovered_root.starts_with(current) && discovered_root != *current;
 
+                    // The discovered root *encloses* the active one. This is
+                    // the shape a session stuck on a too-deep root produces:
+                    // the file is inside the current root, and the discovered
+                    // root is neither outside it nor nested within it, so
+                    // without this arm nothing would ever pull the root back
+                    // out. Same family as the linked-worktree self-correction
+                    // above — a wrong root is otherwise sticky for the whole
+                    // session (issue #289).
+                    let corrects_upward =
+                        current.starts_with(&discovered_root) && discovered_root != *current;
+
+                    // A root may only be replaced by one that is the outermost
+                    // project on its own path — the same rule that produced
+                    // `discovered_root`. Merged module manifests
+                    // (composer-merge-plugin layouts like
+                    // `app/{Parent}/{Module}/composer.json`) must never re-root
+                    // the whole server. Without a workspace there is no fence
+                    // to judge against, so fail closed and keep the current
+                    // root.
+                    let discovered_is_outermost = workspace_root.as_deref().is_some_and(|ws| {
+                        laravel_lsp::config::is_outermost_project(ws, &discovered_root)
+                    });
+
                     if file_outside_root {
                         info!(
                             "File {:?} is outside current root {:?}, switching to discovered root: {:?}",
@@ -7602,26 +7636,24 @@ impl LaravelLanguageServer {
                         );
                         true
                     } else if more_specific {
-                        // A nested directory only replaces an established
-                        // root when it is a standalone app of its own
-                        // (artisan or an installed vendor/ tree). Merged
-                        // module manifests (composer-merge-plugin layouts
-                        // like app/{Parent}/{Module}/composer.json) must
-                        // never re-root the whole server.
-                        let standalone = discovered_root.join("artisan").exists()
-                            || discovered_root.join("vendor").is_dir();
-                        if standalone {
+                        if discovered_is_outermost {
                             info!(
                                 "Discovered more specific Laravel root {:?} (current: {:?})",
                                 discovered_root, current
                             );
                         } else {
                             debug!(
-                                "Ignoring nested non-standalone root candidate {:?} — keeping current root {:?}",
+                                "Ignoring nested non-outermost root candidate {:?} — keeping current root {:?}",
                                 discovered_root, current
                             );
                         }
-                        standalone
+                        discovered_is_outermost
+                    } else if corrects_upward && discovered_is_outermost {
+                        info!(
+                            "Correcting project root upward from {:?} to the outermost project {:?}",
+                            current, discovered_root
+                        );
+                        true
                     } else {
                         // File is within current root and discovered isn't more specific
                         debug!(
@@ -17256,6 +17288,7 @@ return [
             client: self.client.clone(),
             documents: self.documents.clone(),
             root_path: self.root_path.clone(),
+            workspace_root: self.workspace_root.clone(),
             diagnostics: self.diagnostics.clone(),
             pending_diagnostics: self.pending_diagnostics.clone(),
             debounce_delay_ms: self.debounce_delay_ms,
@@ -21808,6 +21841,7 @@ impl LanguageServer for LaravelLanguageServer {
         if let Some(root_uri) = params.root_uri {
             if let Ok(path) = root_uri.to_file_path() {
                 *self.root_path.write().await = Some(path.clone());
+                *self.workspace_root.write().await = Some(path.clone());
                 info!("✅ Laravel: Root path set to {:?}", path);
 
                 // Load ALL cached data (config, middleware, bindings, env) using batch registration (fast)

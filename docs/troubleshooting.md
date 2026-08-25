@@ -80,6 +80,28 @@ xattr -d com.apple.quarantine ~/.local/bin/laravel-ce-lsp 2>/dev/null
 # ensure ~/.local/bin is on your PATH, then fully restart Zed
 ```
 
+## 8. Did the extension pick the wrong project root?
+
+Everything path-shaped hangs off one decision: which directory the extension considers your project root. Get it wrong and the symptoms are baffling rather than obvious — `.env` values resolve to nothing, route and config lookups come back empty, go-to-definition misses files that plainly exist, and the file watchers sit on a subtree instead of your project.
+
+**How the root is chosen.** Inside your open workspace, the extension walks *down* from the workspace folder toward the file you opened and takes the **outermost** directory that looks like a Laravel project — one holding a `composer.json` plus any of:
+
+- `artisan`
+- `app/` **and** `resources/`
+- `src/` **and** `vendor/` (a package checkout)
+
+Outermost-wins is deliberate. In a modular monolith — `app/{Parent}/{Module}/` layouts where per-module `composer.json` files are merged into the workspace manifest via composer-merge-plugin — *every module* matches the same markers as the workspace itself. Picking the nearest match instead would hand the entire server to whichever module you happened to open first.
+
+For a file **outside** your workspace (a vendor file, a globally installed package), there is no folder to walk down from, so the extension walks up from the file and takes the nearest enclosing project.
+
+**Confirm which root it picked.** `Cmd+Shift+P → "open language server logs"`, choose **Laravel CE**, and search for `Found Laravel`. The line names both the directory and the rule that matched it (a package checkout logs *package root* rather than *project root*).
+
+**The usual cause of a wrong answer: a stray `vendor/`.** A leftover or half-installed `vendor/` directory inside a subdirectory used to be enough to convince older versions that the subdirectory was a project in its own right. The check now requires `vendor/autoload.php` to exist as a real file, so an empty `vendor/` no longer counts. If you are on an older build and seeing this, delete the stray directory and restart Zed.
+
+**Opening a module directly is supported.** If you genuinely want to work on one module in isolation, open *that folder* as your Zed workspace — it then becomes the outermost match and the root, exactly as you'd expect.
+
+> 📌 **A sub-app with hoisted dependencies resolves to the workspace root.** A directory holding `composer.json` + `app/` + `resources/` but no `artisan` of its own — dependencies hoisted up to the workspace `vendor/` — is treated as part of the workspace rather than as its own project. Real Laravel applications ship `artisan`, so this is rare; if you hit it, open the sub-app as its own workspace.
+
 ---
 
 See also: [⚙️ Configuration](configuration.md) · [🌱 Environment files](environment.md) · [🔧 Tuning Intelephense](tuning-intelephense.md)

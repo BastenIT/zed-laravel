@@ -928,7 +928,7 @@ fn project_root_walks_past_nested_module_to_workspace_root() {
     let file = module.join("config/legal-guaranteelabel.php");
     fs::write(&file, "<?php return [];").unwrap();
 
-    let found = find_project_root(&file).unwrap();
+    let found = find_project_root(&file, None).unwrap();
     assert_eq!(found, root, "module dir must not hijack the project root");
 }
 
@@ -939,7 +939,7 @@ fn project_root_keeps_nested_app_with_its_own_artisan() {
     let file = module.join("config/legal-guaranteelabel.php");
     fs::write(&file, "<?php return [];").unwrap();
 
-    let found = find_project_root(&file).unwrap();
+    let found = find_project_root(&file, None).unwrap();
     assert_eq!(found, module, "a genuine nested app stays its own root");
 }
 
@@ -953,7 +953,7 @@ fn project_root_standalone_package_with_src_and_vendor_unchanged() {
     let file = pkg.join("src/Provider.php");
     fs::write(&file, "<?php").unwrap();
 
-    assert_eq!(find_project_root(&file).unwrap(), pkg);
+    assert_eq!(find_project_root(&file, None).unwrap(), pkg);
 }
 
 #[test]
@@ -967,7 +967,7 @@ fn project_root_app_without_artisan_but_with_vendor_unchanged() {
     let file = app.join("app/Thing.php");
     fs::write(&file, "<?php").unwrap();
 
-    assert_eq!(find_project_root(&file).unwrap(), app);
+    assert_eq!(find_project_root(&file, None).unwrap(), app);
 }
 
 #[test]
@@ -980,5 +980,224 @@ fn project_root_tentative_match_returned_without_stronger_ancestor() {
     let file = app.join("app/Thing.php");
     fs::write(&file, "<?php").unwrap();
 
-    assert_eq!(find_project_root(&file).unwrap(), app);
+    assert_eq!(find_project_root(&file, None).unwrap(), app);
+}
+
+// ---------------------------------------------------------------------------
+// find_project_root — outermost match within the workspace fence (issue #289)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fenced_modular_monolith_resolves_to_the_workspace_root() {
+    let (_tmp, root, module) = modular_workspace();
+    let file = module.join("config/legal-guaranteelabel.php");
+    fs::write(&file, "<?php return [];").unwrap();
+
+    assert_eq!(find_project_root(&file, Some(&root)).unwrap(), root);
+}
+
+/// The hole #286's heuristic left open: a module carrying its own `vendor/`
+/// satisfied the standalone check and hijacked the root anyway. Outermost-wins
+/// never consults `vendor/` for that decision.
+#[test]
+fn fenced_module_with_its_own_vendor_still_resolves_to_the_workspace_root() {
+    let (_tmp, root, module) = modular_workspace();
+    fs::create_dir_all(module.join("vendor")).unwrap();
+    let file = module.join("config/legal-guaranteelabel.php");
+    fs::write(&file, "<?php return [];").unwrap();
+
+    assert_eq!(find_project_root(&file, Some(&root)).unwrap(), root);
+}
+
+/// Even a module with its own `artisan` loses to the workspace: you opened the
+/// monolith, so you get the monolith. Opening the module directly still yields
+/// the module, because then it *is* the workspace root.
+#[test]
+fn fenced_module_with_its_own_artisan_loses_to_the_workspace_root() {
+    let (_tmp, root, module) = modular_workspace();
+    fs::write(module.join("artisan"), "").unwrap();
+    let file = module.join("config/legal-guaranteelabel.php");
+    fs::write(&file, "<?php return [];").unwrap();
+
+    assert_eq!(find_project_root(&file, Some(&root)).unwrap(), root);
+    assert_eq!(find_project_root(&file, Some(&module)).unwrap(), module);
+}
+
+/// A monorepo manifest that only pins dev tooling has no Laravel markers, so
+/// the walk descends past it to the real app.
+#[test]
+fn fenced_walk_descends_past_a_tooling_only_manifest() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::write(root.join("composer.json"), "{}").unwrap();
+
+    let app = root.join("apps/web");
+    fs::create_dir_all(app.join("app")).unwrap();
+    fs::create_dir_all(app.join("resources")).unwrap();
+    fs::write(app.join("composer.json"), "{}").unwrap();
+    let file = app.join("app/Thing.php");
+    fs::write(&file, "<?php").unwrap();
+
+    assert_eq!(find_project_root(&file, Some(&root)).unwrap(), app);
+}
+
+/// A parent folder holding many unrelated projects: the descent is per-file,
+/// so each resolves to its own project rather than to the shared parent.
+#[test]
+fn fenced_walk_descends_per_file_from_a_multi_project_parent() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    for name in ["alpha", "beta"] {
+        let app = root.join(name);
+        fs::create_dir_all(app.join("app")).unwrap();
+        fs::create_dir_all(app.join("resources")).unwrap();
+        fs::write(app.join("composer.json"), "{}").unwrap();
+        fs::write(app.join("artisan"), "").unwrap();
+        fs::write(app.join("app/Thing.php"), "<?php").unwrap();
+    }
+
+    for name in ["alpha", "beta"] {
+        let file = root.join(name).join("app/Thing.php");
+        assert_eq!(
+            find_project_root(&file, Some(&root)).unwrap(),
+            root.join(name),
+            "{name} resolved to the wrong project"
+        );
+    }
+}
+
+/// A fresh clone that has never run `composer install`: no `vendor/` anywhere,
+/// and it still resolves, because `artisan` is committed.
+#[test]
+fn fenced_fresh_clone_without_vendor_resolves_via_artisan() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::write(root.join("composer.json"), "{}").unwrap();
+    fs::write(root.join("artisan"), "").unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    let file = root.join("app/Thing.php");
+    fs::write(&file, "<?php").unwrap();
+
+    assert_eq!(find_project_root(&file, Some(&root)).unwrap(), root);
+}
+
+#[test]
+fn fenced_package_opened_as_its_own_workspace_resolves_to_the_package() {
+    let tmp = TempDir::new().unwrap();
+    let pkg = tmp.path().join("package");
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    fs::create_dir_all(pkg.join("vendor")).unwrap();
+    fs::write(pkg.join("composer.json"), "{}").unwrap();
+    let file = pkg.join("src/Provider.php");
+    fs::write(&file, "<?php").unwrap();
+
+    assert_eq!(find_project_root(&file, Some(&pkg)).unwrap(), pkg);
+}
+
+/// A file outside the workspace — a vendor file, a globally installed package —
+/// has no fence to descend, so the upward walk takes over.
+#[test]
+fn file_outside_the_workspace_falls_back_to_the_upward_walk() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let other = tmp.path().join("elsewhere");
+    fs::create_dir_all(other.join("app")).unwrap();
+    fs::create_dir_all(other.join("resources")).unwrap();
+    fs::write(other.join("composer.json"), "{}").unwrap();
+    fs::write(other.join("artisan"), "").unwrap();
+    let file = other.join("app/Thing.php");
+    fs::write(&file, "<?php").unwrap();
+
+    assert_eq!(find_project_root(&file, Some(&workspace)).unwrap(), other);
+}
+
+#[test]
+fn looks_like_laravel_project_requires_composer_json() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(dir.join("artisan"), "").unwrap();
+    assert!(
+        !looks_like_laravel_project(dir),
+        "artisan alone is not a root"
+    );
+
+    fs::write(dir.join("composer.json"), "{}").unwrap();
+    assert!(looks_like_laravel_project(dir));
+}
+
+#[test]
+fn looks_like_laravel_project_rejects_a_bare_manifest() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(dir.join("composer.json"), "{}").unwrap();
+    assert!(!looks_like_laravel_project(dir));
+
+    // app/ alone is not enough — resources/ must be there too.
+    fs::create_dir_all(dir.join("app")).unwrap();
+    assert!(!looks_like_laravel_project(dir));
+
+    fs::create_dir_all(dir.join("resources")).unwrap();
+    assert!(looks_like_laravel_project(dir));
+}
+
+// ---------------------------------------------------------------------------
+// is_outermost_project — the "may this nested dir be the root?" predicate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn outermost_project_accepts_the_workspace_root_itself() {
+    let (_tmp, root, _module) = modular_workspace();
+    assert!(is_outermost_project(&root, &root));
+}
+
+#[test]
+fn outermost_project_rejects_a_nested_module() {
+    let (_tmp, root, module) = modular_workspace();
+    assert!(
+        !is_outermost_project(&root, &module),
+        "a module is not the outermost project of the workspace"
+    );
+}
+
+/// The signal is committed state only — adding or removing a gitignored
+/// `vendor/` must not change the answer either way.
+#[test]
+fn outermost_project_ignores_vendor_entirely() {
+    let (_tmp, root, module) = modular_workspace();
+    assert!(!is_outermost_project(&root, &module));
+
+    fs::create_dir_all(module.join("vendor")).unwrap();
+    fs::write(module.join("vendor/autoload.php"), "<?php").unwrap();
+    assert!(
+        !is_outermost_project(&root, &module),
+        "a fully installed vendor/ must not promote a module"
+    );
+}
+
+/// A genuine sub-app under a tooling-only workspace manifest *is* outermost on
+/// its own path, so it is accepted.
+#[test]
+fn outermost_project_accepts_a_real_sub_app_below_a_tooling_manifest() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::write(root.join("composer.json"), "{}").unwrap();
+
+    let app = root.join("apps/web");
+    fs::create_dir_all(app.join("app")).unwrap();
+    fs::create_dir_all(app.join("resources")).unwrap();
+    fs::write(app.join("composer.json"), "{}").unwrap();
+
+    assert!(is_outermost_project(&root, &app));
+}
+
+#[test]
+fn outermost_project_fails_closed_outside_the_workspace() {
+    let (_tmp, root, _module) = modular_workspace();
+    let outside = TempDir::new().unwrap();
+    assert!(
+        !is_outermost_project(&root, outside.path()),
+        "a directory outside the workspace is never outermost within it"
+    );
 }
