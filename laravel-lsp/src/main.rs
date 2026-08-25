@@ -12660,15 +12660,13 @@ impl LaravelLanguageServer {
     async fn blade_backing_class_files(&self, blade_path: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
 
-        let (view_paths, view_namespaces) = match self.cached_config.read().await.as_ref() {
-            Some(config) => (config.view_paths.clone(), config.view_namespaces.clone()),
-            None => (Vec::new(), HashMap::new()),
+        let view_paths = match self.cached_config.read().await.as_ref() {
+            Some(config) => config.view_paths.clone(),
+            None => Vec::new(),
         };
-        if let Some(view_name) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
-            blade_path,
-            &view_paths,
-            &view_namespaces,
-        ) {
+        if let Some(view_name) =
+            laravel_lsp::view_var_index::view_name_for_path(blade_path, &view_paths)
+        {
             if let Ok(idx) = self.view_vars.read() {
                 out.extend(idx.render_source_files(&view_name));
             }
@@ -25240,6 +25238,66 @@ impl LanguageServer for LaravelLanguageServer {
                         position.character,
                     )
                 {
+                    // Dotted binding path (`wire:model="contractData.title"`):
+                    // resolve the leading segments to a class through the same
+                    // machinery `$var->` member completion uses, then offer
+                    // THAT class's properties for the segment under the
+                    // cursor. Depth beyond the first hop resolves as far as
+                    // the property types stay resolvable class names.
+                    if matches!(
+                        wire_kind,
+                        laravel_lsp::livewire_resolver::WireValueKind::Property
+                    ) && typed_prefix.contains('.')
+                    {
+                        let segments: Vec<&str> = typed_prefix.split('.').collect();
+                        let (leaf_prefix, path) = segments.split_last().unwrap();
+                        let mut fqcn = self
+                            .resolve_blade_variable_type(uri, &format!("${}", path[0]))
+                            .await;
+                        for seg in &path[1..] {
+                            let Some(current) = fqcn.take() else {
+                                break;
+                            };
+                            fqcn = self
+                                .get_class_properties(&current)
+                                .await
+                                .into_iter()
+                                .find(|p| p.name == *seg)
+                                .map(|p| {
+                                    p.php_type
+                                        .trim_start_matches('?')
+                                        .trim_start_matches('\\')
+                                        .to_string()
+                                });
+                        }
+                        if let Some(class_name) = fqcn {
+                            let leaf_lower = leaf_prefix.to_lowercase();
+                            let mut items: Vec<CompletionItem> = self
+                                .get_class_properties(&class_name)
+                                .await
+                                .into_iter()
+                                // A binding names a property — the
+                                // `relationship query` (`posts()`) shape
+                                // can't be bound.
+                                .filter(|p| !p.name.ends_with("()"))
+                                .filter(|p| p.name.to_lowercase().starts_with(&leaf_lower))
+                                .map(|p| CompletionItem {
+                                    label: p.name.clone(),
+                                    kind: Some(CompletionItemKind::FIELD),
+                                    detail: Some(p.php_type.clone()),
+                                    ..Default::default()
+                                })
+                                .collect();
+                            if !items.is_empty() {
+                                items.sort_by(|a, b| a.label.cmp(&b.label));
+                                return Ok(Some(CompletionResponse::List(CompletionList {
+                                    is_incomplete: false,
+                                    items,
+                                })));
+                            }
+                        }
+                    }
+
                     if let Ok(blade_path) = uri.to_file_path() {
                         let mut items: Vec<CompletionItem> = Vec::new();
                         let mut seen_members = std::collections::HashSet::new();
