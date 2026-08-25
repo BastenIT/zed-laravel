@@ -897,3 +897,88 @@ fn parse_facade_aliases_absent_key_yields_empty() {
     let source = "<?php return ['name' => 'Laravel'];";
     assert!(parse_facade_aliases(source).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// find_project_root — nested-module (composer-merge-plugin) layouts
+// ---------------------------------------------------------------------------
+
+/// Lay down a minimal workspace: root with composer.json + artisan + app/ +
+/// resources/, and one module at app/Legal/GuaranteeLabel with its own
+/// composer.json + app/ + resources/ + config/ (the merge-plugin shape).
+fn modular_workspace() -> (TempDir, PathBuf, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::write(root.join("composer.json"), "{}").unwrap();
+    fs::write(root.join("artisan"), "").unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::create_dir_all(root.join("resources")).unwrap();
+    fs::create_dir_all(root.join("config")).unwrap();
+
+    let module = root.join("app/Legal/GuaranteeLabel");
+    fs::create_dir_all(module.join("app/Providers")).unwrap();
+    fs::create_dir_all(module.join("resources/views")).unwrap();
+    fs::create_dir_all(module.join("config")).unwrap();
+    fs::write(module.join("composer.json"), "{}").unwrap();
+    (tmp, root, module)
+}
+
+#[test]
+fn project_root_walks_past_nested_module_to_workspace_root() {
+    let (_tmp, root, module) = modular_workspace();
+    let file = module.join("config/legal-guaranteelabel.php");
+    fs::write(&file, "<?php return [];").unwrap();
+
+    let found = find_project_root(&file).unwrap();
+    assert_eq!(found, root, "module dir must not hijack the project root");
+}
+
+#[test]
+fn project_root_keeps_nested_app_with_its_own_artisan() {
+    let (_tmp, _root, module) = modular_workspace();
+    fs::write(module.join("artisan"), "").unwrap();
+    let file = module.join("config/legal-guaranteelabel.php");
+    fs::write(&file, "<?php return [];").unwrap();
+
+    let found = find_project_root(&file).unwrap();
+    assert_eq!(found, module, "a genuine nested app stays its own root");
+}
+
+#[test]
+fn project_root_standalone_package_with_src_and_vendor_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let pkg = tmp.path().join("package");
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    fs::create_dir_all(pkg.join("vendor")).unwrap();
+    fs::write(pkg.join("composer.json"), "{}").unwrap();
+    let file = pkg.join("src/Provider.php");
+    fs::write(&file, "<?php").unwrap();
+
+    assert_eq!(find_project_root(&file).unwrap(), pkg);
+}
+
+#[test]
+fn project_root_app_without_artisan_but_with_vendor_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let app = tmp.path().join("app-root");
+    fs::create_dir_all(app.join("app")).unwrap();
+    fs::create_dir_all(app.join("resources")).unwrap();
+    fs::create_dir_all(app.join("vendor")).unwrap();
+    fs::write(app.join("composer.json"), "{}").unwrap();
+    let file = app.join("app/Thing.php");
+    fs::write(&file, "<?php").unwrap();
+
+    assert_eq!(find_project_root(&file).unwrap(), app);
+}
+
+#[test]
+fn project_root_tentative_match_returned_without_stronger_ancestor() {
+    let tmp = TempDir::new().unwrap();
+    let app = tmp.path().join("bare-app");
+    fs::create_dir_all(app.join("app")).unwrap();
+    fs::create_dir_all(app.join("resources")).unwrap();
+    fs::write(app.join("composer.json"), "{}").unwrap();
+    let file = app.join("app/Thing.php");
+    fs::write(&file, "<?php").unwrap();
+
+    assert_eq!(find_project_root(&file).unwrap(), app);
+}

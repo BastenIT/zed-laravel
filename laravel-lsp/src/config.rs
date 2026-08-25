@@ -24,6 +24,14 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
         current = current.parent()?;
     }
 
+    // A composer.json + app/ + resources/ match without its own dependency
+    // tree is only *tentative*: module directories in modular monoliths
+    // (e.g. app/{Parent}/{Module}/ with a composer.json merged into the
+    // workspace manifest via composer-merge-plugin) match the same markers.
+    // Keep walking and prefer any ancestor that is unambiguously a project
+    // root; fall back to the tentative match only when no ancestor is one.
+    let mut tentative: Option<PathBuf> = None;
+
     // Walk up the directory tree
     loop {
         // Check for Laravel markers
@@ -43,15 +51,6 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
             return Some(current.to_path_buf());
         }
 
-        // Or if we find composer.json + app/ + resources/ (Laravel app)
-        if has_composer && has_app && has_resources {
-            info!(
-                "Found Laravel project root at {:?} (composer.json + app + resources)",
-                current
-            );
-            return Some(current.to_path_buf());
-        }
-
         // Or if we find composer.json + src/ + vendor/ (Laravel package)
         // This pattern recognizes Laravel package development
         if has_composer && has_src && has_vendor {
@@ -62,9 +61,36 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
             return Some(current.to_path_buf());
         }
 
+        // composer.json + app/ + resources/ (Laravel app). With a vendor/
+        // of its own it is a real installed root; without one it could be
+        // a merged nested module, so only record it and keep walking.
+        if has_composer && has_app && has_resources {
+            if has_vendor {
+                info!(
+                    "Found Laravel project root at {:?} (composer.json + app + resources + vendor)",
+                    current
+                );
+                return Some(current.to_path_buf());
+            }
+            if tentative.is_none() {
+                tentative = Some(current.to_path_buf());
+            }
+        }
+
         // Move up one directory
-        current = current.parent()?;
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
     }
+
+    if let Some(root) = &tentative {
+        info!(
+            "Found Laravel project root at {:?} (composer.json + app + resources; no stronger ancestor root)",
+            root
+        );
+    }
+    tentative
 }
 
 /// Resolve a directory's real git "common dir" — the directory holding the
