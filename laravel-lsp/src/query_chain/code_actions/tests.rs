@@ -346,7 +346,10 @@ fn create_file_content(action: &tower_lsp::lsp_types::CodeAction) -> String {
 #[test]
 fn migration_action_creates_timestamped_file_with_stub() {
     let d = diag(json!({"kind": "column", "name": "phone", "table": "users"}));
-    let root = Path::new("/srv/app");
+    // A platform-absolute root: `Url::from_file_path` rejects a prefixless
+    // "/srv/app" on Windows, so the action silently produced None there.
+    let root_buf = crate::test_paths::abs("/srv/app");
+    let root = root_buf.as_path();
     let action =
         into_action(migration_action(&d, root, "2026_05_29_120000").expect("a migration action"));
     assert_eq!(
@@ -371,16 +374,24 @@ fn migration_action_creates_timestamped_file_with_stub() {
 
 #[test]
 fn migration_action_none_for_relation() {
+    // A platform-absolute root, so the `None` is genuinely because the
+    // diagnostic is a relation rather than a column. With a prefixless
+    // "/srv/app" this passed on Windows for the wrong reason: the internal
+    // `Url::from_file_path` failed first, and the assertion would have held
+    // even with the kind check broken (issue #292).
+    let root = crate::test_paths::abs("/srv/app");
     let d = diag(json!({"kind": "relation", "name": "postss", "replacement": "posts"}));
-    assert!(migration_action(&d, Path::new("/srv/app"), "2026_05_29_120000").is_none());
+    assert!(migration_action(&d, &root, "2026_05_29_120000").is_none());
 }
 
 #[test]
 fn migration_action_none_without_table() {
+    // Absolute on every platform — see the note above.
+    let root = crate::test_paths::abs("/srv/app");
     let d = diag(
         json!({"kind": "column", "name": "phone"}), // no table
     );
-    assert!(migration_action(&d, Path::new("/srv/app"), "2026_05_29_120000").is_none());
+    assert!(migration_action(&d, &root, "2026_05_29_120000").is_none());
 }
 
 // ---- qualify_actions (ambiguous columns, issue #24) ------------------------

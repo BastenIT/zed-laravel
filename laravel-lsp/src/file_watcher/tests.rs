@@ -81,10 +81,13 @@ fn watchers_register_each_configured_view_path() {
     let watchers = build_watchers(&root, &view_paths, None, &[]);
 
     for view_path in &view_paths {
+        // Compare against the same forward-slash rendering the watcher emits.
+        // LSP glob patterns are forward-slash by specification, so building the
+        // expectation from a platform-separator `Path` would only match on
+        // Unix (issue #292).
+        let expected_base = super::glob_base(view_path);
         let has_blade = watchers.iter().any(|w| match &w.glob_pattern {
-            GlobPattern::String(s) => {
-                s.contains(view_path.to_string_lossy().as_ref()) && s.ends_with("*.blade.php")
-            }
+            GlobPattern::String(s) => s.contains(&expected_base) && s.ends_with("*.blade.php"),
             _ => false,
         });
         assert!(has_blade, "missing blade watcher for {:?}", view_path);
@@ -215,7 +218,7 @@ fn watchers_include_a_recursive_glob_per_psr4_root() {
 
     let globs = globs_of(&watchers);
     for src in &psr4 {
-        let expected = format!("{}/**/*.php", src.display());
+        let expected = format!("{}/**/*.php", super::glob_base(src));
         assert!(
             globs.iter().any(|g| g == &expected),
             "missing PSR-4 glob {expected}: {globs:?}"
@@ -234,7 +237,7 @@ fn psr4_glob_that_exactly_duplicates_an_existing_one_is_skipped() {
     let psr4 = vec![root.join("app"), root.join("app")];
     let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
 
-    let expected = format!("{}/app/**/*.php", root.display());
+    let expected = format!("{}/app/**/*.php", super::glob_base(&root));
     let count = globs_of(&watchers)
         .into_iter()
         .filter(|g| g == &expected)
@@ -257,7 +260,7 @@ fn overlapping_psr4_glob_coexists_with_fixed_controllers_glob() {
     assert!(
         globs
             .iter()
-            .any(|g| g == &format!("{}/app/**/*.php", root.display())),
+            .any(|g| g == &format!("{}/app/**/*.php", super::glob_base(&root))),
         "missing widened app glob: {globs:?}"
     );
     assert!(

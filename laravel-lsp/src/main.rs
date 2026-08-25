@@ -5027,6 +5027,11 @@ impl LaravelLanguageServer {
                     // no size cap and chokes on these exact files.
                     // The empty patterns are ~30 bytes each in the
                     // serialized disk cache; negligible.
+                    // NOTE: this is a real OS path, so on Windows it carries `\`. The
+                    // branches below match forward-slash markers and must normalize first
+                    // — without it, editing a service provider or a config file never
+                    // re-registered with Salsa on Windows, so middleware aliases, bindings
+                    // and config values silently stopped updating (issue #292).
                     let path_str = path.to_string_lossy();
                     if path_str.ends_with(".json.php") {
                         return Some((
@@ -8756,7 +8761,9 @@ impl LaravelLanguageServer {
                     debug!("Failed to update service provider in Salsa: {}", e);
                 }
             }
-        } else if path_str.contains("app/Providers") && filename.ends_with(".php") {
+        } else if Self::with_forward_slashes(&path_str).contains("app/Providers")
+            && filename.ends_with(".php")
+        {
             // App service provider - Service provider file
             if let Some(root) = root_path {
                 debug!("📦 Updating Salsa: ServiceProviderFile ({})", filename);
@@ -8791,7 +8798,9 @@ impl LaravelLanguageServer {
             {
                 debug!("Failed to update env file in Salsa: {}", e);
             }
-        } else if path_str.contains("/config/") && filename.ends_with(".php") {
+        } else if Self::with_forward_slashes(&path_str).contains("/config/")
+            && filename.ends_with(".php")
+        {
             // Config file (config/*.php) - needs BOTH ConfigFile AND SourceFile treatment
             // ConfigFile: for config discovery (view paths, namespaces, etc.)
             // SourceFile: for pattern extraction (env() calls, etc.)
@@ -11236,9 +11245,21 @@ impl LaravelLanguageServer {
         vars
     }
 
+    /// A path with every separator normalized to `/`, so the marker matching
+    /// below reads the same on every platform.
+    ///
+    /// These paths arrive as strings rather than `Path`s, and on Windows they
+    /// carry `\\`. Matching a literal `"/components/"` against
+    /// `...\\views\\components\\button.blade.php` simply never fires, so the
+    /// component-variable inference silently produced nothing there (issue
+    /// #292).
+    fn with_forward_slashes(path: &str) -> String {
+        path.replace('\\', "/")
+    }
+
     /// Check if a blade file is a component file (in resources/views/components/)
     fn is_component_file(path: &str) -> bool {
-        path.contains("/components/") && path.ends_with(".blade.php")
+        Self::with_forward_slashes(path).contains("/components/") && path.ends_with(".blade.php")
     }
 
     /// Extract variables passed to a view from any PHP file that renders it
@@ -11828,19 +11849,22 @@ impl LaravelLanguageServer {
     ) -> Vec<(String, String)> {
         let vars = Vec::new();
 
-        // Check if this is a component view (in resources/views/components/)
-        let components_marker = format!("{}resources/views/components/", std::path::MAIN_SEPARATOR);
-        let components_marker_alt = "resources/views/components/";
+        // Check if this is a component view (in resources/views/components/).
+        // Normalize first: the previous marker was built as
+        // `format!("{}resources/views/components/", MAIN_SEPARATOR)`, which on
+        // Windows yields `\resources/views/components/` — a mix of both
+        // separators that matches no real path on any platform (issue #292).
+        let normalized = Self::with_forward_slashes(blade_path);
 
-        if !blade_path.contains(&components_marker) && !blade_path.contains(components_marker_alt) {
+        if !normalized.contains("resources/views/components/") {
             return vars;
         }
 
         // Extract component name from path
         // e.g., resources/views/components/button.blade.php -> Button
         // e.g., resources/views/components/forms/input.blade.php -> Forms/Input
-        let relative = if let Some(idx) = blade_path.find("components/") {
-            &blade_path[idx + 11..] // Skip "components/"
+        let relative = if let Some(idx) = normalized.find("components/") {
+            &normalized[idx + "components/".len()..]
         } else {
             return vars;
         };
@@ -12264,8 +12288,10 @@ impl LaravelLanguageServer {
         // 1. Anonymous: resources/views/components/button.blade.php (no class)
         // 2. Class-based: app/View/Components/Button.php with resources/views/components/button.blade.php
 
-        // Check if this is in the components directory
-        if !blade_path.contains("/components/") {
+        // Check if this is in the components directory. Normalized first:
+        // `blade_path` is a path rendered as a string, so on Windows it carries
+        // backslashes and the forward-slash marker never matched (issue #292).
+        if !Self::with_forward_slashes(blade_path).contains("/components/") {
             return None;
         }
 
@@ -13981,7 +14007,7 @@ impl LaravelLanguageServer {
             },
             None => {
                 // Default to app/Livewire if no config
-                let v3_path = root.join("app/Livewire");
+                let v3_path = root.join("app").join("Livewire");
                 let v2_path = root.join("app/Http/Livewire");
                 if v3_path.exists() {
                     v3_path
@@ -17909,7 +17935,8 @@ return [
             // Per Laravel docs: "you should ensure you are only calling the env function
             // from within your application's configuration (config) files"
             // https://laravel.com/docs/12.x/configuration#configuration-caching
-            let is_config_file = file_path.to_string_lossy().contains("/config/");
+            let is_config_file =
+                laravel_lsp::path_segments::contains_segments(&file_path, "config");
             if !is_config_file && !patterns.env_refs.is_empty() {
                 for env_ref in &patterns.env_refs {
                     let diagnostic = Diagnostic {
@@ -22442,11 +22469,10 @@ impl LanguageServer for LaravelLanguageServer {
         // Check for lock file changes that trigger rescans
         if let Ok(path) = uri.to_file_path() {
             let file_name = path.file_name().and_then(|n| n.to_str());
-            let path_str = path.to_string_lossy();
 
             // Invalidate config cache if config-related files change
             let is_config_file = matches!(file_name, Some("composer.json"))
-                || path_str.contains("/config/")
+                || laravel_lsp::path_segments::contains_segments(&path, "config")
                 || matches!(file_name, Some("view.php" | "livewire.php"));
 
             if is_config_file {
@@ -22463,7 +22489,13 @@ impl LanguageServer for LaravelLanguageServer {
                     info!("📦 Package lock changed, queuing node_modules rescan");
                     self.queue_background_rescan(RescanType::NodeModules).await;
                 }
-                Some(name) if name.ends_with(".php") && path_str.contains("app/Providers/") => {
+                Some(name)
+                    if name.ends_with(".php")
+                        && laravel_lsp::path_segments::contains_segments(
+                            &path,
+                            "app/Providers",
+                        ) =>
+                {
                     info!("📦 App provider changed, queuing app rescan");
                     self.queue_background_rescan(RescanType::App).await;
                 }
@@ -22494,7 +22526,7 @@ impl LanguageServer for LaravelLanguageServer {
                         .as_ref()
                         .is_some_and(|idx| idx.source_files.contains(&normalized))
                 };
-                if in_index || path_str.contains("/routes/") {
+                if in_index || laravel_lsp::path_segments::contains_segments(&path, "routes") {
                     if let Some(root) = self.root_path.read().await.clone() {
                         info!("🛣️  Route file saved — rebuilding route index");
                         self.rebuild_route_index(&root).await;
@@ -22646,12 +22678,18 @@ impl LanguageServer for LaravelLanguageServer {
             // `Commands/` directory (app or package). That heuristic keeps the
             // index fresh without rebuilding on every unrelated `.php` save.
             if !commands_changed {
-                let p = path.to_string_lossy();
-                if p.ends_with(".php") && p.contains("/Commands/") {
+                // `.php` stays a string suffix test — a filename extension has
+                // no separators. The directory test does not: `/Commands/`
+                // never matched a Windows path (issue #292).
+                if path.to_string_lossy().ends_with(".php")
+                    && laravel_lsp::path_segments::contains_segments(&path, "Commands")
+                {
                     commands_changed = true;
                 }
             }
-            if !migrations_changed && path.to_string_lossy().contains("database/migrations") {
+            if !migrations_changed
+                && laravel_lsp::path_segments::contains_segments(&path, "database/migrations")
+            {
                 migrations_changed = true;
             }
             // Snapshot the file's pre-change surface for the incremental magic
