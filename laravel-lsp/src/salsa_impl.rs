@@ -1707,6 +1707,16 @@ pub struct ParsedServiceProvider<'db> {
     pub anonymous_component_namespaces: Vec<ParsedAnonymousComponentNamespaceReg<'db>>,
 }
 
+/// Resolve the relative fragment captured from a
+/// `loadViewsFrom(__DIR__ . '<rel>', 'ns')` registration against the
+/// provider's directory. The capture keeps its leading slash
+/// ("/../resources/views"), and `Path::join` REPLACES the receiver when
+/// handed an absolute path — strip it, or every `__DIR__.'/…'` registration
+/// resolves to a nonsense root-relative path.
+fn resolve_load_views_relative(provider_dir: &Path, relative: &str) -> PathBuf {
+    provider_dir.join(relative.trim_start_matches('/').trim_start_matches("./"))
+}
+
 /// Parse a service provider file and extract middleware, bindings, views, and components
 #[salsa::tracked]
 pub fn parse_service_provider_source<'db>(
@@ -1964,7 +1974,7 @@ pub fn parse_service_provider_source<'db>(
             // Resolve __DIR__ + relative path
             // __DIR__ is the directory containing the service provider file
             let provider_dir = path.parent().unwrap_or(path.as_path());
-            let view_path = provider_dir.join(relative_path_str);
+            let view_path = resolve_load_views_relative(provider_dir, relative_path_str);
             let resolved_path = if view_path.exists() {
                 Some(view_path.canonicalize().unwrap_or(view_path))
             } else {
