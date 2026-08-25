@@ -1869,7 +1869,10 @@ class User extends Authenticatable {
     let cache = Arc::new(DashMap::new());
     cache.insert(path.clone(), (0, data));
     let mut hierarchy_by_file = std::collections::HashMap::new();
-    hierarchy_by_file.insert(path.clone(), nodes);
+    hierarchy_by_file.insert(
+        path.clone(),
+        nodes.into_iter().map(Arc::new).collect::<Vec<_>>(),
+    );
     crate::pattern_disk_cache::save_from(&cache, &hierarchy_by_file, dir.path()).unwrap();
 
     let restored_cache = Arc::new(DashMap::new());

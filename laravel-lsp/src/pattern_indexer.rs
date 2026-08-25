@@ -191,6 +191,19 @@ pub fn parse_owned_with_hierarchy(
             data.is_volt,
         )
         .map(Box::new);
+    } else {
+        // Win 1: drop the raw member-access refs for vendor files (~110MB
+        // across a large project's pattern cache). Every consumer of
+        // `member_access_refs` on a vendor entry is already vendor-gated
+        // upstream of this warming path: the magic-member build's passes 1-3
+        // and the save-time granular re-resolve all skip vendor outright, so
+        // they never read these entries in the first place. The one reader
+        // that ISN'T vendor-gated is `find_at_position` against an OPENED
+        // vendor file — but that self-heals: `did_open` routes through
+        // `handle_update_file`, which removes this path's `pattern_cache`
+        // entry, so the next `handle_get_patterns` re-parses the file through
+        // the full (non-warming) path instead of serving this slimmed entry.
+        data.member_access_refs.clear();
     }
 
     // Class FQCNs this file imports — Blade `@use` scanned from source, PHP
@@ -198,7 +211,11 @@ pub fn parse_owned_with_hierarchy(
     // `handle_get_patterns` uses, so both constructors emit identical entries.
     data.class_refs = crate::salsa_impl::class_refs_for(path, php_tree.as_ref(), text);
 
-    data.build_position_index();
+    // Win 2: `sorted_positions` is built lazily on first `find_at_position`
+    // call (see `ParsedPatternsData`), not here — warming parses tens of
+    // thousands of files that are never the cursor's file, so eagerly
+    // sorting every one of them wastes both CPU and the ~23MB the sorted
+    // Vecs add up to across a large project.
     (Arc::new(data), nodes)
 }
 

@@ -232,16 +232,53 @@ fn parse_owned_captures_context_for_a_member_reader() {
 fn parse_owned_skips_capture_for_vendor() {
     // Same source, under a `vendor/` path → NO context (the build passes skip
     // vendor, so capturing there is wasted; the disk cache relies on this).
-    let path = PathBuf::from("/proj/vendor/acme/pkg/src/C.php");
+    // The same source under a non-vendor path (checked first) proves the
+    // source itself DOES contain a member access — so a vendor-path `None`
+    // below is the gate acting, not an absence of anything to capture. (The
+    // vendor path's `member_access_refs` are separately dropped by Win 1 —
+    // see `vendor_member_access_refs_are_dropped_but_app_ones_kept` — so this
+    // test can no longer check that Vec directly.)
     let src = "<?php\nnamespace Acme;\nclass C { public function f(\\App\\Models\\User $u) { return $u->email; } }\n";
-    let (data, _) = parse_owned_with_hierarchy(&path, src);
+
+    let app_path = PathBuf::from("/proj/app/C.php");
+    let (app_data, _) = parse_owned_with_hierarchy(&app_path, src);
     assert!(
-        !data.member_access_refs.is_empty(),
-        "the file DOES have a member access (proving the gate, not the parse, drops context)"
+        !app_data.member_access_refs.is_empty(),
+        "the source DOES have a member access (proving the gate, not the parse, drops context)"
     );
+
+    let vendor_path = PathBuf::from("/proj/vendor/acme/pkg/src/C.php");
+    let (vendor_data, _) = parse_owned_with_hierarchy(&vendor_path, src);
     assert!(
-        data.member_context.is_none(),
+        vendor_data.member_context.is_none(),
         "a vendor file must capture no context"
+    );
+}
+
+// ─── Win 1: vendor `member_access_refs` dropped at parse time ────────────
+
+#[test]
+fn vendor_member_access_refs_are_dropped_but_app_ones_kept() {
+    // Same source, one non-vendor path and one vendor path: the raw
+    // `member_access_refs` list must survive for the app file (M4 magic-member
+    // resolution reads it) and be emptied for the vendor file (every consumer
+    // of a vendor entry's refs is already vendor-gated upstream, so keeping
+    // them just wastes memory — ~110MB across a large project's cache).
+    let src = "<?php\nnamespace App\\Models;\nclass User { public function f() { return $this->email; } }\n";
+
+    let app_path = PathBuf::from("/proj/app/Models/User.php");
+    let (app_data, _) = parse_owned_with_hierarchy(&app_path, src);
+    assert!(
+        !app_data.member_access_refs.is_empty(),
+        "non-vendor files must keep their member_access_refs"
+    );
+
+    let vendor_path = PathBuf::from("/proj/vendor/acme/pkg/src/User.php");
+    let (vendor_data, _) = parse_owned_with_hierarchy(&vendor_path, src);
+    assert!(
+        vendor_data.member_access_refs.is_empty(),
+        "vendor files must have their member_access_refs dropped, got {:?}",
+        vendor_data.member_access_refs
     );
 }
 

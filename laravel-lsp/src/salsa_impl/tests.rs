@@ -1868,6 +1868,32 @@ fn member_access_is_indexed_and_found_at_position() {
     assert!(p.find_at_position(1, 2).is_none());
 }
 
+/// Win 2: `sorted_positions` is a lazily-initialized `OnceLock`, built on
+/// `find_at_position`'s own first call rather than by an explicit
+/// `build_position_index()` beforehand. This is the scenario a disk-cache
+/// restore hits every time (the index is skipped on serialize): the very
+/// first read of a restored `ParsedPatternsData` can be a lookup, with no
+/// eager-build step in between.
+#[test]
+fn find_at_position_lazily_builds_the_index_without_an_explicit_call() {
+    let mut p = ParsedPatternsData::default();
+    p.member_access_refs
+        .push(Arc::new(unresolved_member_access("email", 1, 12)));
+    // Deliberately NOT calling `p.build_position_index()`.
+
+    let found = p
+        .find_at_position(1, 14)
+        .expect("find_at_position must build its own index on first use");
+    match found {
+        PatternAtPosition::MemberAccess(m) => assert_eq!(m.member, "email"),
+        other => panic!("expected MemberAccess, got {other:?}"),
+    }
+
+    // A second call reuses the now-cached index and must agree with the first.
+    assert!(p.find_at_position(1, 2).is_none());
+    assert!(p.find_at_position(1, 14).is_some());
+}
+
 #[test]
 fn member_access_capture_defaults_are_unresolved() {
     let m = unresolved_member_access("email", 1, 12);
