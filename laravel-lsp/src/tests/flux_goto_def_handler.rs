@@ -107,7 +107,7 @@ async fn backend_with_config(root: &Path, config: LaravelConfigData) -> LaravelL
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
     *backend.root_path.write().await = Some(root.to_path_buf());
-    *backend.cached_config.write().await = Some(config);
+    *backend.cached_config.write().await = Some(std::sync::Arc::new(config));
     backend
 }
 

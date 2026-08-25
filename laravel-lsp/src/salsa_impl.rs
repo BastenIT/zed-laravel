@@ -4794,14 +4794,23 @@ pub struct ParsedPatternsData {
     #[serde(default)]
     pub class_refs: Vec<Arc<ClassReferenceData>>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
-    /// Skipped during (de)serialization — when loading from the on-disk
-    /// cache, the caller must invoke `build_position_index()` to rebuild
-    /// this. We don't persist it because (a) it duplicates data already
-    /// in the Vec fields above, (b) rebuilding is O(n log n) and fast,
-    /// and (c) PatternAtPosition's Arc fields would deserialize as
-    /// independent allocations, which is wasteful.
+    /// 100% derived from the Vec fields above and read by exactly one caller,
+    /// `find_at_position`, for exactly one file at a time — the one the
+    /// cursor is currently in. Built LAZILY on that call's first invocation
+    /// rather than eagerly at parse time: a large project parses/restores
+    /// tens of thousands of `ParsedPatternsData`, and eagerly sorting every
+    /// one of them (most of which the cursor never visits in a session) was
+    /// wasted CPU and ~23MB of Vec allocations that outlive their only reader.
+    ///
+    /// Skipped during (de)serialization — restoring from the on-disk cache
+    /// leaves this empty, and the next `find_at_position` call on a restored
+    /// entry builds it on demand, same as a freshly parsed one. We don't
+    /// persist it because (a) it duplicates data already in the Vec fields
+    /// above, (b) rebuilding is O(n log n) and fast, and (c)
+    /// PatternAtPosition's Arc fields would deserialize as independent
+    /// allocations, which is wasteful.
     #[serde(skip)]
-    sorted_positions: Vec<PositionEntry>,
+    sorted_positions: std::sync::OnceLock<Vec<PositionEntry>>,
 }
 
 /// A pattern found at a specific cursor position
@@ -4843,9 +4852,11 @@ pub enum PatternAtPosition {
 }
 
 impl ParsedPatternsData {
-    /// Build the sorted position index from all pattern vectors
-    /// This should be called after populating the pattern vectors
-    pub fn build_position_index(&mut self) {
+    /// Compute the sorted (line, column) position index from the pattern
+    /// vectors. Pure function of `&self` — this is what `find_at_position`
+    /// runs as the `OnceLock` initializer on its first call for a file, and
+    /// what `build_position_index` runs to force-populate it eagerly.
+    fn compute_position_index(&self) -> Vec<PositionEntry> {
         let mut entries = Vec::new();
 
         // Add all patterns to the index
@@ -5023,21 +5034,39 @@ impl ParsedPatternsData {
         // Sort by (line, column) for efficient binary search
         entries.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.column.cmp(&b.column)));
 
-        self.sorted_positions = entries;
+        entries
     }
 
-    /// Find a pattern at the given cursor position (line, column)
-    /// Uses binary search for O(log n) lookup to find the line, then linear scan within line
+    /// Force-build (or rebuild) the sorted position index right now,
+    /// overwriting anything already cached in `sorted_positions`. Nothing in
+    /// production calls this any more: `find_at_position` builds the index
+    /// lazily on its own first call, so it's paid only for files the cursor
+    /// actually visits. Kept for callers (mostly tests) that want the index
+    /// populated up front rather than on first lookup.
+    pub fn build_position_index(&mut self) {
+        let entries = self.compute_position_index();
+        self.sorted_positions = std::sync::OnceLock::from(entries);
+    }
+
+    /// Find a pattern at the given cursor position (line, column).
+    /// Lazily builds `sorted_positions` on the first call for this
+    /// `ParsedPatternsData` (see the field's doc comment), then uses binary
+    /// search for O(log n) lookup to find the line, and a linear scan within
+    /// the line for the matching column range.
     pub fn find_at_position(&self, line: u32, column: u32) -> Option<PatternAtPosition> {
-        if self.sorted_positions.is_empty() {
+        let sorted_positions = self
+            .sorted_positions
+            .get_or_init(|| self.compute_position_index());
+
+        if sorted_positions.is_empty() {
             return None;
         }
 
         // Binary search to find the first entry on or after target line
-        let start_idx = self.sorted_positions.partition_point(|e| e.line < line);
+        let start_idx = sorted_positions.partition_point(|e| e.line < line);
 
         // Scan entries on this line
-        for entry in &self.sorted_positions[start_idx..] {
+        for entry in &sorted_positions[start_idx..] {
             // Stop when we've passed the target line
             if entry.line > line {
                 break;
@@ -5278,7 +5307,7 @@ pub enum SalsaRequest {
     /// the hierarchy to the disk cache.
     SnapshotHierarchyNodes {
         reply: oneshot::Sender<
-            std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+            std::collections::HashMap<PathBuf, Vec<Arc<crate::class_hierarchy_index::ClassNode>>>,
         >,
     },
     /// Surface signatures (`fqcn → u64`) for every class `path` declares.
@@ -6132,7 +6161,7 @@ impl SalsaHandle {
     pub async fn snapshot_hierarchy_nodes(
         &self,
     ) -> Result<
-        std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+        std::collections::HashMap<PathBuf, Vec<Arc<crate::class_hierarchy_index::ClassNode>>>,
         &'static str,
     > {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -6893,8 +6922,13 @@ pub struct SalsaActor {
     ///
     /// DashMap is lock-free for reads and uses per-shard locks for writes
     /// (16 shards by default), so contention between the actor's read path
-    /// and warming's bulk insert is negligible. ~5KB per entry × 65k cap
-    /// = ~320MB worst case. Cap enforced manually on insert.
+    /// and warming's bulk insert is negligible. There is no cap: it holds
+    /// exactly one entry per indexed file (app + vendor), so its size is
+    /// whatever the project's file count makes it — on a large project
+    /// that's tens of thousands of entries, several hundred MB total. Wins
+    /// like dropping vendor `member_access_refs` at parse time (see
+    /// `pattern_indexer`'s vendor gate) shrink the PER-ENTRY cost; nothing
+    /// here bounds the ENTRY COUNT.
     pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
     /// LRU cache of parsed Blade loop blocks, keyed by file path + version.
     /// Salsa already memoizes the underlying query, but caching the Arc avoids
@@ -7029,8 +7063,14 @@ impl SalsaActor {
         // Shared pattern cache: created here, cloned into both the actor
         // and the SalsaHandle. Both ends use the SAME map so writes from
         // either side are immediately visible on the other.
+        //
+        // Modest starting capacity rather than pre-sizing for a large
+        // project's full file count: DashMap grows on demand, and a small
+        // project (or the LSP's own short-lived test/tooling instances)
+        // shouldn't pay for shard storage sized for a 65k-entry monorepo it
+        // will never approach.
         let pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> =
-            Arc::new(dashmap::DashMap::with_capacity(65536));
+            Arc::new(dashmap::DashMap::with_capacity(1024));
         let pattern_cache_for_actor = pattern_cache.clone();
 
         std::thread::spawn(move || {
@@ -8403,7 +8443,7 @@ impl SalsaActor {
             // Populated below once `data` is in hand — capture needs the final
             // `member_access_refs` (parallel `sites`) and reuses the PHP tree.
             member_context: None,
-            sorted_positions: Vec::new(),
+            sorted_positions: std::sync::OnceLock::new(),
         };
 
         // M1 single-parse capture: compile this file's own-source resolution
@@ -8424,8 +8464,10 @@ impl SalsaActor {
             .map(Box::new);
         }
 
-        // Build the sorted position index for O(log n) lookups
-        data.build_position_index();
+        // Win 2: `sorted_positions` is built lazily on first `find_at_position`
+        // call, not here — this parse runs on every `handle_get_patterns`
+        // request (diagnostics, symbols, hovers, …), most of which never
+        // look up a cursor position at all.
 
         // Wrap in Arc for efficient sharing
         let data = Arc::new(data);

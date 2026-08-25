@@ -30,6 +30,7 @@
 //! root path.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -118,7 +119,15 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        plan entirely — a restored Filament-page file would keep resolving
 ///        its Blade template's vars as empty until an unrelated edit. Bump to
 ///        force a re-parse that captures it.
-const SCHEMA_VERSION: u32 = 14;
+///   v15 — vendor-file entries no longer carry `member_access_refs` (memory
+///        win: ~110MB on a large project). The SHAPE of `ParsedPatternsData`
+///        didn't change, so a v14 entry would decode without error — but its
+///        semantics did: a stored vendor entry from before this change still
+///        carries the full raw ref list, which is now bigger than what a
+///        fresh parse would produce and (harmlessly, but wastefully) never
+///        gets trimmed since restored entries aren't re-parsed. Bump so every
+///        on-disk vendor entry is rebuilt through the new, slimmer path.
+const SCHEMA_VERSION: u32 = 15;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 
@@ -147,6 +156,29 @@ struct CachedEntry {
     /// field addition doesn't have to bump the version for this one.
     #[serde(default)]
     nodes: Vec<ClassNode>,
+}
+
+/// Borrowed mirror of [`CachedEntry`], written by [`save_from`] instead of
+/// the owned struct so a save never clones a file's `ParsedPatternsData` or
+/// `ClassNode`s. Field names, order, and TYPES must serialize to the exact
+/// same bytes [`CachedEntry`] would — bincode's wire format is purely
+/// positional, and `Arc<T>`'s `Serialize` impl (the `rc` feature) writes `T`
+/// directly with no wrapper, so `&[Arc<ClassNode>]` here is byte-identical to
+/// `Vec<ClassNode>` there. [`super::tests::save_borrowed_then_load_owned_round_trips`]
+/// pins this.
+#[derive(Serialize)]
+struct CachedEntryRef<'a> {
+    mtime_secs: u64,
+    mtime_nanos: u32,
+    patterns: &'a ParsedPatternsData,
+    nodes: &'a [Arc<ClassNode>],
+}
+
+/// Borrowed mirror of [`CacheFile`] — see [`CachedEntryRef`].
+#[derive(Serialize)]
+struct CacheFileRef<'a> {
+    schema_version: u32,
+    entries: HashMap<&'a Path, CachedEntryRef<'a>>,
 }
 
 /// Outcome of [`load_into`]: how many entries were restored vs dropped, plus
@@ -290,10 +322,14 @@ pub fn load_into_reporting(
             // cached value, drop the entry — warming will re-parse it.
             let node_entry = match read_mtime(&path) {
                 Some((s, n)) if s == entry.mtime_secs && n == entry.mtime_nanos => {
-                    // Fresh: rebuild the position index (we skipped persisting
-                    // it because it duplicates the Vec data) and insert.
-                    let mut patterns = entry.patterns;
-                    patterns.build_position_index();
+                    // Fresh: insert as-is. The position index isn't rebuilt
+                    // here — it's derived data (skipped on serialize, see
+                    // `ParsedPatternsData::sorted_positions`) that
+                    // `find_at_position` now builds lazily on its own first
+                    // call, so a 40k-entry warm restore no longer pays an
+                    // eager sort for every file, only the handful the cursor
+                    // actually visits.
+                    let patterns = entry.patterns;
                     // Surface the file's hierarchy nodes so the caller can
                     // re-import them — the index is otherwise empty on a warm
                     // start (no parse runs for disk-restored files).
@@ -330,13 +366,27 @@ pub fn load_into_reporting(
 /// failing to persist doesn't break the in-memory cache.
 pub fn save_from(
     pattern_cache: &Arc<DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
-    hierarchy_by_file: &HashMap<PathBuf, Vec<ClassNode>>,
+    hierarchy_by_file: &HashMap<PathBuf, Vec<Arc<ClassNode>>>,
     project_root: &Path,
 ) -> Result<usize> {
     let cache_path =
         cache_file_path(project_root).context("could not resolve cache directory for project")?;
 
-    let mut entries: HashMap<PathBuf, CachedEntry> = HashMap::with_capacity(pattern_cache.len());
+    // One cheap row per live entry: a `PathBuf` clone and an `Arc` bump for
+    // the patterns (same per-entry cost as before), NOT a deep clone of the
+    // `ParsedPatternsData`/`ClassNode` payload. Collecting these first (rather
+    // than serializing while iterating the DashMap directly) releases each
+    // shard's read lock immediately, same as the old per-entry-clone loop —
+    // the actual save-time peak this replaces came from `(**patterns).clone()`
+    // duplicating every Vec field of every entry, not from the lock pattern.
+    struct Row {
+        path: PathBuf,
+        mtime_secs: u64,
+        mtime_nanos: u32,
+        patterns: Arc<ParsedPatternsData>,
+    }
+
+    let mut rows: Vec<Row> = Vec::with_capacity(pattern_cache.len());
 
     // Walk the live DashMap and copy out the data we need. We stat each
     // path at save time (rather than trust an mtime we computed earlier)
@@ -353,26 +403,43 @@ pub fn save_from(
             // drop it anyway.
             continue;
         };
-        entries.insert(
-            path.clone(),
-            CachedEntry {
-                mtime_secs: secs,
-                mtime_nanos: nanos,
-                // ParsedPatternsData: Clone is cheap (Arc bumps).
-                patterns: (**patterns).clone(),
-                nodes: hierarchy_by_file.get(path).cloned().unwrap_or_default(),
-            },
-        );
+        rows.push(Row {
+            path: path.clone(),
+            mtime_secs: secs,
+            mtime_nanos: nanos,
+            patterns: Arc::clone(patterns),
+        });
     }
 
-    let total = entries.len();
-    let cache = CacheFile {
+    let total = rows.len();
+
+    // Build the borrowed envelope: every `patterns`/`nodes` field is a
+    // reference into `rows` (via the Arc) or into `hierarchy_by_file`, so
+    // encoding below never clones a Vec-laden payload — the write is the
+    // only place bytes for these get copied.
+    let entries: HashMap<&Path, CachedEntryRef<'_>> = rows
+        .iter()
+        .map(|row| {
+            let nodes: &[Arc<ClassNode>] = hierarchy_by_file
+                .get(&row.path)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            (
+                row.path.as_path(),
+                CachedEntryRef {
+                    mtime_secs: row.mtime_secs,
+                    mtime_nanos: row.mtime_nanos,
+                    patterns: row.patterns.as_ref(),
+                    nodes,
+                },
+            )
+        })
+        .collect();
+
+    let cache = CacheFileRef {
         schema_version: SCHEMA_VERSION,
         entries,
     };
-
-    let encoded = bincode::serde::encode_to_vec(&cache, bincode::config::standard())
-        .context("bincode encode failed")?;
 
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent).context("could not create cache directory")?;
@@ -396,7 +463,22 @@ pub fn save_from(
         SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
     );
     let tmp = cache_path.with_extension(unique);
-    std::fs::write(&tmp, &encoded).context("write tmp cache file failed")?;
+
+    // Stream-encode straight into the temp file through a `BufWriter` rather
+    // than building the full `Vec<u8>` in memory first (`encode_to_vec`) and
+    // then writing it out (`fs::write`) — on a large project that Vec was a
+    // second full-sized copy of the encoded cache alive at once, on top of
+    // the (now-removed) entry clone. The write happens inside a closure so a
+    // mid-encode I/O error is reported the same way an encode error is,
+    // before we ever attempt the rename.
+    (|| -> Result<()> {
+        let file = std::fs::File::create(&tmp).context("create tmp cache file failed")?;
+        let mut writer = std::io::BufWriter::new(file);
+        bincode::serde::encode_into_std_write(&cache, &mut writer, bincode::config::standard())
+            .context("bincode encode failed")?;
+        writer.flush().context("flush tmp cache file failed")?;
+        Ok(())
+    })()?;
     std::fs::rename(&tmp, &cache_path).context("rename tmp cache file failed")?;
 
     Ok(total)

@@ -75,7 +75,7 @@ fn config_with_namespace(root: &Path, namespace_dir: &Path) -> LaravelConfigData
 /// `create_slot_location` reads the slot source from `documents` and resolves
 /// the parent through the seeded namespace.
 async fn seed(server: &LaravelLanguageServer, config: LaravelConfigData, source_uri: &Url) {
-    *server.cached_config.write().await = Some(config);
+    *server.cached_config.write().await = Some(std::sync::Arc::new(config));
     server
         .documents
         .write()

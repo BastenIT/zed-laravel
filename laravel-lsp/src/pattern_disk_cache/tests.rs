@@ -136,15 +136,16 @@ fn position_index_is_rebuilt_on_load() {
     let restored_cache = Arc::new(DashMap::new());
     load_into(&restored_cache, project.path());
 
-    // find_at_position uses the position index. If it works after a
-    // load, the index was rebuilt successfully — which is the whole
-    // point of running `build_position_index()` in load_into.
+    // `sorted_positions` is skipped on serialize and rebuilt LAZILY, on
+    // `find_at_position`'s own first call, rather than eagerly in
+    // `load_into` — so a restored entry works exactly like a freshly
+    // parsed one that's never had `build_position_index()` called on it.
     let entry = restored_cache.get(&file).unwrap();
     let patterns = &entry.value().1;
     let found = patterns.find_at_position(1, 5);
     assert!(
         found.is_some(),
-        "position index should be reconstructed so find_at_position works"
+        "position index should be lazily rebuilt so find_at_position works"
     );
 }
 
@@ -181,7 +182,10 @@ fn hierarchy_nodes_survive_save_and_load() {
     let mut hierarchy = std::collections::HashMap::new();
     hierarchy.insert(
         file.clone(),
-        crate::class_hierarchy_index::classes_in_file(&file, src),
+        crate::class_hierarchy_index::classes_in_file(&file, src)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
     );
     save_from(&cache, &hierarchy, project.path()).unwrap();
 
@@ -296,7 +300,10 @@ fn parallel_load_matches_serial_for_mixed_fixture() {
     for (i, p) in fresh.iter().enumerate() {
         hierarchy.insert(
             p.clone(),
-            crate::class_hierarchy_index::classes_in_file(p, &fresh_src(i)),
+            crate::class_hierarchy_index::classes_in_file(p, &fresh_src(i))
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>(),
         );
     }
     save_from(&cache, &hierarchy, project.path()).unwrap();
@@ -421,4 +428,123 @@ fn member_access_refs_survive_save_and_load() {
         "member accesses must round-trip through the disk cache"
     );
     assert_eq!(restored.value().1.member_access_refs[0].member, "email");
+}
+
+// ─── Win 3: borrowed-mirror save must be byte-compatible with owned load ──
+
+/// `save_from` now serializes through `CachedEntryRef`/`CacheFileRef` —
+/// borrowed mirrors of `CachedEntry`/`CacheFile` built without cloning any
+/// `ParsedPatternsData` or `ClassNode` — while `load_into` still decodes into
+/// the OWNED `CachedEntry`/`CacheFile`. This pins that the two really are
+/// byte-compatible: every pattern kind that round-trips value-for-value, and
+/// the class-hierarchy nodes saved alongside them (also now `Arc`-wrapped on
+/// the save side, plain `ClassNode` on the load side).
+#[test]
+fn save_borrowed_then_load_owned_round_trips() {
+    use crate::class_hierarchy_index::classes_in_file;
+    use crate::salsa_impl::{
+        ClassReferenceData, Confidence, MemberAccessReferenceData, RouteReferenceData,
+    };
+
+    let project = TempDir::new().unwrap();
+    let cache = Arc::new(DashMap::new());
+    let src = "<?php\nnamespace App\\Models;\nclass User extends Model {}\n";
+    let file = touch(project.path(), "User.php", src);
+
+    let mut patterns = ParsedPatternsData::default();
+    patterns.views.push(Arc::new(ViewReferenceData {
+        name: "users.profile".into(),
+        line: 3,
+        column: 1,
+        end_column: 14,
+        is_route_view: true,
+    }));
+    patterns.route_refs.push(Arc::new(RouteReferenceData {
+        name: "users.show".into(),
+        line: 4,
+        column: 2,
+        end_column: 12,
+    }));
+    patterns.class_refs.push(Arc::new(ClassReferenceData {
+        name: "App\\Models\\User".into(),
+        line: 0,
+        column: 4,
+        end_column: 19,
+    }));
+    patterns
+        .member_access_refs
+        .push(Arc::new(MemberAccessReferenceData {
+            member: "email".into(),
+            receiver: "$this".into(),
+            receiver_byte_start: 0,
+            receiver_byte_end: 5,
+            is_nullsafe: true,
+            form: AccessForm::Property,
+            line: 5,
+            column: 6,
+            end_column: 11,
+            declaring_fqcn: Some("App\\Models\\User".into()),
+            kind: None,
+            confidence: Confidence::High,
+        }));
+    patterns.is_volt = true;
+    cache.insert(file.clone(), (0, Arc::new(patterns)));
+
+    let nodes: Vec<Arc<ClassNode>> = classes_in_file(&file, src)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    assert_eq!(nodes.len(), 1, "fixture must declare exactly one class");
+    let mut hierarchy = std::collections::HashMap::new();
+    hierarchy.insert(file.clone(), nodes.clone());
+
+    let saved = save_from(&cache, &hierarchy, project.path()).unwrap();
+    assert_eq!(saved, 1);
+
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into(&restored_cache, project.path());
+    assert_eq!(lr.restored, 1);
+    assert_eq!(lr.dropped, 0);
+
+    let entry = restored_cache.get(&file).expect("entry should be restored");
+    let restored = &entry.value().1;
+
+    assert_eq!(restored.views.len(), 1);
+    assert_eq!(restored.views[0].name, "users.profile");
+    assert_eq!(restored.views[0].line, 3);
+    assert_eq!(restored.views[0].column, 1);
+    assert_eq!(restored.views[0].end_column, 14);
+    assert!(restored.views[0].is_route_view);
+
+    assert_eq!(restored.route_refs.len(), 1);
+    assert_eq!(restored.route_refs[0].name, "users.show");
+
+    assert_eq!(restored.class_refs.len(), 1);
+    assert_eq!(restored.class_refs[0].name, "App\\Models\\User");
+
+    assert_eq!(restored.member_access_refs.len(), 1);
+    let m = &restored.member_access_refs[0];
+    assert_eq!(m.member, "email");
+    assert_eq!(m.receiver, "$this");
+    assert!(m.is_nullsafe);
+    assert_eq!(m.declaring_fqcn.as_deref(), Some("App\\Models\\User"));
+    assert_eq!(m.confidence, Confidence::High);
+
+    assert!(restored.is_volt);
+
+    // Hierarchy nodes: saved as `Arc<ClassNode>` (via `nodes_by_file`'s
+    // Win-3 return type), decoded back into plain owned `ClassNode`s.
+    assert_eq!(lr.hierarchy.len(), 1);
+    let (restored_path, restored_nodes) = &lr.hierarchy[0];
+    assert_eq!(restored_path, &file);
+    assert_eq!(restored_nodes.len(), 1);
+    assert_eq!(restored_nodes[0].fqcn, "App\\Models\\User");
+    assert_eq!(
+        restored_nodes[0].extends.as_deref(),
+        Some("App\\Models\\Model")
+    );
+
+    // find_at_position (lazy, Win 2) must still resolve on the restored,
+    // borrowed-then-owned-round-tripped entry.
+    assert!(restored.find_at_position(3, 5).is_some());
 }

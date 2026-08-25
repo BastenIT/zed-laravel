@@ -81,7 +81,7 @@ fn config_with_components_dir(root: &Path, components_dir: &Path) -> LaravelConf
 /// reads the cached config via `get_cached_config`; `root_path` is set for parity
 /// with the sibling component flow.
 async fn seed(server: &LaravelLanguageServer, root: &Path, config: LaravelConfigData) {
-    *server.cached_config.write().await = Some(config);
+    *server.cached_config.write().await = Some(std::sync::Arc::new(config));
     *server.root_path.write().await = Some(root.to_path_buf());
 }
 
