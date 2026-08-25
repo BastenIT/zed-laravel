@@ -5472,6 +5472,30 @@ impl LaravelLanguageServer {
             // the index is empty). It surfaces on the next open/edit of a file.
             warm_complete_for_warm.store(true, std::sync::atomic::Ordering::Relaxed);
 
+            // Re-register every open buffer's live text. The warm rebuilt
+            // pattern entries from DISK content, so a file the user has open
+            // (and possibly edited) would serve stale positions — goto/hover
+            // dead in exactly the files being worked on — until their next
+            // keystroke re-parses it. Bounded by open tabs, idempotent.
+            let open_docs: Vec<(std::path::PathBuf, String, i32)> = server_for_warm
+                .documents
+                .read()
+                .await
+                .iter()
+                .filter_map(|(uri, (text, version))| {
+                    uri.to_file_path().ok().map(|p| (p, text.clone(), *version))
+                })
+                .collect();
+            for (path, text, version) in open_docs {
+                if let Err(e) = server_for_warm
+                    .salsa
+                    .update_file(path.clone(), version, text)
+                    .await
+                {
+                    debug!("post-warm buffer re-sync failed for {:?}: {}", path, e);
+                }
+            }
+
             let elapsed = started_at.elapsed();
             info!(
                 "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?}; parse {:?}, magic-resolve {:?})",
