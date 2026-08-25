@@ -14569,9 +14569,12 @@ impl LaravelLanguageServer {
                 .trim_end_matches('\'')
                 .trim_end_matches('"');
 
-            // Truncate long values for display
-            if unquoted.len() > 50 {
-                format!("{}...", &unquoted[..47])
+            // Truncate long values for display. Char-based, not byte-based:
+            // a byte slice panics when index 47 lands inside a multibyte
+            // character (e.g. 'č' in a Czech catalogue).
+            if unquoted.chars().count() > 50 {
+                let truncated: String = unquoted.chars().take(47).collect();
+                format!("{truncated}...")
             } else {
                 unquoted.to_string()
             }
@@ -14722,9 +14725,12 @@ impl LaravelLanguageServer {
             // Check for env() call pattern: env('VAR_NAME') or env('VAR_NAME', 'default')
             let resolved = Self::resolve_env_value(value, env_vars);
 
-            // Truncate long values for display
-            let display_value = if resolved.len() > 50 {
-                format!("{}...", &resolved[..47])
+            // Truncate long values for display. Char-based, not byte-based:
+            // a byte slice panics when index 47 lands inside a multibyte
+            // character (e.g. 'ü' in a German config value).
+            let display_value = if resolved.chars().count() > 50 {
+                let truncated: String = resolved.chars().take(47).collect();
+                format!("{truncated}...")
             } else {
                 resolved
             };

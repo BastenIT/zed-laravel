@@ -217,3 +217,23 @@ fn detect_method_name_position_detects_instance_past_multibyte_char() {
     let ctx = detect_method_name_position(line, cursor).expect("instance `->` position");
     assert_eq!(ctx, MethodNameContext::Instance);
 }
+
+// ---- display-value truncation: char-boundary safety ----------------------
+//
+// `extract_translation_value` and `extract_config_value` both truncated
+// their hover/completion display value with a byte slice (`&s[..47]`). A
+// multibyte character straddling index 47 panicked the whole server — always
+// reachable via any root `lang/` translation value over 50 bytes with a
+// multibyte char at the boundary, not just an exotic namespaced-catalogue
+// case.
+
+#[test]
+fn translation_value_truncation_is_char_boundary_safe() {
+    // 46 ASCII chars, then a two-byte 'č' occupying bytes 46..48, then
+    // padding past the 50-char threshold.
+    let value: String = "a".repeat(46) + "čééééééé";
+    let line = format!("'key' => '{}',", value);
+    let display = LaravelLanguageServer::extract_translation_value(&line);
+    assert!(display.ends_with("..."));
+    assert!(display.chars().count() <= 50);
+}
