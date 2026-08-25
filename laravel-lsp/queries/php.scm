@@ -41,6 +41,41 @@
   (#eq? @function_name "view"))
 
 ; ============================================================================
+; Pattern 1a: view($cond ? 'a' : 'b') - conditional/coalesce/match first argument
+; ============================================================================
+; Matches: view($this->template === 'button' ? 'ns::button' : 'ns::form')
+;          view($view ?? 'ns::fallback')
+;          view(match ($type) { 'a' => 'ns::a', default => 'ns::b' })
+;
+; The first argument isn't a plain string literal, so Pattern 1 above never
+; fires. Instead of enumerating every literal position (ternary nesting,
+; match arm count, etc. are unbounded), capture the whole first-argument
+; expression and let the Rust-side walker in `extract_all_php_patterns`
+; recurse into it, emitting one ViewMatch per string literal it finds.
+
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (conditional_expression) @view_conditional_arg))
+  (#eq? @function_name "view"))
+
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (binary_expression
+        operator: "??") @view_conditional_arg))
+  (#eq? @function_name "view"))
+
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (match_expression) @view_conditional_arg))
+  (#eq? @function_name "view"))
+
+; ============================================================================
 ; Pattern 2: View::make('view.name') static method calls
 ; ============================================================================
 ; Matches: View::make('users.profile')

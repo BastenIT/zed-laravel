@@ -47,6 +47,88 @@ fn test_extract_all_php_patterns_views() {
 }
 
 #[test]
+fn test_extract_all_php_patterns_views_ternary_first_argument() {
+    // `view()`'s first argument isn't a plain string literal — Pattern 1
+    // never fires — but every arm is still a resolvable view name, so each
+    // one gets its own ViewMatch (mirrors the real fixture in
+    // GuestTestPage::render()).
+    let php_code = r#"<?php
+    return view($this->template === 'button' ? 'common-google::test-button' : 'common-google::test-form');
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    let view_names: Vec<&str> = patterns.views.iter().map(|m| m.view_name).collect();
+    assert_eq!(
+        patterns.views.len(),
+        2,
+        "both ternary arms should be captured, got {view_names:?}"
+    );
+    assert!(view_names.contains(&"common-google::test-button"));
+    assert!(view_names.contains(&"common-google::test-form"));
+    assert!(
+        patterns.views.iter().all(|v| !v.is_route_view),
+        "ternary arms of view() are not Route::view()"
+    );
+}
+
+#[test]
+fn test_extract_all_php_patterns_views_null_coalesce_first_argument() {
+    let php_code = r#"<?php
+    return view($override ?? 'pages.default');
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(patterns.views[0].view_name, "pages.default");
+}
+
+#[test]
+fn test_extract_all_php_patterns_views_match_first_argument() {
+    let php_code = r#"<?php
+    return view(match ($type) {
+        'a' => 'pages.a',
+        default => 'pages.b',
+    });
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    let view_names: Vec<&str> = patterns.views.iter().map(|m| m.view_name).collect();
+    assert_eq!(patterns.views.len(), 2, "got {view_names:?}");
+    assert!(view_names.contains(&"pages.a"));
+    assert!(view_names.contains(&"pages.b"));
+}
+
+#[test]
+fn test_extract_all_php_patterns_views_conditional_argument_skips_interpolated_arm() {
+    // An interpolated arm (`"ns::{$x}"`) isn't a resolvable literal — same
+    // rule Pattern 1 applies to a direct `view()` argument — so only the
+    // plain-literal arm is captured.
+    let php_code = r#"<?php
+    return view($cond ? "ns::{$dynamic}" : 'pages.fallback');
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(patterns.views[0].view_name, "pages.fallback");
+}
+
+#[test]
 fn test_extract_all_php_patterns_env() {
     let php_code = r#"<?php
     $name = env('APP_NAME', 'Laravel');

@@ -44,6 +44,39 @@ fn view_column_positions() {
 }
 
 #[test]
+fn view_ternary_argument_column_positions() {
+    // view($x ? 'a' : 'b')
+    // Position: 0         1         2
+    //           0123456789012345678901234567
+    //           <?php view($x ? 'a' : 'b');
+    // Each ternary arm's position points at ITS OWN content, not the call
+    // or the conditional expression as a whole.
+    let php_code = "<?php view($x ? 'a' : 'b');";
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 2, "got {:?}", patterns.views);
+
+    let a = patterns
+        .views
+        .iter()
+        .find(|v| v.view_name == "a")
+        .expect("should capture the 'then' arm");
+    assert_eq!(a.column, 17, "'a' content starts at column 17");
+    assert_eq!(a.end_column, 18, "'a' content ends at column 18");
+
+    let b = patterns
+        .views
+        .iter()
+        .find(|v| v.view_name == "b")
+        .expect("should capture the 'else' arm");
+    assert_eq!(b.column, 23, "'b' content starts at column 23");
+    assert_eq!(b.end_column, 24, "'b' content ends at column 24");
+}
+
+#[test]
 fn env_column_positions() {
     // env('APP_NAME')
     // Position: 0         1         2
