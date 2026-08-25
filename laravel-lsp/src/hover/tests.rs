@@ -726,3 +726,39 @@ fn translation_card_without_value_shows_not_found_trailer() {
         format!("`key` · en\n\n{TRANSLATION_NOT_FOUND_TRAILER}")
     );
 }
+
+#[test]
+fn translation_card_locales_renders_every_defined_locale() {
+    let card = translation_card_locales(
+        "legal::contract.prefill.failed_title",
+        &[
+            (
+                "de".to_string(),
+                Some("Analyse fehlgeschlagen".to_string()),
+                Some("[lang/de/contract.php](file:///x)".to_string()),
+            ),
+            (
+                "en".to_string(),
+                Some("Analysis failed".to_string()),
+                Some("[lang/en/contract.php](file:///y)".to_string()),
+            ),
+        ],
+    );
+    assert!(card.starts_with("`failed_title`"));
+    assert!(card.contains("**de** — “Analyse fehlgeschlagen”"));
+    assert!(card.contains("**en** — “Analysis failed”"));
+    assert!(card.contains("[lang/de/contract.php](file:///x)"));
+}
+
+#[test]
+fn translation_card_locales_skips_missing_and_falls_back_to_trailer() {
+    let card = translation_card_locales(
+        "messages.welcome",
+        &[
+            ("de".to_string(), None, None),
+            ("en".to_string(), None, None),
+        ],
+    );
+    assert!(card.contains(TRANSLATION_NOT_FOUND_TRAILER));
+    assert!(!card.contains("**de**"));
+}

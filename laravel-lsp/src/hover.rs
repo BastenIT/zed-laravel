@@ -205,6 +205,34 @@ pub fn translation_card(
     })
 }
 
+/// Multi-locale variant of [`translation_card`]: one value line per locale
+/// that defines the key, each with its own source link, so a `de` + `en`
+/// catalogue shows both translations at once. Locales that don't define the
+/// key are skipped; when none does, the not-found trailer renders instead.
+pub fn translation_card_locales(
+    key: &str,
+    entries: &[(String, Option<String>, Option<String>)],
+) -> String {
+    let mut body = format!("`{}`", leaf_segment(key));
+    let mut any = false;
+    for (locale, value, source_link) in entries {
+        let Some(value) = value else {
+            continue;
+        };
+        any = true;
+        body.push_str(&format!("\n\n**{locale}** — “{value}”"));
+        if let Some(link) = source_link {
+            body.push_str("\n\n");
+            body.push_str(link);
+        }
+    }
+    if !any {
+        body.push_str("\n\n");
+        body.push_str(TRANSLATION_NOT_FOUND_TRAILER);
+    }
+    body
+}
+
 /// The leaf of a translation key: the last `.`-segment, after dropping any
 /// `namespace::` prefix. `app::notification.task.title` → `title`,
 /// `messages.welcome` → `welcome`, a spaced JSON text key → unchanged.
