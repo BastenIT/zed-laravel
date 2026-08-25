@@ -44,6 +44,64 @@ fn view_column_positions() {
 }
 
 #[test]
+fn view_ternary_argument_column_positions() {
+    // view($x ? 'a' : 'b')
+    // Position: 0         1         2
+    //           0123456789012345678901234567
+    //           <?php view($x ? 'a' : 'b');
+    // Each ternary arm's position points at ITS OWN content, not the call
+    // or the conditional expression as a whole.
+    let php_code = "<?php view($x ? 'a' : 'b');";
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 2, "got {:?}", patterns.views);
+
+    let a = patterns
+        .views
+        .iter()
+        .find(|v| v.view_name == "a")
+        .expect("should capture the 'then' arm");
+    assert_eq!(a.column, 17, "'a' content starts at column 17");
+    assert_eq!(a.end_column, 18, "'a' content ends at column 18");
+
+    let b = patterns
+        .views
+        .iter()
+        .find(|v| v.view_name == "b")
+        .expect("should capture the 'else' arm");
+    assert_eq!(b.column, 23, "'b' content starts at column 23");
+    assert_eq!(b.end_column, 24, "'b' content ends at column 24");
+}
+
+#[test]
+fn view_property_literal_column_positions() {
+    // Line 2 (0-based): `protected string $view = 'pages.report';`
+    // Position: 0         1         2         3
+    //           0123456789012345678901234567890123456789
+    let source = "<?php\nclass C {\nprotected string $view = 'pages.report';\n}\n";
+    let tree = parse_php(source).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns = extract_all_php_patterns(&tree, source, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    let view = &patterns.views[0];
+    assert_eq!(view.view_name, "pages.report");
+    assert_eq!(view.row, 2, "the property sits on the 3rd line (0-based)");
+    // 'p' of "pages.report" starts right after the opening quote at column 26
+    assert_eq!(
+        view.column, 26,
+        "column should point to first char of the literal"
+    );
+    assert_eq!(
+        view.end_column, 38,
+        "end_column should be after the last char"
+    );
+}
+
+#[test]
 fn env_column_positions() {
     // env('APP_NAME')
     // Position: 0         1         2

@@ -538,6 +538,14 @@ pub fn extract_all_php_patterns<'a>(
                     is_route_view: true,
                 });
             }
+            // `view($cond ? 'a' : 'b')` / `view($x ?? 'fallback')` /
+            // `view(match (...) { ... })` — the captured node is the whole
+            // first-argument expression (see Pattern 1a in php.scm); walk it
+            // for every nested string literal, each becoming its own
+            // ViewMatch at that literal's own position.
+            "view_conditional_arg" => {
+                collect_nested_view_literals(node, source_bytes, &mut result.views);
+            }
 
             // Inertia page patterns (issue #10). `inertia_page` covers the
             // helper (`inertia('Page')`) and facade (`Inertia::render('Page')`)
@@ -1037,6 +1045,31 @@ pub fn extract_all_php_patterns<'a>(
         }
     }
 
+    // Filament-style `protected [static] string $view = '…';` class property
+    // — the property-declaration counterpart of a `view()` call, not
+    // reachable by the query above (no function call to match on). Reuses
+    // `view_var_index`'s property-detection walk so "what counts as the
+    // `$view` property" has one definition; this call just adds position
+    // info for goto/hover/diagnostics on top of the value that walk already
+    // resolves for view-variable inference.
+    if let Some(content) =
+        crate::view_var_index::declared_view_literal_node(root_node, source_bytes)
+    {
+        if let Ok(text) = content.utf8_text(source_bytes) {
+            let start = content.start_position();
+            let end = content.end_position();
+            result.views.push(ViewMatch {
+                view_name: text,
+                byte_start: content.start_byte(),
+                byte_end: content.end_byte(),
+                row: start.row,
+                column: start.column,
+                end_column: end.column,
+                is_route_view: false,
+            });
+        }
+    }
+
     let total_time = start.elapsed();
     let pattern_count = result.views.len()
         + result.inertia_pages.len()
@@ -1320,6 +1353,113 @@ fn literal_string_value(node: tree_sitter::Node, source: &[u8]) -> Option<String
             }
         }
         _ => None,
+    }
+}
+
+/// The `string_content` node inside `node`, if `node` is a plain
+/// (non-interpolated) string literal — a single-quoted `string` or
+/// double-quoted `encapsed_string` whose only named child is exactly one
+/// `string_content`. `None` for everything else, including an empty literal
+/// (`''`, no content node to position at) and an interpolated string. Unlike
+/// [`literal_string_value`], this returns the AST node rather than the
+/// value, so callers that need both text AND position read them off the
+/// same node.
+fn plain_string_content(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if node.kind() != "string" && node.kind() != "encapsed_string" {
+        return None;
+    }
+    if node.named_child_count() != 1 {
+        return None;
+    }
+    let child = node.named_child(0)?;
+    (child.kind() == "string_content").then_some(child)
+}
+
+/// Collect every plain string literal nested within `node` — a `view()`
+/// call's first-argument expression captured as `view_conditional_arg` in
+/// php.scm (a ternary, `??`, or `match`) — one [`ViewMatch`] per literal at
+/// that literal's own position.
+///
+/// Only descends into VALUE positions, never the expression being tested:
+/// a ternary's `condition`, a `??`'s left-hand operand, and a match arm's
+/// key list (`'a', 'b' => …`) are skipped — a literal sitting there isn't a
+/// view name, it's a discriminant (`view($this->x === 'button' ? … : …)`
+/// must not capture `'button'`, and `match ($t) { 'a' => 'x', … }` must not
+/// capture `'a'`).
+fn collect_nested_view_literals<'a>(
+    node: tree_sitter::Node,
+    source: &'a [u8],
+    out: &mut Vec<ViewMatch<'a>>,
+) {
+    match node.kind() {
+        "string" | "encapsed_string" => {
+            // Recursion stops AT the string node rather than descending
+            // into it, so an interpolated fragment inside an arm
+            // (`"ns::{$x}"`) is skipped instead of yielding a garbage
+            // partial name — the same rule Pattern 1 applies to a direct
+            // `view()` argument.
+            if let Some(content) = plain_string_content(node) {
+                if let Ok(text) = content.utf8_text(source) {
+                    let start = content.start_position();
+                    let end = content.end_position();
+                    out.push(ViewMatch {
+                        view_name: text,
+                        byte_start: content.start_byte(),
+                        byte_end: content.end_byte(),
+                        row: start.row,
+                        column: start.column,
+                        end_column: end.column,
+                        is_route_view: false,
+                    });
+                }
+            }
+        }
+        // `$cond ? then : else` / elvis `$cond ?: else` — `body` is absent
+        // for elvis, so only `alternative` is guaranteed.
+        "conditional_expression" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                collect_nested_view_literals(body, source, out);
+            }
+            if let Some(alternative) = node.child_by_field_name("alternative") {
+                collect_nested_view_literals(alternative, source, out);
+            }
+        }
+        // `$x ?? 'fallback'` — only the fallback (right operand) is a
+        // resolvable view name.
+        "binary_expression"
+            if node
+                .child_by_field_name("operator")
+                .is_some_and(|op| op.kind() == "??") =>
+        {
+            if let Some(right) = node.child_by_field_name("right") {
+                collect_nested_view_literals(right, source, out);
+            }
+        }
+        "match_expression" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                collect_nested_view_literals(body, source, out);
+            }
+        }
+        "match_block" => {
+            let mut cursor = node.walk();
+            for arm in node.named_children(&mut cursor) {
+                collect_nested_view_literals(arm, source, out);
+            }
+        }
+        // `'a', 'b' => 'x'` / `default => 'y'` — only `return_expression`
+        // (the arm's VALUE), never `conditional_expressions` (the keys).
+        "match_conditional_expression" | "match_default_expression" => {
+            if let Some(value) = node.child_by_field_name("return_expression") {
+                collect_nested_view_literals(value, source, out);
+            }
+        }
+        // Transparently unwrap `($cond ? 'a' : 'b')`.
+        "parenthesized_expression" => {
+            if let Some(inner) = node.named_child(0) {
+                collect_nested_view_literals(inner, source, out);
+            }
+        }
+        _ => {}
     }
 }
 

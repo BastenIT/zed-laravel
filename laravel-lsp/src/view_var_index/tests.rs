@@ -193,6 +193,63 @@ class DynamicPage {
     assert!(r.is_empty(), "got {r:?}");
 }
 
+// ---- `declared_view_literal_node` — position-aware sibling used by the
+// pattern-capture site (`queries::extract_all_php_patterns`) to report the
+// `$view` property as a ViewReferenceData for goto/hover/diagnostics -------
+
+#[test]
+fn declared_view_literal_node_points_at_literal_content() {
+    // Line 2 (0-based):
+    //     protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+    //     0         1         2         3         4         5         6         7         8
+    //     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234
+    let src = "<?php\nclass ContractViewPage {\n    protected string $view = \
+               'legal-contractmanagement::filament.pages.contract-edit-page';\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    let content =
+        declared_view_literal_node(tree.root_node(), bytes).expect("should find the $view node");
+    assert_eq!(
+        content.utf8_text(bytes).unwrap(),
+        "legal-contractmanagement::filament.pages.contract-edit-page"
+    );
+    // Position points at the literal's CONTENT, not the surrounding quotes.
+    assert_eq!(content.start_position().row, 2);
+    assert_eq!(content.start_position().column, 30);
+    assert_eq!(content.end_position().column, 89);
+}
+
+#[test]
+fn declared_view_literal_node_static_variant() {
+    let src =
+        "<?php\nclass StatsWidget {\n    protected static string $view = 'widgets.stats';\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    let content =
+        declared_view_literal_node(tree.root_node(), bytes).expect("should find the $view node");
+    assert_eq!(content.utf8_text(bytes).unwrap(), "widgets.stats");
+}
+
+#[test]
+fn declared_view_literal_node_non_literal_is_none() {
+    let src = "<?php\nclass DynamicPage {\n    const VIEW = 'pages.dynamic';\n    protected string $view = self::VIEW;\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    assert!(declared_view_literal_node(tree.root_node(), bytes).is_none());
+}
+
+#[test]
+fn declared_view_literal_node_no_view_property_is_none() {
+    let src = "<?php\nclass NoView {\n    public function render() {}\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    assert!(declared_view_literal_node(tree.root_node(), bytes).is_none());
+}
+
 #[test]
 fn captured_view_property_render_matches_live() {
     // Plan capture/eval (`capture_render_plans` + `evaluate_render_plans`) must

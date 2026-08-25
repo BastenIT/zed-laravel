@@ -1236,15 +1236,14 @@ pub fn view_renders_in_file(
     out
 }
 
-/// The literal view name declared by a Filament-style
-/// `protected string $view = '…';` (or `protected static string $view = '…';`)
-/// class property — the convention `Page`/`Widget` subclasses use instead of
-/// calling `view()`. Visibility and `static` don't matter, only the
-/// property's NAME and a plain string-literal initializer. `None` when the
-/// class declares no `$view` property, or its value isn't a literal (a
-/// constant reference, a `config()` call, …) — such a class isn't a resolvable
-/// render site.
-fn declared_view_literal(root: Node, bytes: &[u8]) -> Option<String> {
+/// The `$view` property's raw initializer node — `protected [static] string
+/// $view = <expr>;` — whatever `<expr>` is. Visibility and `static` don't
+/// matter, only the property's NAME. `None` when the class declares no
+/// `$view` property. The one place that walks the AST for "which property
+/// declaration is `$view`" — both [`declared_view_literal`] and
+/// [`declared_view_literal_node`] build on it so that detection rule lives
+/// once.
+fn declared_view_value_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>> {
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         if n.kind() == "property_declaration" {
@@ -1261,9 +1260,7 @@ fn declared_view_literal(root: Node, bytes: &[u8]) -> Option<String> {
                 if !is_view {
                     continue;
                 }
-                return element
-                    .child_by_field_name("default_value")
-                    .and_then(|d| string_literal_value(d, bytes));
+                return element.child_by_field_name("default_value");
             }
         }
         let mut c = n.walk();
@@ -1272,6 +1269,36 @@ fn declared_view_literal(root: Node, bytes: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// The literal view name declared by a Filament-style
+/// `protected string $view = '…';` (or `protected static string $view = '…';`)
+/// class property — the convention `Page`/`Widget` subclasses use instead of
+/// calling `view()`. `None` when the class declares no `$view` property, or
+/// its value isn't a literal (a constant reference, a `config()` call, …) —
+/// such a class isn't a resolvable render site.
+fn declared_view_literal(root: Node, bytes: &[u8]) -> Option<String> {
+    string_literal_value(declared_view_value_node(root, bytes)?, bytes)
+}
+
+/// Same `$view`-property lookup as [`declared_view_literal`], but returns
+/// the literal's CONTENT node — the span between the quotes — instead of the
+/// trimmed value, so a capture site can report a position (goto/hover/
+/// diagnostics on a `ViewReferenceData`). `None` both when there's no
+/// `$view` property and when its initializer isn't a PLAIN literal: unlike
+/// [`declared_view_literal`]'s looser [`string_literal_value`], this needs
+/// an actual `string_content` node to position at, so an empty `''` or an
+/// interpolated string also yields `None` here.
+pub(crate) fn declared_view_literal_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>> {
+    let value_node = declared_view_value_node(root, bytes)?;
+    if !matches!(value_node.kind(), "string" | "encapsed_string") {
+        return None;
+    }
+    if value_node.named_child_count() != 1 {
+        return None;
+    }
+    let content = value_node.named_child(0)?;
+    (content.kind() == "string_content").then_some(content)
 }
 
 /// Build a [`ViewRender`] from a `view('name', data)` call, also folding in any

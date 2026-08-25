@@ -14568,78 +14568,76 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Get Livewire path from cached config
+        // Get Livewire path from cached config — the conventional-path scan
+        // below is skipped (not the whole function) when there isn't one, so
+        // a project whose components live ONLY under a registered namespace
+        // (no root `app/Livewire`) still gets that namespace's completions.
         let livewire_path = match self.cached_config.read().await.as_ref() {
-            Some(config) => match &config.livewire_path {
-                Some(path) => root.join(path),
-                None => return Vec::new(), // Livewire not configured
-            },
+            Some(config) => config.livewire_path.as_ref().map(|path| root.join(path)),
             None => {
                 // Default to app/Livewire if no config
                 let v3_path = root.join("app").join("Livewire");
                 let v2_path = root.join("app/Http/Livewire");
                 if v3_path.exists() {
-                    v3_path
+                    Some(v3_path)
                 } else if v2_path.exists() {
-                    v2_path
+                    Some(v2_path)
                 } else {
-                    return Vec::new();
+                    None
                 }
             }
         };
 
-        if !livewire_path.exists() {
-            return Vec::new();
-        }
-
         let mut completions = Vec::new();
 
-        // Containment audit (issue #228): no walk-entry gate is needed here. A
-        // discovered path becomes only the `path` *display* string of a
-        // `LivewireComponentCompletion` — never read, opened, or resolved to an FS
-        // primitive at this site. Selecting a completion inserts its `name`;
-        // navigation resolves that name through the independently
-        // containment-gated Livewire resolver. So a `follow_links(true)` escape
-        // could at most surface an out-of-root display string, never a read.
-        for entry in walkdir::WalkDir::new(&livewire_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
-            })
-        {
-            let path = entry.into_path();
+        if let Some(livewire_path) = livewire_path.filter(|p| p.exists()) {
+            // Containment audit (issue #228): no walk-entry gate is needed here. A
+            // discovered path becomes only the `path` *display* string of a
+            // `LivewireComponentCompletion` — never read, opened, or resolved to an FS
+            // primitive at this site. Selecting a completion inserts its `name`;
+            // navigation resolves that name through the independently
+            // containment-gated Livewire resolver. So a `follow_links(true)` escape
+            // could at most surface an out-of-root display string, never a read.
+            for entry in walkdir::WalkDir::new(&livewire_path)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
+                })
+            {
+                let path = entry.into_path();
 
-            // Convert file path to component name
-            if let Ok(relative) = path.strip_prefix(&livewire_path) {
-                let relative_str = relative.to_string_lossy();
+                // Convert file path to component name
+                if let Ok(relative) = path.strip_prefix(&livewire_path) {
+                    let relative_str = relative.to_string_lossy();
 
-                // Remove .php extension
-                let component_name = if relative_str.ends_with(".php") {
-                    relative_str.trim_end_matches(".php")
-                } else {
-                    continue;
-                };
+                    // Remove .php extension
+                    let component_name = if relative_str.ends_with(".php") {
+                        relative_str.trim_end_matches(".php")
+                    } else {
+                        continue;
+                    };
 
-                // Convert path separators to dots for nested components
-                // e.g., "Admin/Dashboard.php" -> "admin.dashboard"
-                let component_name = component_name.replace(['/', '\\'], ".");
+                    // Convert path separators to dots for nested components
+                    // e.g., "Admin/Dashboard.php" -> "admin.dashboard"
+                    let component_name = component_name.replace(['/', '\\'], ".");
 
-                // Convert PascalCase to kebab-case
-                // e.g., "UserProfile" -> "user-profile", "Admin.Dashboard" -> "admin.dashboard"
-                let component_name = Self::to_kebab_case(&component_name);
+                    // Convert PascalCase to kebab-case
+                    // e.g., "UserProfile" -> "user-profile", "Admin.Dashboard" -> "admin.dashboard"
+                    let component_name = Self::to_kebab_case(&component_name);
 
-                // Get relative path from project root for display
-                let display_path = path
-                    .strip_prefix(&root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                    // Get relative path from project root for display
+                    let display_path = path
+                        .strip_prefix(&root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-                completions.push(LivewireComponentCompletion {
-                    name: component_name,
-                    path: display_path,
-                });
+                    completions.push(LivewireComponentCompletion {
+                        name: component_name,
+                        path: display_path,
+                    });
+                }
             }
         }
 
@@ -15014,7 +15012,12 @@ impl LaravelLanguageServer {
         completions
     }
 
-    /// Get all translation keys from lang/*.php files for autocomplete
+    /// Get all translation keys from lang/*.php files for autocomplete —
+    /// the project root's own catalogues AND every registered translation
+    /// namespace (vendor packages, modules, app `loadTranslationsFrom`
+    /// calls). Without the latter, a project that keeps a namespace's
+    /// catalogues only under its registered directory (never published to
+    /// root `lang/vendor/…`) got zero completions for `ns::file.key`.
     async fn get_all_translation_keys(&self) -> Vec<TranslationKeyCompletion> {
         let root = match self.root_path.read().await.clone() {
             Some(r) => r,
@@ -15036,52 +15039,14 @@ impl LaravelLanguageServer {
         // were project-wide. First-wins is the right shape for this caller.
         let lang_dirs = [root.join("lang"), root.join("resources").join("lang")];
 
-        let lang_dir = lang_dirs.iter().find(|d| d.exists());
-        let lang_dir = match lang_dir {
-            Some(d) => d,
-            None => return Vec::new(),
-        };
-
         let mut completions = Vec::new();
+        if let Some(lang_dir) = lang_dirs.iter().find(|d| d.exists()) {
+            completions.extend(Self::translation_keys_in_lang_dir(lang_dir, None));
+        }
 
-        // Find the default locale directory (usually 'en')
-        // We'll use the first locale we find
-        if let Ok(entries) = std::fs::read_dir(lang_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let locale = path.file_name().and_then(|n| n.to_str()).unwrap_or("en");
-
-                    // Read all PHP files in this locale directory
-                    if let Ok(files) = std::fs::read_dir(&path) {
-                        for file_entry in files.flatten() {
-                            let file_path = file_entry.path();
-                            if file_path.extension().is_some_and(|e| e == "php") {
-                                if let Some(file_name) =
-                                    file_path.file_stem().and_then(|s| s.to_str())
-                                {
-                                    let base_key = file_name.to_string();
-                                    let source = format!("lang/{}/{}.php", locale, file_name);
-
-                                    if let Ok(content) = std::fs::read_to_string(&file_path) {
-                                        let keys =
-                                            Self::parse_translation_keys(&content, &base_key);
-                                        for (key, value) in keys {
-                                            completions.push(TranslationKeyCompletion {
-                                                key,
-                                                value,
-                                                source: source.clone(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Only use the first locale directory found
-                    break;
-                }
+        if let Some(namespaces) = self.vendor_translation_namespaces_for(&root).await {
+            for (namespace, dir) in namespaces.iter() {
+                completions.extend(Self::translation_keys_in_lang_dir(dir, Some(namespace)));
             }
         }
 
@@ -15090,6 +15055,70 @@ impl LaravelLanguageServer {
 
         // Remove duplicates
         completions.dedup_by(|a, b| a.key == b.key);
+
+        completions
+    }
+
+    /// Enumerate every translation key under `lang_dir`'s first locale
+    /// subdirectory (see [`Self::get_all_translation_keys`] for the
+    /// "first-locale-wins" rationale), one catalogue file `{file}.php`
+    /// contributing `{file}.{key}` completions. `namespace` prefixes both
+    /// the key (`{ns}::{file}.{key}`, the Laravel namespaced-translation
+    /// syntax) and the reported source, and is `None` for the project's own
+    /// root `lang/` scan. Shared by that root scan and by every registered
+    /// translation namespace so namespaced candidates go through the exact
+    /// same per-file key parsing as root ones.
+    fn translation_keys_in_lang_dir(
+        lang_dir: &Path,
+        namespace: Option<&str>,
+    ) -> Vec<TranslationKeyCompletion> {
+        let mut completions = Vec::new();
+
+        let Ok(entries) = std::fs::read_dir(lang_dir) else {
+            return completions;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let locale = path.file_name().and_then(|n| n.to_str()).unwrap_or("en");
+
+            // Read all PHP files in this locale directory
+            if let Ok(files) = std::fs::read_dir(&path) {
+                for file_entry in files.flatten() {
+                    let file_path = file_entry.path();
+                    if file_path.extension().is_some_and(|e| e == "php") {
+                        if let Some(file_name) = file_path.file_stem().and_then(|s| s.to_str()) {
+                            let base_key = file_name.to_string();
+                            let source = match namespace {
+                                Some(ns) => format!("{ns}::lang/{locale}/{file_name}.php"),
+                                None => format!("lang/{locale}/{file_name}.php"),
+                            };
+
+                            if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                let keys = Self::parse_translation_keys(&content, &base_key);
+                                for (key, value) in keys {
+                                    let key = match namespace {
+                                        Some(ns) => format!("{ns}::{key}"),
+                                        None => key,
+                                    };
+                                    completions.push(TranslationKeyCompletion {
+                                        key,
+                                        value,
+                                        source: source.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Only use the first locale directory found
+            break;
+        }
 
         completions
     }
