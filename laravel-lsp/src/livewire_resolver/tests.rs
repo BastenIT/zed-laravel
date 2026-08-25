@@ -590,3 +590,37 @@ fn wire_target_show_and_text_bind_properties() {
         Some(WireTarget::Property("prefillStatus".to_string()))
     );
 }
+
+#[test]
+fn wire_completion_context_accepts_dotted_binding_paths() {
+    let line = r#"<input wire:model="formData.">"#;
+    let col = (line.find("formData.").unwrap() + "formData.".len()) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Property, "formData.".to_string()))
+    );
+
+    let line = r#"<input wire:model="formData.ti">"#;
+    let col = (line.find("ti\"").unwrap() + 2) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Property, "formData.ti".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_still_rejects_dotted_action_values() {
+    let line = r#"<button wire:click="save.now">"#;
+    let col = (line.find("save").unwrap() + 6) as u32;
+    assert_eq!(wire_attribute_completion_context(line, col), None);
+}
+
+#[test]
+fn property_path_prefix_rejects_malformed_paths() {
+    assert!(is_property_path_prefix("a.b.c"));
+    assert!(is_property_path_prefix("a."));
+    assert!(is_property_path_prefix(""));
+    assert!(!is_property_path_prefix(".a"));
+    assert!(!is_property_path_prefix("a..b"));
+    assert!(!is_property_path_prefix("a.b c"));
+}

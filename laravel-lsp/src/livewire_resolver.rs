@@ -307,7 +307,16 @@ pub fn wire_attribute_completion_context(
         }
         let typed = line[value_start..cursor].trim();
         let kind = wire_value_kind(attr_name.strip_prefix("wire:")?.split('.').next()?)?;
-        return if typed.is_empty() || is_php_identifier(typed) {
+        let acceptable = match kind {
+            // Actions are a single identifier.
+            WireValueKind::Method => typed.is_empty() || is_php_identifier(typed),
+            // Bindings may be a dotted path into a nested object
+            // (`wire:model="contractData.title"`): every completed segment
+            // must be an identifier, the segment under the cursor may be
+            // empty (right after a dot) or partial.
+            WireValueKind::Property => is_property_path_prefix(typed),
+        };
+        return if acceptable {
             Some((kind, typed.to_string()))
         } else {
             None
@@ -315,6 +324,19 @@ pub fn wire_attribute_completion_context(
     }
 
     None
+}
+
+/// A (possibly unfinished) dotted property path: `a`, `a.b`, `a.` or an
+/// empty string. Every segment before the last must be an identifier; the
+/// last may be empty (cursor right after a dot) or a partial identifier.
+fn is_property_path_prefix(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    let segments: Vec<&str> = s.split('.').collect();
+    let (last, completed) = segments.split_last().unwrap();
+    completed.iter().all(|seg| is_php_identifier(seg))
+        && (last.is_empty() || is_php_identifier(last))
 }
 
 /// A bare PHP identifier: `[A-Za-z_][A-Za-z0-9_]*`, nothing else. Used to
