@@ -14567,78 +14567,76 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Get Livewire path from cached config
+        // Get Livewire path from cached config — the conventional-path scan
+        // below is skipped (not the whole function) when there isn't one, so
+        // a project whose components live ONLY under a registered namespace
+        // (no root `app/Livewire`) still gets that namespace's completions.
         let livewire_path = match self.cached_config.read().await.as_ref() {
-            Some(config) => match &config.livewire_path {
-                Some(path) => root.join(path),
-                None => return Vec::new(), // Livewire not configured
-            },
+            Some(config) => config.livewire_path.as_ref().map(|path| root.join(path)),
             None => {
                 // Default to app/Livewire if no config
                 let v3_path = root.join("app").join("Livewire");
                 let v2_path = root.join("app/Http/Livewire");
                 if v3_path.exists() {
-                    v3_path
+                    Some(v3_path)
                 } else if v2_path.exists() {
-                    v2_path
+                    Some(v2_path)
                 } else {
-                    return Vec::new();
+                    None
                 }
             }
         };
 
-        if !livewire_path.exists() {
-            return Vec::new();
-        }
-
         let mut completions = Vec::new();
 
-        // Containment audit (issue #228): no walk-entry gate is needed here. A
-        // discovered path becomes only the `path` *display* string of a
-        // `LivewireComponentCompletion` — never read, opened, or resolved to an FS
-        // primitive at this site. Selecting a completion inserts its `name`;
-        // navigation resolves that name through the independently
-        // containment-gated Livewire resolver. So a `follow_links(true)` escape
-        // could at most surface an out-of-root display string, never a read.
-        for entry in walkdir::WalkDir::new(&livewire_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
-            })
-        {
-            let path = entry.into_path();
+        if let Some(livewire_path) = livewire_path.filter(|p| p.exists()) {
+            // Containment audit (issue #228): no walk-entry gate is needed here. A
+            // discovered path becomes only the `path` *display* string of a
+            // `LivewireComponentCompletion` — never read, opened, or resolved to an FS
+            // primitive at this site. Selecting a completion inserts its `name`;
+            // navigation resolves that name through the independently
+            // containment-gated Livewire resolver. So a `follow_links(true)` escape
+            // could at most surface an out-of-root display string, never a read.
+            for entry in walkdir::WalkDir::new(&livewire_path)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
+                })
+            {
+                let path = entry.into_path();
 
-            // Convert file path to component name
-            if let Ok(relative) = path.strip_prefix(&livewire_path) {
-                let relative_str = relative.to_string_lossy();
+                // Convert file path to component name
+                if let Ok(relative) = path.strip_prefix(&livewire_path) {
+                    let relative_str = relative.to_string_lossy();
 
-                // Remove .php extension
-                let component_name = if relative_str.ends_with(".php") {
-                    relative_str.trim_end_matches(".php")
-                } else {
-                    continue;
-                };
+                    // Remove .php extension
+                    let component_name = if relative_str.ends_with(".php") {
+                        relative_str.trim_end_matches(".php")
+                    } else {
+                        continue;
+                    };
 
-                // Convert path separators to dots for nested components
-                // e.g., "Admin/Dashboard.php" -> "admin.dashboard"
-                let component_name = component_name.replace(['/', '\\'], ".");
+                    // Convert path separators to dots for nested components
+                    // e.g., "Admin/Dashboard.php" -> "admin.dashboard"
+                    let component_name = component_name.replace(['/', '\\'], ".");
 
-                // Convert PascalCase to kebab-case
-                // e.g., "UserProfile" -> "user-profile", "Admin.Dashboard" -> "admin.dashboard"
-                let component_name = Self::to_kebab_case(&component_name);
+                    // Convert PascalCase to kebab-case
+                    // e.g., "UserProfile" -> "user-profile", "Admin.Dashboard" -> "admin.dashboard"
+                    let component_name = Self::to_kebab_case(&component_name);
 
-                // Get relative path from project root for display
-                let display_path = path
-                    .strip_prefix(&root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                    // Get relative path from project root for display
+                    let display_path = path
+                        .strip_prefix(&root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-                completions.push(LivewireComponentCompletion {
-                    name: component_name,
-                    path: display_path,
-                });
+                    completions.push(LivewireComponentCompletion {
+                        name: component_name,
+                        path: display_path,
+                    });
+                }
             }
         }
 
