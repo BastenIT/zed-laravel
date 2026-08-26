@@ -41,6 +41,57 @@
   (#eq? @function_name "view"))
 
 ; ============================================================================
+; Pattern 1a: view($cond ? 'a' : 'b') - expression first argument
+; ============================================================================
+; Matches: view($this->template === 'button' ? 'ns::button' : 'ns::form')
+;          view($view ?? 'ns::fallback')
+;          view(match ($type) { 'a' => 'ns::a', default => 'ns::b' })
+;          view(($cond ? 'pages.a' : 'pages.b'))
+;          view(('pages.home')) - a parenthesized literal also hides the
+;          string from Pattern 1, which requires it as a direct child of
+;          the argument
+;
+; The first argument isn't a plain string literal, so Pattern 1 above never
+; fires. Instead of enumerating every literal position (ternary nesting,
+; match arm count, etc. are unbounded), capture the whole first-argument
+; expression and let the Rust-side walker in `extract_all_php_patterns`
+; recurse into it, emitting one ViewMatch per string literal it finds.
+;
+; The same four expression kinds are captured at every view entry point:
+; Pattern 2a (View::make), Pattern 3a (Route::view), Pattern 4a
+; (Volt::route). The second-argument sites use @route_view_conditional_arg
+; so the walker marks their names as route views.
+
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (conditional_expression) @view_conditional_arg))
+  (#eq? @function_name "view"))
+
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (binary_expression
+        operator: "??") @view_conditional_arg))
+  (#eq? @function_name "view"))
+
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (match_expression) @view_conditional_arg))
+  (#eq? @function_name "view"))
+
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (parenthesized_expression) @view_conditional_arg))
+  (#eq? @function_name "view"))
+
+; ============================================================================
 ; Pattern 2: View::make('view.name') static method calls
 ; ============================================================================
 ; Matches: View::make('users.profile')
@@ -97,6 +148,87 @@
   (#eq? @method_name "make"))
 
 ; ============================================================================
+; Pattern 2a: View::make($cond ? 'a' : 'b') - expression first argument
+; ============================================================================
+; Same blind spot as Pattern 1a, same fix: capture the whole expression
+; (ternary, `??`, match, or parenthesized) and let the Rust-side walker
+; emit one ViewMatch per nested string literal.
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (conditional_expression) @view_conditional_arg))
+  (#eq? @class_name "View")
+  (#eq? @method_name "make"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (binary_expression
+        operator: "??") @view_conditional_arg))
+  (#eq? @class_name "View")
+  (#eq? @method_name "make"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (match_expression) @view_conditional_arg))
+  (#eq? @class_name "View")
+  (#eq? @method_name "make"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (parenthesized_expression) @view_conditional_arg))
+  (#eq? @class_name "View")
+  (#eq? @method_name "make"))
+
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (conditional_expression) @view_conditional_arg))
+  (#match? @class_name ".*View$")
+  (#eq? @method_name "make"))
+
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (binary_expression
+        operator: "??") @view_conditional_arg))
+  (#match? @class_name ".*View$")
+  (#eq? @method_name "make"))
+
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (match_expression) @view_conditional_arg))
+  (#match? @class_name ".*View$")
+  (#eq? @method_name "make"))
+
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (parenthesized_expression) @view_conditional_arg))
+  (#match? @class_name ".*View$")
+  (#eq? @method_name "make"))
+
+; ============================================================================
 ; Pattern 3: Route::view('/path', 'view.name') - Route view registration
 ; ============================================================================
 ; Matches: Route::view('/home', 'welcome')
@@ -135,6 +267,55 @@
   (#eq? @method_name "view"))
 
 ; ============================================================================
+; Pattern 3a: Route::view('/path', $cond ? 'a' : 'b') - expression second argument
+; ============================================================================
+; Same treatment as Pattern 1a for the SECOND argument. The bare (argument)
+; placeholder keeps the positional constraint - without it a ternary in the
+; route-path argument would be captured and its strings treated as view
+; names. @route_view_conditional_arg tells the walker these are route views.
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (conditional_expression) @route_view_conditional_arg))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "view"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (binary_expression
+        operator: "??") @route_view_conditional_arg))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "view"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (match_expression) @route_view_conditional_arg))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "view"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (parenthesized_expression) @route_view_conditional_arg))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "view"))
+
+; ============================================================================
 ; Pattern 4: Volt::route('/path', 'view.name') - Volt route registration
 ; ============================================================================
 ; Matches: Volt::route('/home', 'welcome')
@@ -163,6 +344,52 @@
     (argument
       (encapsed_string
         (string_content) @route_view_name)))
+  (#eq? @class_name "Volt")
+  (#eq? @method_name "route"))
+
+; ============================================================================
+; Pattern 4a: Volt::route('/path', $cond ? 'a' : 'b') - expression second argument
+; ============================================================================
+; Same as Pattern 3a - Volt view names are route views too.
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (conditional_expression) @route_view_conditional_arg))
+  (#eq? @class_name "Volt")
+  (#eq? @method_name "route"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (binary_expression
+        operator: "??") @route_view_conditional_arg))
+  (#eq? @class_name "Volt")
+  (#eq? @method_name "route"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (match_expression) @route_view_conditional_arg))
+  (#eq? @class_name "Volt")
+  (#eq? @method_name "route"))
+
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (parenthesized_expression) @route_view_conditional_arg))
   (#eq? @class_name "Volt")
   (#eq? @method_name "route"))
 
