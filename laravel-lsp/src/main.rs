@@ -8987,15 +8987,20 @@ impl LaravelLanguageServer {
     /// Extract view name from directive arguments
     /// e.g., "('layouts.app')" → "layouts.app"
     fn extract_view_from_directive_args(args: &str) -> Option<String> {
-        // Remove parentheses and quotes
-        let trimmed = args.trim().trim_matches('(').trim_matches(')').trim();
-        let unquoted = trimmed.trim_matches('\'').trim_matches('"');
-
-        if !unquoted.is_empty() && !unquoted.contains(',') {
-            Some(unquoted.to_string())
-        } else {
-            None
-        }
+        // The FIRST quoted string is the name; anything after it (a data
+        // array, replacements, ...) is not part of it. The previous "no
+        // comma anywhere" shape rejected the most common real-world form —
+        // `@include('view', ['data' => $x])` — outright, killing goto and
+        // the missing-view diagnostic for every data-carrying directive.
+        // Returns None when the first token isn't a string literal (e.g.
+        // `@includeWhen($cond, 'view')`, handled by the second-arg path).
+        let trimmed = args.trim().trim_start_matches('(').trim_start();
+        let mut chars = trimmed.char_indices();
+        let (open, quote) = chars.next().filter(|(_, c)| *c == '\'' || *c == '"')?;
+        let rest = &trimmed[open + quote.len_utf8()..];
+        let end = rest.find(quote)?;
+        let name = &rest[..end];
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// Convert kebab-case to PascalCase
@@ -15792,11 +15797,13 @@ return [
         // branch builds its path from `root.join(..)` and so is already contained.
 
         // Directives where first argument is a view name
-        let view_directives_first_arg =
-            ["extends", "include", "includeIf", "includeUnless", "each"];
+        let view_directives_first_arg = ["extends", "include", "includeIf", "each"];
 
         // Directives where second argument is a view name (after a condition)
-        let view_directives_second_arg = ["includeWhen"];
+        // `@includeUnless($boolean, 'view.name', [...])` is condition-first,
+        // exactly like `@includeWhen` — it never resolved from the
+        // first-argument list.
+        let view_directives_second_arg = ["includeWhen", "includeUnless"];
 
         // @component directive - resolves to component file
         if dir.name == "component" {
@@ -16020,34 +16027,27 @@ return [
     /// Extract the second string argument from directive args
     /// For @includeWhen($condition, 'view.name', $data)
     fn extract_second_string_arg(arguments: &str) -> Option<String> {
-        // Find second quoted string after a comma
+        // Condition-first directives (`@includeWhen($cond, 'view', [...])`,
+        // `@includeUnless(...)`) put a boolean EXPRESSION first — it is not
+        // a quoted string. The name is therefore the FIRST quoted string in
+        // the args. The previous version skipped one quoted string on the
+        // assumption argument one was quoted: the two-argument form then
+        // resolved nothing, and the three-argument form returned the data
+        // array's first key — a wrong goto target and a false missing-view
+        // diagnostic.
         let mut in_string = false;
         let mut quote_char = ' ';
-        let mut found_first = false;
         let mut result = String::new();
-        let mut capturing = false;
 
         for ch in arguments.chars() {
             if !in_string {
                 if ch == '\'' || ch == '"' {
-                    if found_first {
-                        // Start capturing second string
-                        in_string = true;
-                        quote_char = ch;
-                        capturing = true;
-                    } else {
-                        // Skip first string
-                        in_string = true;
-                        quote_char = ch;
-                    }
+                    in_string = true;
+                    quote_char = ch;
                 }
             } else if ch == quote_char {
-                in_string = false;
-                if capturing {
-                    return Some(result);
-                }
-                found_first = true;
-            } else if capturing {
+                return (!result.is_empty()).then_some(result);
+            } else {
                 result.push(ch);
             }
         }

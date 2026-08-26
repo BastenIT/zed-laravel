@@ -215,3 +215,61 @@ async fn under_root_symlink_to_outside_target_returns_none() {
          guard refuses it even though the link path is lexically inside"
     );
 }
+
+/// Regression: a directive whose args carry a second parameter —
+/// `@include('view', ['data' => $x])`, `@lang('key', ['name' => $n])` —
+/// must still yield its first quoted string. The old extractor rejected
+/// any args containing a comma, so goto and the missing-view diagnostic
+/// were dead for every data-carrying directive.
+#[test]
+fn directive_first_string_extraction_survives_data_arguments() {
+    let cases = [
+        (
+            "('ns::pages.editor.block-outline', ['rowBlocks' => $rowBlocks])",
+            Some("ns::pages.editor.block-outline"),
+        ),
+        ("('plain.view')", Some("plain.view")),
+        ("(\"double.quoted\", ['a' => 1])", Some("double.quoted")),
+        // First token not a string literal (condition-first directives are
+        // handled by the second-arg extractor) — must yield None.
+        ("($condition, 'view.name')", None),
+        ("('')", None),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(
+            crate::LaravelLanguageServer::extract_view_from_directive_args(args).as_deref(),
+            expected,
+            "args: {args}"
+        );
+    }
+}
+
+/// Regression for the condition-first extractor: `@includeWhen` /
+/// `@includeUnless` put a boolean EXPRESSION first, so the view name is the
+/// FIRST quoted string in the args. The previous version skipped one quoted
+/// string — the two-argument form resolved nothing, and the three-argument
+/// form returned the data array's first key as the "view name" (wrong goto
+/// target, false missing-view diagnostic).
+#[test]
+fn second_arg_extraction_takes_the_first_quoted_string() {
+    let cases = [
+        ("($cond, 'view')", Some("view")),
+        (
+            "($boolean, 'view.name', ['status' => 'complete'])",
+            Some("view.name"),
+        ),
+        (
+            "($cond, \"double.quoted\", ['a' => $b])",
+            Some("double.quoted"),
+        ),
+        ("($cond)", None),
+        ("($cond, '')", None),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(
+            crate::LaravelLanguageServer::extract_second_string_arg(args).as_deref(),
+            expected,
+            "args: {args}"
+        );
+    }
+}
