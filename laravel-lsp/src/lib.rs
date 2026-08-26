@@ -65,6 +65,7 @@ pub mod config;
 pub mod config_key_locator;
 pub mod config_lookup;
 pub mod database;
+pub mod display_truncate;
 pub mod document_symbols;
 pub mod env_key_locator;
 pub mod facade_resolver;

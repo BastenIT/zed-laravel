@@ -145,20 +145,56 @@ fn translation_call_context_passes_namespace_prefix_through_unmangled() {
     );
 }
 
-/// Regression: values longer than 50 characters with a multibyte character
-/// straddling the truncation index must not panic (`&s[..47]` was a byte
-/// slice; index 47 landing inside 'č' aborted the whole server the first
-/// time namespaced catalogues — full of non-ASCII values — were enumerated
-/// for completion).
+/// Regression: `extract_translation_value` and `extract_config_value` used
+/// to truncate with a byte slice (`&s[..47]`); index 47 landing inside a
+/// multibyte character (e.g. 'č') aborted the whole server the first time
+/// namespaced catalogues — full of non-ASCII values — were enumerated for
+/// completion. Both now delegate to the shared, char-safe
+/// `display_truncate::truncate_for_display` (also used by `hover.rs`), so
+/// the limit is 200 chars, not 47/50, and the ellipsis is the single `…`
+/// char.
 #[test]
 fn translation_value_truncation_is_char_boundary_safe() {
-    // 46 ASCII chars, then a two-byte 'č' occupying bytes 46..48, then
-    // padding past the 50-char threshold.
-    let value: String = "a".repeat(46) + "čééééééé";
+    // 199 ASCII chars, then a two-byte 'č', then padding well past the
+    // shared 200-char limit. Truncation operates on chars, not bytes, so the
+    // multibyte char at the cut point can't panic.
+    let value: String = "a".repeat(199) + "č" + &"é".repeat(50);
     let line = format!("'key' => '{}',", value);
     let display = LaravelLanguageServer::extract_translation_value(&line);
-    assert!(display.ends_with("..."));
-    assert!(display.chars().count() <= 50);
+    assert!(display.ends_with('…'));
+    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
+}
+
+/// Consequence of the dedup: a 30-char/60-byte Czech string used to get
+/// truncated (and could panic) under the old byte-slice/50-char threshold;
+/// the shared 200-char, char-based limit now passes it through untouched.
+#[test]
+fn translation_value_under_two_hundred_chars_is_not_truncated() {
+    let value = "č".repeat(30);
+    let line = format!("'key' => '{}',", value);
+    let display = LaravelLanguageServer::extract_translation_value(&line);
+    assert_eq!(display, value);
+}
+
+/// Same char-boundary regression, for `extract_config_value` — it shared
+/// the identical byte-slice bug and now shares the identical fix.
+#[test]
+fn config_value_truncation_is_char_boundary_safe() {
+    let value: String = "a".repeat(199) + "ü" + &"ö".repeat(50);
+    let line = format!("'key' => '{}',", value);
+    let env_vars = std::collections::HashMap::new();
+    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
+    assert!(display.ends_with('…'));
+    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
+}
+
+#[test]
+fn config_value_under_two_hundred_chars_is_not_truncated() {
+    let value = "ü".repeat(30);
+    let line = format!("'key' => '{}',", value);
+    let env_vars = std::collections::HashMap::new();
+    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
+    assert_eq!(display, value);
 }
 
 /// Regression: a directive whose args carry a second parameter —
