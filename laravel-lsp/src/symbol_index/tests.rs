@@ -632,10 +632,10 @@ fn magic_members_export_round_trips_insert() {
     assert_eq!(export.get(&b).unwrap().len(), 1);
 }
 
-// ─── Win 5a: vendor `class_refs` skipped at index time ──────────────────
+// ─── class_refs are indexed regardless of vendor status ──────────────────
 
-/// `ParsedPatternsData` with a single class ref (as a Blade `@use` or PHP
-/// `use` would produce).
+/// `ParsedPatternsData` with a single class ref (as a Blade `@use`, a plain
+/// PHP `use`, or a Volt front-matter import would produce).
 fn class_fixture(name: &str) -> ParsedPatternsData {
     let mut d = ParsedPatternsData::default();
     d.class_refs
@@ -649,21 +649,19 @@ fn class_fixture(name: &str) -> ParsedPatternsData {
 }
 
 #[test]
-fn vendor_class_refs_are_not_indexed() {
+fn vendor_class_refs_are_indexed() {
+    // Vendor `use` imports are the only recorded evidence that a vendor
+    // class depends on another class (extends/implements aren't indexed
+    // anywhere) — find-references on a class must surface them, which
+    // matters most for path-repository package development under vendor/.
     let mut idx = SymbolIndex::default();
     let vendor_path = PathBuf::from("/proj/vendor/acme/pkg/src/Consumer.php");
     idx.insert_file(&vendor_path, &class_fixture("App\\Models\\User"));
 
-    assert!(
-        idx.find(&SymbolRefData::Class("App\\Models\\User".into()))
-            .is_empty(),
-        "a vendor file's `use` of an app class must not surface as a reference"
-    );
-    assert_eq!(
-        idx.indexed_file_count(),
-        0,
-        "a vendor file contributing only class_refs should register no by_file entry"
-    );
+    let hits = idx.find(&SymbolRefData::Class("App\\Models\\User".into()));
+    assert_eq!(hits.len(), 1, "a vendor file's `use` must be indexed");
+    assert_eq!(hits[0].file_path, vendor_path);
+    assert_eq!(idx.indexed_file_count(), 1);
 }
 
 #[test]
@@ -677,24 +675,7 @@ fn non_vendor_class_refs_are_still_indexed() {
     assert_eq!(hits[0].file_path, app_path);
 }
 
-#[test]
-fn vendor_path_component_matches_only_a_real_path_segment() {
-    // A file whose NAME merely contains "vendor" (not a `vendor/` path
-    // segment) is not vendor — this pins the `components()` check against a
-    // naive substring match that would over-suppress.
-    let mut idx = SymbolIndex::default();
-    let path = PathBuf::from("/proj/app/Services/VendorImportService.php");
-    idx.insert_file(&path, &class_fixture("App\\Models\\User"));
-
-    assert_eq!(
-        idx.find(&SymbolRefData::Class("App\\Models\\User".into()))
-            .len(),
-        1,
-        "a file merely named like 'vendor' must still be indexed"
-    );
-}
-
-// ─── Win 5b: `by_file` shares its `SymbolKey`s with `forward` ────────────
+// ─── `by_file` shares its `SymbolKey`s with `forward` ────────────────────
 
 #[test]
 fn by_file_and_forward_share_the_same_key_allocation() {

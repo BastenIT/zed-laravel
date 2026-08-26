@@ -5197,3 +5197,44 @@ class P extends ServiceProvider
         ]
     );
 }
+
+// ─── SalsaHandle::resize_pattern_cache ────────────────────────────────────
+
+#[tokio::test]
+async fn resize_pattern_cache_grows_capacity_and_keeps_existing_entries() {
+    let handle = SalsaActor::spawn();
+    let path = PathBuf::from("/proj/app/Models/User.php");
+    let data = Arc::new(ParsedPatternsData::default());
+    handle
+        .bulk_import_patterns(vec![(path.clone(), data)])
+        .await
+        .unwrap();
+
+    let before = handle.pattern_cache().capacity();
+    handle.resize_pattern_cache(before + 5_000);
+    let after = handle.pattern_cache().capacity();
+
+    assert!(
+        after >= before + 5_000,
+        "resize must grow capacity to at least the requested target (+ padding), got {before} -> {after}"
+    );
+    assert!(
+        handle.pattern_cache().contains_key(&path),
+        "an entry present before the resize must survive the table swap"
+    );
+}
+
+#[tokio::test]
+async fn resize_pattern_cache_is_a_no_op_once_already_big_enough() {
+    let handle = SalsaActor::spawn();
+    handle.resize_pattern_cache(10_000);
+    let grown = handle.pattern_cache().capacity();
+
+    // A smaller request must not shrink or rebuild an already-adequate table.
+    handle.resize_pattern_cache(10);
+    assert_eq!(
+        handle.pattern_cache().capacity(),
+        grown,
+        "resize must not rebuild the table when it's already big enough"
+    );
+}

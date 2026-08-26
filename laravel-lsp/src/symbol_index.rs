@@ -55,7 +55,9 @@ pub enum SymbolKind {
     Livewire,
     Middleware,
     Binding,
-    /// A PHP class referenced by FQCN from a Blade `@use` directive.
+    /// A PHP class referenced by FQCN from a `use` import: a Blade `@use`
+    /// directive, a plain PHP `use` statement, or a Volt single-file
+    /// component's `<?php … ?>` front-matter imports.
     Class,
     /// Eloquent magic member / plain class member (M4). The `name` is the
     /// composite `<declaring_fqcn>#<member>` produced by the M3 resolver, so
@@ -132,15 +134,6 @@ impl SymbolIndex {
     /// pairing this with `remove_file` if the file was already indexed.
     pub fn insert_file(&mut self, path: &Path, patterns: &ParsedPatternsData) {
         let mut keys: Vec<Arc<SymbolKey>> = Vec::new();
-        // Win 5a: a vendor file's `class_refs` (its `use` imports) are its
-        // OWN references TO other classes, not something else referencing
-        // it — indexing them just means every vendor file that `use`s a
-        // popular class (Laravel's `Model`, `Collection`, …) becomes a
-        // find-references hit for it. On a large project that's ~20MB of
-        // entries whose only value is enumerating vendor's own internals,
-        // which a user never navigates to. App-file class refs are unaffected
-        // — this only ever suppresses the `Class` kind, and only for vendor.
-        let is_vendor = path.components().any(|c| c.as_os_str() == "vendor");
 
         // One macro arm per pattern collection on `ParsedPatternsData`.
         // The `$name` field name varies between collections (it's
@@ -174,17 +167,13 @@ impl SymbolIndex {
         ingest!(livewire_refs, SymbolKind::Livewire, name);
         ingest!(middleware_refs, SymbolKind::Middleware, name);
         ingest!(binding_refs, SymbolKind::Binding, name);
-        // Find-references on a class intentionally no longer enumerates its
-        // vendor `use` sites — vendor code that imports `App\Models\User`
-        // (or a framework class of its own) contributes no navigable value,
-        // and a project's vendor directory can carry tens of thousands of
-        // such imports. Vendor consumers still resolve fine on demand: an
-        // opened vendor file re-parses through the live `handle_get_patterns`
-        // path (see the Win 1 note in `pattern_indexer.rs`), which
-        // `find_at_position` reads directly rather than through this index.
-        if !is_vendor {
-            ingest!(class_refs, SymbolKind::Class, name);
-        }
+        // Vendor `use` imports ARE indexed, deliberately: extends/implements
+        // relationships aren't otherwise indexed anywhere, so a `use` line is
+        // the only recorded evidence that a vendor class depends on an app
+        // (or another vendor) class. That matters most for path-repository
+        // package development under `vendor/`, where find-references on a
+        // class needs to surface those cross-package call sites.
+        ingest!(class_refs, SymbolKind::Class, name);
 
         // Chain-aware config/translation entries: a reference to a dotted key
         // is also a reference to every ancestor in the chain —

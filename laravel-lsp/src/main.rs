@@ -4914,6 +4914,22 @@ impl LaravelLanguageServer {
 
         info!("Laravel: Project files registered with Salsa for reference finding");
 
+        // Size the shared pattern cache for this project's real file count
+        // now that `register_project_files`'s walk has discovered it — and
+        // BEFORE either of the two bulk-insert paths below (the disk-cache
+        // restore and warming's bulk import) run. Sizing here means neither
+        // one grows the table through a series of rehashes as it inserts.
+        // `list_project_files` just returns the actor's already-discovered
+        // list (no re-walk); a failure here is non-fatal — it only costs
+        // the resize's benefit, not correctness — so we log and continue.
+        match self.salsa.list_project_files().await {
+            Ok(paths) => self.salsa.resize_pattern_cache(paths.len()),
+            Err(e) => debug!(
+                "list_project_files failed, pattern cache stays at its bootstrap capacity: {}",
+                e
+            ),
+        }
+
         // Disk-cache restore. Loads previously-parsed patterns into the
         // shared pattern_cache, dropping any entry whose on-disk mtime
         // doesn't match what was cached. Anything restored here gets
