@@ -14688,12 +14688,7 @@ impl LaravelLanguageServer {
                 .trim_end_matches('\'')
                 .trim_end_matches('"');
 
-            // Truncate long values for display
-            if unquoted.len() > 50 {
-                format!("{}...", &unquoted[..47])
-            } else {
-                unquoted.to_string()
-            }
+            laravel_lsp::display_truncate::truncate_for_display(unquoted, 200)
         } else {
             String::new()
         }
@@ -14841,14 +14836,7 @@ impl LaravelLanguageServer {
             // Check for env() call pattern: env('VAR_NAME') or env('VAR_NAME', 'default')
             let resolved = Self::resolve_env_value(value, env_vars);
 
-            // Truncate long values for display
-            let display_value = if resolved.len() > 50 {
-                format!("{}...", &resolved[..47])
-            } else {
-                resolved
-            };
-
-            display_value
+            laravel_lsp::display_truncate::truncate_for_display(&resolved, 200)
         } else {
             String::new()
         }
@@ -20167,7 +20155,7 @@ return [
         };
         let truncated = value
             .as_deref()
-            .map(|v| laravel_lsp::hover::truncate_for_display(v, 200));
+            .map(|v| laravel_lsp::display_truncate::truncate_for_display(v, 200));
         let trailer = if value.is_none() {
             Some("*(value not found)*")
         } else {
@@ -20238,7 +20226,10 @@ return [
                 r, key, &locale, map_ref,
             ) {
                 Some(res) => Some((
-                    hover::truncate_for_display(&Self::unquote_php_literal(&res.value), 200),
+                    laravel_lsp::display_truncate::truncate_for_display(
+                        &Self::unquote_php_literal(&res.value),
+                        200,
+                    ),
                     self.source_link(&res.source_file, None).await,
                 )),
                 None => None,

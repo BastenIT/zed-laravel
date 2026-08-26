@@ -793,18 +793,5 @@ pub fn source_link(display: &str, file_url: &str, line: Option<u32>) -> String {
     }
 }
 
-/// Truncate strings longer than `limit` chars with a `…` ellipsis. Operates
-/// on chars (not bytes) so it never splits a multibyte character.
-///
-/// Used by config/translation dispatch code to clip long resolved values
-/// before stuffing them into a code block.
-pub fn truncate_for_display(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(limit).collect();
-    format!("{}…", head)
-}
-
 #[cfg(test)]
 mod tests;
