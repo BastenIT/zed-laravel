@@ -538,13 +538,19 @@ pub fn extract_all_php_patterns<'a>(
                     is_route_view: true,
                 });
             }
-            // `view($cond ? 'a' : 'b')` / `view($x ?? 'fallback')` /
-            // `view(match (...) { ... })` — the captured node is the whole
-            // first-argument expression (see Pattern 1a in php.scm); walk it
-            // for every nested string literal, each becoming its own
-            // ViewMatch at that literal's own position.
+            // `view($cond ? 'a' : 'b')` / `View::make($x ?? 'fallback')` /
+            // `view(match (...) { ... })` / `view(('name'))` — the captured
+            // node is a whole argument expression (Patterns 1a/2a/3a/4a in
+            // php.scm); walk it for every nested string literal, each
+            // becoming its own ViewMatch at that literal's own position.
+            // `route_view_conditional_arg` is the same capture at the
+            // second-argument sites (`Route::view`, `Volt::route`), whose
+            // names are route views.
             "view_conditional_arg" => {
-                collect_nested_view_literals(node, source_bytes, &mut result.views);
+                collect_nested_view_literals(node, source_bytes, &mut result.views, false);
+            }
+            "route_view_conditional_arg" => {
+                collect_nested_view_literals(node, source_bytes, &mut result.views, true);
             }
 
             // Inertia page patterns (issue #10). `inertia_page` covers the
@@ -1312,23 +1318,23 @@ fn is_conditionally_nested(node: tree_sitter::Node, scope: tree_sitter::Node) ->
 
 /// The content of `node` if it is a plain (non-interpolated) string literal —
 /// single-quoted `string` or a double-quoted `encapsed_string` whose only
-/// named child is one `string_content`. `None` for everything else.
+/// named child is one `string_content`. `Some("")` for an empty literal,
+/// `None` for everything else. The literal check itself lives in
+/// [`plain_string_content`]; this wraps it for callers that want the value
+/// rather than the node.
 fn literal_string_value(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     if node.kind() != "string" && node.kind() != "encapsed_string" {
         return None;
     }
-    match node.named_child_count() {
-        0 => Some(String::new()),
-        1 => {
-            let child = node.named_child(0)?;
-            if child.kind() == "string_content" {
-                Some(child.utf8_text(source).ok()?.to_string())
-            } else {
-                None
-            }
-        }
-        _ => None,
+    if node.named_child_count() == 0 {
+        return Some(String::new());
     }
+    Some(
+        plain_string_content(node)?
+            .utf8_text(source)
+            .ok()?
+            .to_string(),
+    )
 }
 
 /// The `string_content` node inside `node`, if `node` is a plain
@@ -1350,10 +1356,12 @@ fn plain_string_content(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     (child.kind() == "string_content").then_some(child)
 }
 
-/// Collect every plain string literal nested within `node` — a `view()`
-/// call's first-argument expression captured as `view_conditional_arg` in
-/// php.scm (a ternary, `??`, or `match`) — one [`ViewMatch`] per literal at
-/// that literal's own position.
+/// Collect every plain string literal nested within `node` — a view
+/// entry point's argument expression captured as `view_conditional_arg` or
+/// `route_view_conditional_arg` in php.scm (a ternary, `??`, `match`, or
+/// parenthesized expression) — one [`ViewMatch`] per literal at that
+/// literal's own position. `is_route_view` marks names from the
+/// second-argument sites (`Route::view`, `Volt::route`) as route views.
 ///
 /// Only descends into VALUE positions, never the expression being tested:
 /// a ternary's `condition`, a `??`'s left-hand operand, and a match arm's
@@ -1365,6 +1373,7 @@ fn collect_nested_view_literals<'a>(
     node: tree_sitter::Node,
     source: &'a [u8],
     out: &mut Vec<ViewMatch<'a>>,
+    is_route_view: bool,
 ) {
     match node.kind() {
         "string" | "encapsed_string" => {
@@ -1384,7 +1393,7 @@ fn collect_nested_view_literals<'a>(
                         row: start.row,
                         column: start.column,
                         end_column: end.column,
-                        is_route_view: false,
+                        is_route_view,
                     });
                 }
             }
@@ -1393,10 +1402,10 @@ fn collect_nested_view_literals<'a>(
         // for elvis, so only `alternative` is guaranteed.
         "conditional_expression" => {
             if let Some(body) = node.child_by_field_name("body") {
-                collect_nested_view_literals(body, source, out);
+                collect_nested_view_literals(body, source, out, is_route_view);
             }
             if let Some(alternative) = node.child_by_field_name("alternative") {
-                collect_nested_view_literals(alternative, source, out);
+                collect_nested_view_literals(alternative, source, out, is_route_view);
             }
         }
         // `$x ?? 'fallback'` — only the fallback (right operand) is a
@@ -1407,31 +1416,31 @@ fn collect_nested_view_literals<'a>(
                 .is_some_and(|op| op.kind() == "??") =>
         {
             if let Some(right) = node.child_by_field_name("right") {
-                collect_nested_view_literals(right, source, out);
+                collect_nested_view_literals(right, source, out, is_route_view);
             }
         }
         "match_expression" => {
             if let Some(body) = node.child_by_field_name("body") {
-                collect_nested_view_literals(body, source, out);
+                collect_nested_view_literals(body, source, out, is_route_view);
             }
         }
         "match_block" => {
             let mut cursor = node.walk();
             for arm in node.named_children(&mut cursor) {
-                collect_nested_view_literals(arm, source, out);
+                collect_nested_view_literals(arm, source, out, is_route_view);
             }
         }
         // `'a', 'b' => 'x'` / `default => 'y'` — only `return_expression`
         // (the arm's VALUE), never `conditional_expressions` (the keys).
         "match_conditional_expression" | "match_default_expression" => {
             if let Some(value) = node.child_by_field_name("return_expression") {
-                collect_nested_view_literals(value, source, out);
+                collect_nested_view_literals(value, source, out, is_route_view);
             }
         }
         // Transparently unwrap `($cond ? 'a' : 'b')`.
         "parenthesized_expression" => {
             if let Some(inner) = node.named_child(0) {
-                collect_nested_view_literals(inner, source, out);
+                collect_nested_view_literals(inner, source, out, is_route_view);
             }
         }
         _ => {}

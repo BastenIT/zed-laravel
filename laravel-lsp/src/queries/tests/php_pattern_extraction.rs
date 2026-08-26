@@ -129,6 +129,160 @@ fn test_extract_all_php_patterns_views_conditional_argument_skips_interpolated_a
 }
 
 #[test]
+fn test_extract_all_php_patterns_views_elvis_first_argument() {
+    // Elvis `$x ?: 'fallback'` parses as a conditional_expression with NO
+    // `body` field — this exercises the walker's absent-body path.
+    let php_code = r#"<?php
+    return view($x ?: 'pages.fallback');
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(patterns.views[0].view_name, "pages.fallback");
+}
+
+#[test]
+fn test_extract_all_php_patterns_views_parenthesized_conditional_argument() {
+    // The outer parentheses make the argument's direct child a
+    // parenthesized_expression, hiding the conditional from the bare
+    // conditional_expression capture.
+    let php_code = r#"<?php
+    return view(($cond ? 'pages.a' : 'pages.b'));
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    let view_names: Vec<&str> = patterns.views.iter().map(|m| m.view_name).collect();
+    assert_eq!(patterns.views.len(), 2, "got {view_names:?}");
+    assert!(view_names.contains(&"pages.a"));
+    assert!(view_names.contains(&"pages.b"));
+}
+
+#[test]
+fn test_extract_all_php_patterns_views_parenthesized_literal_argument() {
+    // A plain literal wrapped in parentheses is hidden from Pattern 1 too —
+    // it requires the string as a DIRECT child of the argument.
+    let php_code = r#"<?php
+    return view(('pages.home'));
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(patterns.views[0].view_name, "pages.home");
+    assert!(!patterns.views[0].is_route_view);
+}
+
+#[test]
+fn test_extract_all_php_patterns_view_make_ternary_first_argument() {
+    let php_code = r#"<?php
+    return View::make($compact ? 'widgets.small' : 'widgets.large');
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    let view_names: Vec<&str> = patterns.views.iter().map(|m| m.view_name).collect();
+    assert_eq!(patterns.views.len(), 2, "got {view_names:?}");
+    assert!(view_names.contains(&"widgets.small"));
+    assert!(view_names.contains(&"widgets.large"));
+    assert!(patterns.views.iter().all(|v| !v.is_route_view));
+}
+
+#[test]
+fn test_extract_all_php_patterns_view_make_qualified_null_coalesce_argument() {
+    let php_code = r#"<?php
+    return \Illuminate\Support\Facades\View::make($override ?? 'pages.default');
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(patterns.views[0].view_name, "pages.default");
+}
+
+#[test]
+fn test_extract_all_php_patterns_route_view_conditional_second_argument() {
+    // The ternary sits in the SECOND argument (the view name). The bare
+    // (argument) placeholder in the query keeps the route-path argument out:
+    // a ternary in the path must not be captured, so exactly two names come
+    // back and both are the view-argument arms.
+    let php_code = r#"<?php
+    Route::view($legacy ? '/old-home' : '/home', $dark ? 'home.dark' : 'home.light');
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    let view_names: Vec<&str> = patterns.views.iter().map(|m| m.view_name).collect();
+    assert_eq!(
+        patterns.views.len(),
+        2,
+        "only the view-argument arms should be captured, got {view_names:?}"
+    );
+    assert!(view_names.contains(&"home.dark"));
+    assert!(view_names.contains(&"home.light"));
+    assert!(
+        patterns.views.iter().all(|v| v.is_route_view),
+        "Route::view names are route views"
+    );
+}
+
+#[test]
+fn test_extract_all_php_patterns_route_view_parenthesized_literal_second_argument() {
+    let php_code = r#"<?php
+    Route::view('/about', ('pages.about'));
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(patterns.views[0].view_name, "pages.about");
+    assert!(patterns.views[0].is_route_view);
+}
+
+#[test]
+fn test_extract_all_php_patterns_volt_route_match_second_argument() {
+    let php_code = r#"<?php
+    Volt::route('/counter', match ($variant) {
+        'v2' => 'counter.v2',
+        default => 'counter.v1',
+    });
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    let view_names: Vec<&str> = patterns.views.iter().map(|m| m.view_name).collect();
+    assert_eq!(patterns.views.len(), 2, "got {view_names:?}");
+    assert!(view_names.contains(&"counter.v2"));
+    assert!(view_names.contains(&"counter.v1"));
+    assert!(patterns.views.iter().all(|v| v.is_route_view));
+}
+
+#[test]
 fn test_extract_all_php_patterns_env() {
     let php_code = r#"<?php
     $name = env('APP_NAME', 'Laravel');
