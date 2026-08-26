@@ -160,3 +160,31 @@ fn translation_value_truncation_is_char_boundary_safe() {
     assert!(display.ends_with("..."));
     assert!(display.chars().count() <= 50);
 }
+
+/// Regression: a directive whose args carry a second parameter —
+/// `@include('view', ['data' => $x])`, `@lang('key', ['name' => $n])` —
+/// must still yield its first quoted string. The old extractor rejected
+/// any args containing a comma, so goto and the missing-view diagnostic
+/// were dead for every data-carrying directive.
+#[test]
+fn directive_first_string_extraction_survives_data_arguments() {
+    let cases = [
+        (
+            "('ns::pages.editor.block-outline', ['rowBlocks' => $rowBlocks])",
+            Some("ns::pages.editor.block-outline"),
+        ),
+        ("('plain.view')", Some("plain.view")),
+        ("(\"double.quoted\", ['a' => 1])", Some("double.quoted")),
+        // First token not a string literal (condition-first directives are
+        // handled by the second-arg extractor) — must yield None.
+        ("($condition, 'view.name')", None),
+        ("('')", None),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(
+            LaravelLanguageServer::extract_view_from_directive_args(args).as_deref(),
+            expected,
+            "args: {args}"
+        );
+    }
+}

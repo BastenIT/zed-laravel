@@ -9226,15 +9226,20 @@ impl LaravelLanguageServer {
     /// Extract view name from directive arguments
     /// e.g., "('layouts.app')" → "layouts.app"
     fn extract_view_from_directive_args(args: &str) -> Option<String> {
-        // Remove parentheses and quotes
-        let trimmed = args.trim().trim_matches('(').trim_matches(')').trim();
-        let unquoted = trimmed.trim_matches('\'').trim_matches('"');
-
-        if !unquoted.is_empty() && !unquoted.contains(',') {
-            Some(unquoted.to_string())
-        } else {
-            None
-        }
+        // The FIRST quoted string is the name; anything after it (a data
+        // array, replacements, ...) is not part of it. The previous "no
+        // comma anywhere" shape rejected the most common real-world form —
+        // `@include('view', ['data' => $x])` — outright, killing goto and
+        // the missing-view diagnostic for every data-carrying directive.
+        // Returns None when the first token isn't a string literal (e.g.
+        // `@includeWhen($cond, 'view')`, handled by the second-arg path).
+        let trimmed = args.trim().trim_start_matches('(').trim_start();
+        let mut chars = trimmed.char_indices();
+        let (open, quote) = chars.next().filter(|(_, c)| *c == '\'' || *c == '"')?;
+        let rest = &trimmed[open + quote.len_utf8()..];
+        let end = rest.find(quote)?;
+        let name = &rest[..end];
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// Convert kebab-case to PascalCase
