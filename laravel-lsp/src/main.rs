@@ -14569,15 +14569,7 @@ impl LaravelLanguageServer {
                 .trim_end_matches('\'')
                 .trim_end_matches('"');
 
-            // Truncate long values for display. Char-based, not byte-based:
-            // a byte slice panics when index 47 lands inside a multibyte
-            // character (e.g. 'č' in a Czech catalogue).
-            if unquoted.chars().count() > 50 {
-                let truncated: String = unquoted.chars().take(47).collect();
-                format!("{truncated}...")
-            } else {
-                unquoted.to_string()
-            }
+            laravel_lsp::display_truncate::truncate_for_display(unquoted, 200)
         } else {
             String::new()
         }
@@ -14725,17 +14717,7 @@ impl LaravelLanguageServer {
             // Check for env() call pattern: env('VAR_NAME') or env('VAR_NAME', 'default')
             let resolved = Self::resolve_env_value(value, env_vars);
 
-            // Truncate long values for display. Char-based, not byte-based:
-            // a byte slice panics when index 47 lands inside a multibyte
-            // character (e.g. 'ü' in a German config value).
-            let display_value = if resolved.chars().count() > 50 {
-                let truncated: String = resolved.chars().take(47).collect();
-                format!("{truncated}...")
-            } else {
-                resolved
-            };
-
-            display_value
+            laravel_lsp::display_truncate::truncate_for_display(&resolved, 200)
         } else {
             String::new()
         }
@@ -20054,7 +20036,7 @@ return [
         };
         let truncated = value
             .as_deref()
-            .map(|v| laravel_lsp::hover::truncate_for_display(v, 200));
+            .map(|v| laravel_lsp::display_truncate::truncate_for_display(v, 200));
         let trailer = if value.is_none() {
             Some("*(value not found)*")
         } else {
@@ -20125,7 +20107,10 @@ return [
                 r, key, &locale, map_ref,
             ) {
                 Some(res) => Some((
-                    hover::truncate_for_display(&Self::unquote_php_literal(&res.value), 200),
+                    laravel_lsp::display_truncate::truncate_for_display(
+                        &Self::unquote_php_literal(&res.value),
+                        200,
+                    ),
                     self.source_link(&res.source_file, None).await,
                 )),
                 None => None,

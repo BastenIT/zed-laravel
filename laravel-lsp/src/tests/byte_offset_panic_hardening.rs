@@ -220,20 +220,53 @@ fn detect_method_name_position_detects_instance_past_multibyte_char() {
 
 // ---- display-value truncation: char-boundary safety ----------------------
 //
-// `extract_translation_value` and `extract_config_value` both truncated
-// their hover/completion display value with a byte slice (`&s[..47]`). A
-// multibyte character straddling index 47 panicked the whole server — always
-// reachable via any root `lang/` translation value over 50 bytes with a
-// multibyte char at the boundary, not just an exotic namespaced-catalogue
-// case.
+// `extract_translation_value` and `extract_config_value` both used to
+// truncate their hover/completion display value with a byte slice
+// (`&s[..47]`), which panicked whenever a multibyte character straddled
+// index 47 — reachable via any root `lang/` translation value over 50 bytes
+// with a multibyte char at the boundary, not just an exotic namespaced-
+// catalogue case. Both now delegate to the shared, char-safe
+// `display_truncate::truncate_for_display` (also used by `hover.rs`), so the
+// limit is 200 chars, not 47/50, and the ellipsis is the single `…` char.
 
 #[test]
 fn translation_value_truncation_is_char_boundary_safe() {
-    // 46 ASCII chars, then a two-byte 'č' occupying bytes 46..48, then
-    // padding past the 50-char threshold.
-    let value: String = "a".repeat(46) + "čééééééé";
+    // 199 ASCII chars, then a two-byte 'č', then padding well past the
+    // shared 200-char limit. Truncation operates on chars, not bytes, so the
+    // multibyte char at the cut point can't panic.
+    let value: String = "a".repeat(199) + "č" + &"é".repeat(50);
     let line = format!("'key' => '{}',", value);
     let display = LaravelLanguageServer::extract_translation_value(&line);
-    assert!(display.ends_with("..."));
-    assert!(display.chars().count() <= 50);
+    assert!(display.ends_with('…'));
+    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
+}
+
+#[test]
+fn translation_value_under_two_hundred_chars_is_not_truncated() {
+    // A 30-char/60-byte Czech string used to get truncated (and could
+    // panic) under the old byte-slice/50-char threshold; the shared
+    // 200-char, char-based limit now passes it through untouched.
+    let value = "č".repeat(30);
+    let line = format!("'key' => '{}',", value);
+    let display = LaravelLanguageServer::extract_translation_value(&line);
+    assert_eq!(display, value);
+}
+
+#[test]
+fn config_value_truncation_is_char_boundary_safe() {
+    let value: String = "a".repeat(199) + "ü" + &"ö".repeat(50);
+    let line = format!("'key' => '{}',", value);
+    let env_vars = std::collections::HashMap::new();
+    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
+    assert!(display.ends_with('…'));
+    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
+}
+
+#[test]
+fn config_value_under_two_hundred_chars_is_not_truncated() {
+    let value = "ü".repeat(30);
+    let line = format!("'key' => '{}',", value);
+    let env_vars = std::collections::HashMap::new();
+    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
+    assert_eq!(display, value);
 }
