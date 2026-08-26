@@ -1868,6 +1868,32 @@ fn member_access_is_indexed_and_found_at_position() {
     assert!(p.find_at_position(1, 2).is_none());
 }
 
+/// Win 2: `sorted_positions` is a lazily-initialized `OnceLock`, built on
+/// `find_at_position`'s own first call rather than by an explicit
+/// `build_position_index()` beforehand. This is the scenario a disk-cache
+/// restore hits every time (the index is skipped on serialize): the very
+/// first read of a restored `ParsedPatternsData` can be a lookup, with no
+/// eager-build step in between.
+#[test]
+fn find_at_position_lazily_builds_the_index_without_an_explicit_call() {
+    let mut p = ParsedPatternsData::default();
+    p.member_access_refs
+        .push(Arc::new(unresolved_member_access("email", 1, 12)));
+    // Deliberately NOT calling `p.build_position_index()`.
+
+    let found = p
+        .find_at_position(1, 14)
+        .expect("find_at_position must build its own index on first use");
+    match found {
+        PatternAtPosition::MemberAccess(m) => assert_eq!(m.member, "email"),
+        other => panic!("expected MemberAccess, got {other:?}"),
+    }
+
+    // A second call reuses the now-cached index and must agree with the first.
+    assert!(p.find_at_position(1, 2).is_none());
+    assert!(p.find_at_position(1, 14).is_some());
+}
+
 #[test]
 fn member_access_capture_defaults_are_unresolved() {
     let m = unresolved_member_access("email", 1, 12);
@@ -5169,5 +5195,46 @@ class P extends ServiceProvider
             ("one".to_string(), Some(PathBuf::from("/pkg/src/a"))),
             ("two".to_string(), Some(PathBuf::from("/pkg/src/b"))),
         ]
+    );
+}
+
+// ─── SalsaHandle::resize_pattern_cache ────────────────────────────────────
+
+#[tokio::test]
+async fn resize_pattern_cache_grows_capacity_and_keeps_existing_entries() {
+    let handle = SalsaActor::spawn();
+    let path = PathBuf::from("/proj/app/Models/User.php");
+    let data = Arc::new(ParsedPatternsData::default());
+    handle
+        .bulk_import_patterns(vec![(path.clone(), data)])
+        .await
+        .unwrap();
+
+    let before = handle.pattern_cache().capacity();
+    handle.resize_pattern_cache(before + 5_000);
+    let after = handle.pattern_cache().capacity();
+
+    assert!(
+        after >= before + 5_000,
+        "resize must grow capacity to at least the requested target (+ padding), got {before} -> {after}"
+    );
+    assert!(
+        handle.pattern_cache().contains_key(&path),
+        "an entry present before the resize must survive the table swap"
+    );
+}
+
+#[tokio::test]
+async fn resize_pattern_cache_is_a_no_op_once_already_big_enough() {
+    let handle = SalsaActor::spawn();
+    handle.resize_pattern_cache(10_000);
+    let grown = handle.pattern_cache().capacity();
+
+    // A smaller request must not shrink or rebuild an already-adequate table.
+    handle.resize_pattern_cache(10);
+    assert_eq!(
+        handle.pattern_cache().capacity(),
+        grown,
+        "resize must not rebuild the table when it's already big enough"
     );
 }

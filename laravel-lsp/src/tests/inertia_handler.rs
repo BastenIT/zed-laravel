@@ -71,7 +71,8 @@ fn inertia_config(root: PathBuf) -> LaravelConfigData {
 async fn goto_backend(root: &Path) -> LaravelLanguageServer {
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
-    *backend.cached_config.write().await = Some(inertia_config(root.to_path_buf()));
+    *backend.cached_config.write().await =
+        Some(std::sync::Arc::new(inertia_config(root.to_path_buf())));
     backend
 }
 
@@ -88,7 +89,8 @@ async fn goto_backend(root: &Path) -> LaravelLanguageServer {
 async fn goto_backend_with_dominant(root: &Path, dominant_ext: &str) -> LaravelLanguageServer {
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
-    *backend.cached_config.write().await = Some(inertia_config(root.to_path_buf()));
+    *backend.cached_config.write().await =
+        Some(std::sync::Arc::new(inertia_config(root.to_path_buf())));
     *backend.inertia_default_ext.write().await = Some(Some(dominant_ext.to_string()));
     backend
 }

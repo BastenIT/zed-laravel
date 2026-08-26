@@ -39,6 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::laravel_introspector::walker::{self, PhpMethodInfo, PhpPropertyInfo, PhpStructureKind};
 use crate::query_chain::use_aliases::{self, UseAliases};
@@ -169,7 +170,11 @@ pub fn surface_map_diff(old: &HashMap<String, u64>, new: &HashMap<String, u64>) 
 /// Inverted class-hierarchy index. Owned by the actor; never shared.
 #[derive(Default, Debug)]
 pub struct ClassHierarchyIndex {
-    classes: HashMap<String, ClassNode>,
+    /// `Arc`-wrapped so [`Self::nodes_by_file`] (the disk-cache save snapshot,
+    /// taken for the WHOLE project at once) can hand out cheap ref-count
+    /// bumps instead of deep-cloning every `ClassNode` — the clone had been a
+    /// measured ~40MB save-time peak on a large project.
+    classes: HashMap<String, Arc<ClassNode>>,
     /// interface FQCN → classes that implement it (direct).
     implementers: HashMap<String, Vec<String>>,
     /// trait FQCN → classes that `use` it (direct).
@@ -212,7 +217,7 @@ impl ClassHierarchyIndex {
                     .or_default()
                     .push(fqcn.clone());
             }
-            self.classes.insert(fqcn.clone(), node);
+            self.classes.insert(fqcn.clone(), Arc::new(node));
             fqcns.push(fqcn);
         }
         self.by_file.insert(path.to_path_buf(), fqcns);
@@ -271,7 +276,7 @@ impl ClassHierarchyIndex {
 
     /// The declaration node for a class FQCN, if indexed.
     pub fn get(&self, fqcn: &str) -> Option<&ClassNode> {
-        self.classes.get(fqcn)
+        self.classes.get(fqcn).map(Arc::as_ref)
     }
 
     /// Snapshot the `fqcn → declaring file` mapping. The magic-member index
@@ -288,13 +293,20 @@ impl ClassHierarchyIndex {
     /// Group every indexed class by its declaring file. Used to persist the
     /// hierarchy alongside the pattern cache so it survives a warm restart
     /// (the index is otherwise only populated by fresh parses).
-    pub fn nodes_by_file(&self) -> std::collections::HashMap<PathBuf, Vec<ClassNode>> {
-        let mut map: std::collections::HashMap<PathBuf, Vec<ClassNode>> =
+    ///
+    /// Returns `Arc<ClassNode>` (cheap ref-count bumps, sharing the SAME
+    /// allocations `classes` owns) rather than cloning every node — this
+    /// snapshot covers the WHOLE project, so a deep clone here was the
+    /// dominant cost of a disk-cache save (~40MB peak). The disk-cache save
+    /// path serializes through `Arc<ClassNode>` directly (serde's `rc`
+    /// feature), so the wire format is unaffected.
+    pub fn nodes_by_file(&self) -> std::collections::HashMap<PathBuf, Vec<Arc<ClassNode>>> {
+        let mut map: std::collections::HashMap<PathBuf, Vec<Arc<ClassNode>>> =
             std::collections::HashMap::new();
         for node in self.classes.values() {
             map.entry(node.file_path.clone())
                 .or_default()
-                .push(node.clone());
+                .push(Arc::clone(node));
         }
         map
     }

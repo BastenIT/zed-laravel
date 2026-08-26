@@ -631,3 +631,77 @@ fn magic_members_export_round_trips_insert() {
     assert_eq!(a_entries[1].member, "posts");
     assert_eq!(export.get(&b).unwrap().len(), 1);
 }
+
+// ─── class_refs are indexed regardless of vendor status ──────────────────
+
+/// `ParsedPatternsData` with a single class ref (as a Blade `@use`, a plain
+/// PHP `use`, or a Volt front-matter import would produce).
+fn class_fixture(name: &str) -> ParsedPatternsData {
+    let mut d = ParsedPatternsData::default();
+    d.class_refs
+        .push(Arc::new(crate::salsa_impl::ClassReferenceData {
+            name: name.to_string(),
+            line: 2,
+            column: 4,
+            end_column: 4 + name.len() as u32,
+        }));
+    d
+}
+
+#[test]
+fn vendor_class_refs_are_indexed() {
+    // Vendor `use` imports are the only recorded evidence that a vendor
+    // class depends on another class (extends/implements aren't indexed
+    // anywhere) — find-references on a class must surface them, which
+    // matters most for path-repository package development under vendor/.
+    let mut idx = SymbolIndex::default();
+    let vendor_path = PathBuf::from("/proj/vendor/acme/pkg/src/Consumer.php");
+    idx.insert_file(&vendor_path, &class_fixture("App\\Models\\User"));
+
+    let hits = idx.find(&SymbolRefData::Class("App\\Models\\User".into()));
+    assert_eq!(hits.len(), 1, "a vendor file's `use` must be indexed");
+    assert_eq!(hits[0].file_path, vendor_path);
+    assert_eq!(idx.indexed_file_count(), 1);
+}
+
+#[test]
+fn non_vendor_class_refs_are_still_indexed() {
+    let mut idx = SymbolIndex::default();
+    let app_path = PathBuf::from("/proj/app/Http/Controllers/UserController.php");
+    idx.insert_file(&app_path, &class_fixture("App\\Models\\User"));
+
+    let hits = idx.find(&SymbolRefData::Class("App\\Models\\User".into()));
+    assert_eq!(hits.len(), 1, "non-vendor class refs must still be indexed");
+    assert_eq!(hits[0].file_path, app_path);
+}
+
+// ─── `by_file` shares its `SymbolKey`s with `forward` ────────────────────
+
+#[test]
+fn by_file_and_forward_share_the_same_key_allocation() {
+    // Two files referencing the same view name must not each allocate their
+    // own `SymbolKey` — `by_file`'s entries should be the SAME `Arc` `forward`
+    // uses as its map key, for both the first-seen file and every later one.
+    let mut idx = SymbolIndex::default();
+    let a = PathBuf::from("/proj/a.php");
+    let b = PathBuf::from("/proj/b.php");
+    idx.insert_file(&a, &fixture("shared-view", "route-a"));
+    idx.insert_file(&b, &fixture("shared-view", "route-b"));
+
+    let (forward_key, _) = idx
+        .forward
+        .iter()
+        .find(|(k, _)| k.kind == SymbolKind::View && k.name == "shared-view")
+        .expect("shared-view must be indexed");
+
+    for path in [&a, &b] {
+        let by_file_key = idx.by_file[path]
+            .iter()
+            .find(|k| k.kind == SymbolKind::View && k.name == "shared-view")
+            .expect("by_file must record the shared-view key");
+        assert!(
+            Arc::ptr_eq(forward_key, by_file_key),
+            "by_file's key for {path:?} must be the SAME allocation forward uses, not a copy"
+        );
+    }
+}
