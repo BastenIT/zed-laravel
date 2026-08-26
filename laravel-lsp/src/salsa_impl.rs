@@ -15,9 +15,10 @@ use salsa::Setter;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tower_lsp::lsp_types::Url;
 use tracing::{debug, info};
 
 use crate::config::kebab_to_pascal_case;
@@ -5559,6 +5560,13 @@ pub struct SalsaHandle {
     /// rather than a plain `Arc<DashMap>`.
     pattern_cache:
         Arc<std::sync::RwLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
+    /// The server's open-document map (URI → (text, version)). `None` until
+    /// `set_documents` publishes it — every existing `spawn()` call site
+    /// (mostly tests) still compiles unchanged; an unset map is treated as
+    /// "no open buffers", i.e. the pre-fix behaviour. See
+    /// `SalsaActor::documents` for the shared-allocation rationale and
+    /// `bulk_import_patterns` for the one consumer that matters.
+    documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>>,
 }
 
 impl SalsaHandle {
@@ -5615,6 +5623,39 @@ impl SalsaHandle {
             resized.insert(entry.key().clone(), entry.value().clone());
         }
         *current = Arc::new(resized);
+    }
+
+    /// Publish the server's open-document map into the salsa layer. Call
+    /// once at startup, right after `SalsaActor::spawn()` — mirrors how
+    /// `pattern_cache` above is a single shared cell handed to both sides
+    /// at construction. Kept as a post-construction setter (instead of a
+    /// `spawn()` parameter) because `spawn()` has many call sites, mostly
+    /// tests, that don't have a documents map to hand it. A second call is
+    /// a no-op — `OnceLock` refuses to overwrite — since only server
+    /// startup should ever publish this.
+    pub fn set_documents(&self, documents: Arc<RwLock<HashMap<Url, (String, i32)>>>) {
+        if self.documents.set(documents).is_err() {
+            debug!("SalsaHandle::set_documents called more than once; ignoring");
+        }
+    }
+
+    /// Snapshot the paths of every currently open buffer as a `HashSet`,
+    /// once, for O(1) membership checks. The sole consumer is
+    /// `bulk_import_patterns`, which must not let a disk-parsed warm entry
+    /// overwrite a path the user has open (and possibly edited) — see
+    /// there. Called from async context (the warming task that calls
+    /// `bulk_import_patterns` is itself a `tokio::spawn`ed future, not the
+    /// actor thread), so a plain `.read().await` is correct here.
+    async fn open_buffer_paths(&self) -> std::collections::HashSet<PathBuf> {
+        match self.documents.get() {
+            Some(documents) => documents
+                .read()
+                .await
+                .keys()
+                .filter_map(|uri| uri.to_file_path().ok())
+                .collect(),
+            None => std::collections::HashSet::new(),
+        }
     }
 
     /// Update or create a file in the database
@@ -5991,13 +6032,29 @@ impl SalsaHandle {
     /// Real-world cost: ~7ms for 40,589 entries (per earlier bench).
     /// The `async fn` and `Result` shape is preserved for source
     /// compatibility with the existing call sites.
+    ///
+    /// **Open buffers are skipped.** Entries here are parsed from DISK, so
+    /// unconditionally inserting would silently overwrite the pattern-cache
+    /// entry for a file the user has open with unsaved edits — goto/hover
+    /// then serve stale positions in exactly the files being worked on,
+    /// until the next keystroke re-parses it. The open path is read from
+    /// `documents` (published via `set_documents`) into a `HashSet` ONCE,
+    /// not per-entry, to stay inside the ~7ms budget above. A skipped path
+    /// simply keeps whatever's already in the cache (or nothing, forcing a
+    /// lazy re-parse from the live Salsa buffer on the next `get_patterns`
+    /// call) — its own `did_open`/`did_change` path is what keeps its entry
+    /// current.
     pub async fn bulk_import_patterns(
         &self,
         entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
     ) -> Result<usize, &'static str> {
         let total = entries.len();
+        let open_paths = self.open_buffer_paths().await;
         let cache = self.pattern_cache.read().unwrap();
         for (path, data) in entries {
+            if open_paths.contains(&path) {
+                continue;
+            }
             cache.insert(path, (0, data));
         }
         Ok(total)
@@ -6988,6 +7045,16 @@ pub struct SalsaActor {
     /// negligible next to a DashMap shard lock or a tree-sitter parse.
     pattern_cache:
         Arc<std::sync::RwLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
+    /// The server's open-document map (URI → (text, version)), published
+    /// once via `SalsaHandle::set_documents` after `spawn()` returns. SAME
+    /// `Arc<OnceLock<_>>` allocation as `SalsaHandle::documents` — see there
+    /// for why this exists and why it's a `OnceLock` rather than a
+    /// constructor parameter. Read with `blocking_read()` in
+    /// `BulkImportPatterns`: this struct lives on the actor's dedicated
+    /// `std::thread::spawn` thread (`run`, below), never polled by the
+    /// tokio runtime, so a blocking read is the correct (and only
+    /// available) primitive here.
+    documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>>,
     /// LRU cache of parsed Blade loop blocks, keyed by file path + version.
     /// Salsa already memoizes the underlying query, but caching the Arc avoids
     /// re-walking the query graph on every diagnostic / completion request.
@@ -7151,6 +7218,15 @@ impl SalsaActor {
         )));
         let pattern_cache_for_actor = pattern_cache.clone();
 
+        // Published post-construction via `SalsaHandle::set_documents` (the
+        // server's `documents` map isn't available yet here — see the field
+        // doc comment on `SalsaActor::documents`). Both structs below share
+        // this SAME `Arc<OnceLock<_>>`, so a single `set()` through either
+        // handle publishes it to both at once.
+        let documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>> =
+            Arc::new(OnceLock::new());
+        let documents_for_actor = documents.clone();
+
         std::thread::spawn(move || {
             let mut actor = SalsaActor {
                 db: LaravelDatabase::new(),
@@ -7158,6 +7234,7 @@ impl SalsaActor {
                 // Pre-allocate with reasonable capacity to avoid early reallocations
                 files: HashMap::with_capacity(64),
                 pattern_cache: pattern_cache_for_actor,
+                documents: documents_for_actor,
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
@@ -7211,6 +7288,25 @@ impl SalsaActor {
         SalsaHandle {
             sender: tx,
             pattern_cache,
+            documents,
+        }
+    }
+
+    /// Synchronous counterpart to `SalsaHandle::open_buffer_paths`, for the
+    /// dead-fallback `BulkImportPatterns` message handler below. This runs
+    /// inside `run()`, on the actor's dedicated `std::thread::spawn` thread
+    /// — never polled by the tokio runtime — so `blocking_read()` is the
+    /// correct primitive: there's no `.await` available (this isn't an
+    /// async fn) and, unlike on a tokio worker thread, nothing here can
+    /// deadlock the runtime by blocking.
+    fn open_buffer_paths_blocking(&self) -> std::collections::HashSet<PathBuf> {
+        match self.documents.get() {
+            Some(documents) => documents
+                .blocking_read()
+                .keys()
+                .filter_map(|uri| uri.to_file_path().ok())
+                .collect(),
+            None => std::collections::HashSet::new(),
         }
     }
 
@@ -7395,10 +7491,17 @@ impl SalsaActor {
                 // pattern_cache via SalsaHandle::bulk_import_patterns
                 // (which does NOT round-trip through this actor channel).
                 // See SalsaActor::pattern_cache for the architectural why.
+                // Guarded the same way as that real path (open buffers
+                // skipped) so the two can't drift apart if this fallback
+                // ever does get exercised.
                 SalsaRequest::BulkImportPatterns { entries, reply } => {
                     let total = entries.len();
+                    let open_paths = self.open_buffer_paths_blocking();
                     let cache = self.pattern_cache.read().unwrap();
                     for (path, data) in entries {
+                        if open_paths.contains(&path) {
+                            continue;
+                        }
                         cache.insert(path, (0, data));
                     }
                     let _ = reply.send(total);
