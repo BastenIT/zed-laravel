@@ -4783,15 +4783,23 @@ pub struct ParsedPatternsData {
     /// re-parse anyway.
     #[serde(default)]
     pub class_refs: Vec<Arc<ClassReferenceData>>,
-    /// Sorted index of all patterns by (line, column) for O(log n) lookup.
-    /// Skipped during (de)serialization — when loading from the on-disk
-    /// cache, the caller must invoke `build_position_index()` to rebuild
-    /// this. We don't persist it because (a) it duplicates data already
-    /// in the Vec fields above, (b) rebuilding is O(n log n) and fast,
-    /// and (c) PatternAtPosition's Arc fields would deserialize as
-    /// independent allocations, which is wasteful.
+    /// 100% derived from the Vec fields above and read by exactly one caller,
+    /// `find_at_position`, for exactly one file at a time — the one the
+    /// cursor is currently in. Built LAZILY on that call's first invocation
+    /// rather than eagerly at parse time: a large project parses/restores
+    /// tens of thousands of `ParsedPatternsData`, and eagerly sorting every
+    /// one of them (most of which the cursor never visits in a session) was
+    /// wasted CPU and ~23MB of Vec allocations that outlive their only reader.
+    ///
+    /// Skipped during (de)serialization — restoring from the on-disk cache
+    /// leaves this empty, and the next `find_at_position` call on a restored
+    /// entry builds it on demand, same as a freshly parsed one. We don't
+    /// persist it because (a) it duplicates data already in the Vec fields
+    /// above, (b) rebuilding is O(n log n) and fast, and (c)
+    /// PatternAtPosition's Arc fields would deserialize as independent
+    /// allocations, which is wasteful.
     #[serde(skip)]
-    sorted_positions: Vec<PositionEntry>,
+    sorted_positions: std::sync::OnceLock<Vec<PositionEntry>>,
 }
 
 /// A pattern found at a specific cursor position
@@ -4833,9 +4841,11 @@ pub enum PatternAtPosition {
 }
 
 impl ParsedPatternsData {
-    /// Build the sorted position index from all pattern vectors
-    /// This should be called after populating the pattern vectors
-    pub fn build_position_index(&mut self) {
+    /// Compute the sorted (line, column) position index from the pattern
+    /// vectors. Pure function of `&self` — this is what `find_at_position`
+    /// runs as the `OnceLock` initializer on its first call for a file, and
+    /// what `build_position_index` runs to force-populate it eagerly.
+    fn compute_position_index(&self) -> Vec<PositionEntry> {
         let mut entries = Vec::new();
 
         // Add all patterns to the index
@@ -5013,21 +5023,39 @@ impl ParsedPatternsData {
         // Sort by (line, column) for efficient binary search
         entries.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.column.cmp(&b.column)));
 
-        self.sorted_positions = entries;
+        entries
     }
 
-    /// Find a pattern at the given cursor position (line, column)
-    /// Uses binary search for O(log n) lookup to find the line, then linear scan within line
+    /// Force-build (or rebuild) the sorted position index right now,
+    /// overwriting anything already cached in `sorted_positions`. Nothing in
+    /// production calls this any more: `find_at_position` builds the index
+    /// lazily on its own first call, so it's paid only for files the cursor
+    /// actually visits. Kept for callers (mostly tests) that want the index
+    /// populated up front rather than on first lookup.
+    pub fn build_position_index(&mut self) {
+        let entries = self.compute_position_index();
+        self.sorted_positions = std::sync::OnceLock::from(entries);
+    }
+
+    /// Find a pattern at the given cursor position (line, column).
+    /// Lazily builds `sorted_positions` on the first call for this
+    /// `ParsedPatternsData` (see the field's doc comment), then uses binary
+    /// search for O(log n) lookup to find the line, and a linear scan within
+    /// the line for the matching column range.
     pub fn find_at_position(&self, line: u32, column: u32) -> Option<PatternAtPosition> {
-        if self.sorted_positions.is_empty() {
+        let sorted_positions = self
+            .sorted_positions
+            .get_or_init(|| self.compute_position_index());
+
+        if sorted_positions.is_empty() {
             return None;
         }
 
         // Binary search to find the first entry on or after target line
-        let start_idx = self.sorted_positions.partition_point(|e| e.line < line);
+        let start_idx = sorted_positions.partition_point(|e| e.line < line);
 
         // Scan entries on this line
-        for entry in &self.sorted_positions[start_idx..] {
+        for entry in &sorted_positions[start_idx..] {
             // Stop when we've passed the target line
             if entry.line > line {
                 break;
@@ -5268,7 +5296,7 @@ pub enum SalsaRequest {
     /// the hierarchy to the disk cache.
     SnapshotHierarchyNodes {
         reply: oneshot::Sender<
-            std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+            std::collections::HashMap<PathBuf, Vec<Arc<crate::class_hierarchy_index::ClassNode>>>,
         >,
     },
     /// Surface signatures (`fqcn → u64`) for every class `path` declares.
@@ -5512,12 +5540,22 @@ pub enum SalsaRequest {
 #[derive(Clone)]
 pub struct SalsaHandle {
     sender: mpsc::Sender<SalsaRequest>,
-    /// Shared concurrent pattern cache — same `Arc<DashMap>` the actor
-    /// holds. Reads and writes from here NEVER go through the actor's
-    /// mpsc channel, which means they're never blocked behind a slow
-    /// handler. See the comment on `SalsaActor::pattern_cache` for why
-    /// this exists.
-    pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
+    /// Publication slot for the shared concurrent pattern cache. Reads and
+    /// writes through it NEVER go through the actor's mpsc channel, which
+    /// means they're never blocked behind a slow handler. See the comment on
+    /// `SalsaActor::pattern_cache` for why that matters.
+    ///
+    /// Empty until the actor finishes its first project walk and publishes a
+    /// table sized for the real file count (see
+    /// `SalsaActor::size_and_publish_pattern_cache`). A `OnceLock` rather
+    /// than a plain `Arc<DashMap>` handed out at `spawn()` because the
+    /// capacity isn't knowable that early — and a `OnceLock` rather than a
+    /// swappable `RwLock<Arc<DashMap>>` because a swap would silently split
+    /// a long-lived caller (warming holds this `Arc` for minutes) from the
+    /// table the actor is writing to. Published exactly once, so an `Arc`
+    /// taken from here is the live table for the rest of the session.
+    pattern_cache:
+        Arc<std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
     /// The server's open-document map (URI → (text, version)). `None` until
     /// `set_documents` publishes it — every existing `spawn()` call site
     /// (25+, mostly tests) still compiles unchanged; an unset map is
@@ -5529,12 +5567,20 @@ pub struct SalsaHandle {
 
 impl SalsaHandle {
     /// Borrow the shared pattern cache directly. The on-disk cache module
-    /// uses this to pre-load entries before warming starts, and to read
-    /// them back out after warming completes for persistence. Returned
-    /// `Arc` is cheap to clone — the underlying `DashMap` is the same
-    /// instance the actor reads from in `handle_get_patterns`.
-    pub fn pattern_cache(&self) -> Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> {
-        self.pattern_cache.clone()
+    /// uses this to pre-load entries before warming starts, and to read them
+    /// back out after warming completes for persistence. The returned `Arc`
+    /// is cheap to clone and points at the same `DashMap` instance the actor
+    /// reads from in `handle_get_patterns` — for the rest of the session, not
+    /// just for the moment of this call.
+    ///
+    /// `None` until the actor has walked a project and published the table
+    /// (see `SalsaActor::size_and_publish_pattern_cache`). Callers that run
+    /// before project registration — or in a test/tooling instance that never
+    /// registers one — must handle that rather than assume a cache exists.
+    pub fn pattern_cache(
+        &self,
+    ) -> Option<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>> {
+        self.pattern_cache.get().cloned()
     }
 
     /// Publish the server's open-document map into the salsa layer. Call
@@ -5945,6 +5991,11 @@ impl SalsaHandle {
     /// The `async fn` and `Result` shape is preserved for source
     /// compatibility with the existing call sites.
     ///
+    /// Errors if the actor hasn't published the cache yet. Every caller is on
+    /// the warming path, which only runs after project registration, so this
+    /// should be unreachable — but dropping the batch loudly beats inserting
+    /// it into a table nothing else can see.
+    ///
     /// **Open buffers are skipped.** Entries here are parsed from DISK, so
     /// unconditionally inserting would silently overwrite the pattern-cache
     /// entry for a file the user has open with unsaved edits — goto/hover
@@ -5960,13 +6011,17 @@ impl SalsaHandle {
         &self,
         entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
     ) -> Result<usize, &'static str> {
+        let cache = self
+            .pattern_cache
+            .get()
+            .ok_or("pattern cache not published — no project registered yet")?;
         let total = entries.len();
         let open_paths = self.open_buffer_paths().await;
         for (path, data) in entries {
             if open_paths.contains(&path) {
                 continue;
             }
-            self.pattern_cache.insert(path, (0, data));
+            cache.insert(path, (0, data));
         }
         Ok(total)
     }
@@ -6178,7 +6233,7 @@ impl SalsaHandle {
     pub async fn snapshot_hierarchy_nodes(
         &self,
     ) -> Result<
-        std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+        std::collections::HashMap<PathBuf, Vec<Arc<crate::class_hierarchy_index::ClassNode>>>,
         &'static str,
     > {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -6938,10 +6993,27 @@ pub struct SalsaActor {
     /// no reason they should serialize through the actor.
     ///
     /// DashMap is lock-free for reads and uses per-shard locks for writes
-    /// (16 shards by default), so contention between the actor's read path
-    /// and warming's bulk insert is negligible. ~5KB per entry × 65k cap
-    /// = ~320MB worst case. Cap enforced manually on insert.
+    /// (`(available_parallelism * 4).next_power_of_two()` shards by default —
+    /// 64 on a typical 10-to-16-core dev machine), so contention between the
+    /// actor's read path and warming's bulk insert is negligible. There is no
+    /// cap: it holds exactly one entry per indexed file (app + vendor), so its
+    /// size is whatever the project's file count makes it — on a large project
+    /// that's tens of thousands of entries, several hundred MB total. Wins
+    /// like dropping vendor `member_access_refs` at parse time (see
+    /// `pattern_indexer`'s vendor gate) shrink the PER-ENTRY cost; nothing
+    /// here bounds the ENTRY COUNT.
+    ///
+    /// Replaced exactly once, by `size_and_publish_pattern_cache`, with a
+    /// table pre-sized for the project's real file count — dashmap 6.x has no
+    /// `reserve`, so growing the table means building a new one. That happens
+    /// before the table is ever published to a `SalsaHandle`, so no other
+    /// holder can be left pointing at the discarded one.
     pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
+    /// The slot every `SalsaHandle` reads `pattern_cache` out of. Filled by
+    /// `size_and_publish_pattern_cache` once the first project walk knows how
+    /// big the table should be; see `SalsaHandle::pattern_cache`.
+    pattern_cache_slot:
+        Arc<std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
     /// The server's open-document map (URI → (text, version)), published
     /// once via `SalsaHandle::set_documents` after `spawn()` returns. SAME
     /// `Arc<OnceLock<_>>` allocation as `SalsaHandle::documents` — see there
@@ -7077,17 +7149,33 @@ pub struct SalsaActor {
     salsa_sp_root: Option<PathBuf>,
 }
 
+/// Bootstrap capacity for the pattern cache, used only until
+/// [`SalsaActor::size_and_publish_pattern_cache`] sizes it for real (see that
+/// method and [`SalsaActor::spawn`]).
+const PATTERN_CACHE_INITIAL_CAPACITY: usize = 1024;
+
+/// Headroom added on top of the discovered file count when
+/// [`SalsaActor::size_and_publish_pattern_cache`] sizes the pattern cache —
+/// covers files that appear afterwards without forcing an immediate rehash
+/// (a `composer update`, new app files created mid-session).
+const PATTERN_CACHE_CAPACITY_PADDING: usize = 1000;
+
 impl SalsaActor {
     /// Spawn the actor on a dedicated thread and return a handle for communication
     pub fn spawn() -> SalsaHandle {
         let (tx, rx) = mpsc::channel(256);
 
-        // Shared pattern cache: created here, cloned into both the actor
-        // and the SalsaHandle. Both ends use the SAME map so writes from
-        // either side are immediately visible on the other.
-        let pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> =
-            Arc::new(dashmap::DashMap::with_capacity(65536));
-        let pattern_cache_for_actor = pattern_cache.clone();
+        // The pattern cache is published to handles through this slot rather
+        // than handed out here, because `spawn()` runs before any project is
+        // known — the LSP server is constructed at this point, before
+        // `initialize` carries a workspace root — so there's no file count to
+        // size a table against yet. `handle_register_project_files` fills the
+        // slot once its walk knows the count. A short-lived test/tooling
+        // instance that never registers a project simply never fills it.
+        let pattern_cache_slot: Arc<
+            std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>,
+        > = Arc::new(std::sync::OnceLock::new());
+        let pattern_cache_slot_for_actor = pattern_cache_slot.clone();
 
         // Published post-construction via `SalsaHandle::set_documents` (the
         // server's `documents` map isn't available yet here — see the field
@@ -7104,7 +7192,14 @@ impl SalsaActor {
                 receiver: rx,
                 // Pre-allocate with reasonable capacity to avoid early reallocations
                 files: HashMap::with_capacity(64),
-                pattern_cache: pattern_cache_for_actor,
+                // Bootstrap table, big enough for the handful of `didOpen`
+                // buffers an editor may send before registration finishes.
+                // Replaced with a correctly-sized one — carrying those
+                // entries over — by `size_and_publish_pattern_cache`.
+                pattern_cache: Arc::new(dashmap::DashMap::with_capacity(
+                    PATTERN_CACHE_INITIAL_CAPACITY,
+                )),
+                pattern_cache_slot: pattern_cache_slot_for_actor,
                 documents: documents_for_actor,
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
@@ -7158,7 +7253,7 @@ impl SalsaActor {
 
         SalsaHandle {
             sender: tx,
-            pattern_cache,
+            pattern_cache: pattern_cache_slot,
             documents,
         }
     }
@@ -7248,7 +7343,9 @@ impl SalsaActor {
                     // pushing into HashMaps — no parsing). Clear first
                     // so we start from a known state.
                     self.symbol_index.clear();
-                    let cache = self.pattern_cache.clone();
+                    // Cloned so the iteration below borrows the Arc, not `self` —
+                    // `insert_file` needs `&mut self.symbol_index` at the same time.
+                    let cache = Arc::clone(&self.pattern_cache);
                     for entry in cache.iter() {
                         let path = entry.key();
                         let (_, ref patterns) = *entry.value();
@@ -7537,7 +7634,10 @@ impl SalsaActor {
                     // freshly resolved magic members. `remove_file` clears both
                     // kinds, so re-inserting literals here keeps them alive.
                     self.symbol_index.remove_file(&path);
-                    if let Some(cached) = self.pattern_cache.get(&path) {
+                    // Cloned so the lookup borrows the Arc, not `self` — `insert_file`
+                    // needs `&mut self.symbol_index` while the Ref guard is alive.
+                    let cache = Arc::clone(&self.pattern_cache);
+                    if let Some(cached) = cache.get(&path) {
                         let (_, ref patterns) = *cached;
                         self.symbol_index.insert_file(&path, patterns);
                     }
@@ -7935,12 +8035,14 @@ impl SalsaActor {
         // we don't need a Salsa SourceFile input to serve cached
         // patterns.
         //
-        // DashMap::get returns a Ref guard; clone the Arc out and drop
-        // the guard so we don't hold a shard lock across the return.
-        if let Some(entry) = self.pattern_cache.get(path) {
+        // DashMap::get returns a Ref guard holding a shard lock; clone the
+        // Arc out and let the guard drop at the end of this statement, so
+        // it's never held across the `&mut self` work below.
+        let hit = self.pattern_cache.get(path).map(|entry| {
             let (_, cached_data) = entry.value();
-            let data = Arc::clone(cached_data);
-            drop(entry);
+            Arc::clone(cached_data)
+        });
+        if let Some(data) = hit {
             debug!("✅ Cache HIT for {} ({:?})", file_name, start.elapsed());
             return Some(data);
         }
@@ -8495,7 +8597,7 @@ impl SalsaActor {
             // Populated below once `data` is in hand — capture needs the final
             // `member_access_refs` (parallel `sites`) and reuses the PHP tree.
             member_context: None,
-            sorted_positions: Vec::new(),
+            sorted_positions: std::sync::OnceLock::new(),
         };
 
         // M1 single-parse capture: compile this file's own-source resolution
@@ -8516,8 +8618,10 @@ impl SalsaActor {
             .map(Box::new);
         }
 
-        // Build the sorted position index for O(log n) lookups
-        data.build_position_index();
+        // Win 2: `sorted_positions` is built lazily on first `find_at_position`
+        // call, not here — this parse runs on every `handle_get_patterns`
+        // request (diagnostics, symbols, hovers, …), most of which never
+        // look up a cursor position at all.
 
         // Wrap in Arc for efficient sharing
         let data = Arc::new(data);
@@ -8979,6 +9083,67 @@ impl SalsaActor {
             self.livewire_files.clone(),
             self.route_files.clone(),
         ));
+
+        // The buckets above are the only file-count signal in the process,
+        // and this is the moment they're complete — size the pattern cache
+        // from them before anything bulk-inserts into it.
+        self.size_and_publish_pattern_cache();
+    }
+
+    /// Number of distinct files the project walk discovered. Supersets the
+    /// categorized buckets (`source_files` covers all non-vendor code, and the
+    /// controller/view/livewire/route lists overlap it), so the union is
+    /// deduplicated — on borrowed paths, which costs a hash per entry and no
+    /// `PathBuf` allocations.
+    fn project_file_count(&self) -> usize {
+        let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        self.source_files
+            .iter()
+            .chain(self.controller_files.iter())
+            .chain(self.view_files.iter())
+            .chain(self.livewire_files.iter())
+            .chain(self.route_files.iter())
+            .chain(self.vendor_files.iter())
+            .filter(|p| seen.insert(p.as_path()))
+            .count()
+    }
+
+    /// Replace the bootstrap pattern cache with one sized for the project just
+    /// walked, then publish it to every [`SalsaHandle`].
+    ///
+    /// dashmap 6.x has no `reserve` — growing a `DashMap`'s table means
+    /// building a new one — so this runs BEFORE the table is shared, and only
+    /// ever once. Both halves of that matter:
+    ///
+    /// * **Before sharing.** The disk-cache load and warming's bulk import
+    ///   hold their `Arc` for the whole indexing pass; if the table could be
+    ///   swapped underneath them they'd read one map while the actor wrote to
+    ///   another. Sizing first and publishing second makes that unreachable
+    ///   rather than merely unlikely.
+    /// * **Only once.** A mid-session re-registration (a project-root change)
+    ///   leaves the existing table in place: [`PATTERN_CACHE_CAPACITY_PADDING`]
+    ///   absorbs ordinary growth, and organic per-shard rehashing beyond that
+    ///   is far cheaper than the alternative of a swap.
+    ///
+    /// Any entries already present — an editor may send `didOpen` for open
+    /// buffers before registration finishes — are migrated, not dropped.
+    fn size_and_publish_pattern_cache(&mut self) {
+        if self.pattern_cache_slot.get().is_some() {
+            return;
+        }
+
+        let target_capacity = self
+            .project_file_count()
+            .saturating_add(PATTERN_CACHE_CAPACITY_PADDING);
+        if self.pattern_cache.capacity() < target_capacity {
+            let sized = dashmap::DashMap::with_capacity(target_capacity);
+            for entry in self.pattern_cache.iter() {
+                sized.insert(entry.key().clone(), entry.value().clone());
+            }
+            self.pattern_cache = Arc::new(sized);
+        }
+
+        let _ = self.pattern_cache_slot.set(Arc::clone(&self.pattern_cache));
     }
 
     /// Ensure a file is registered with Salsa (read from disk if needed)

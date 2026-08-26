@@ -78,7 +78,7 @@ fn view_ref(name: &str) -> ViewReferenceData {
 /// Seed `config` as the cached config so `get_cached_config` returns it without
 /// touching Salsa.
 async fn seed(server: &LaravelLanguageServer, config: LaravelConfigData) {
-    *server.cached_config.write().await = Some(config);
+    *server.cached_config.write().await = Some(std::sync::Arc::new(config));
 }
 
 /// Write `contents` to `path`, creating parent directories as needed.

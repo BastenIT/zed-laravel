@@ -38,6 +38,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::salsa_impl::{ParsedPatternsData, ReferenceLocationData, SymbolRefData};
 
@@ -54,7 +55,9 @@ pub enum SymbolKind {
     Livewire,
     Middleware,
     Binding,
-    /// A PHP class referenced by FQCN from a Blade `@use` directive.
+    /// A PHP class referenced by FQCN from a `use` import: a Blade `@use`
+    /// directive, a plain PHP `use` statement, or a Volt single-file
+    /// component's `<?php … ?>` front-matter imports.
     Class,
     /// Eloquent magic member / plain class member (M4). The `name` is the
     /// composite `<declaring_fqcn>#<member>` produced by the M3 resolver, so
@@ -89,10 +92,20 @@ struct SymbolKey {
 /// The inverted index itself. Owned by the actor; never shared (reads
 /// and writes both go through the actor's single-threaded queue, so
 /// internal Mutexes would be redundant).
+///
+/// `forward` and `by_file` both need a `SymbolKey` per occurrence — `forward`
+/// as its map key, `by_file` to remember which keys a path contributed (for
+/// eviction). Storing a plain `SymbolKey` in each meant every occurrence of
+/// e.g. `View("welcome")` allocated its OWN copy of the `"welcome"` `String`,
+/// once for `forward`'s key slot and again for `by_file`'s list — on a large
+/// project, ~8-10MB of pure duplication. Wrapping the key in `Arc` and
+/// sharing ONE instance between both maps (see `Self::intern_key`) cuts that
+/// to a single allocation per DISTINCT `(kind, name)` pair, no matter how
+/// many files or occurrences reference it.
 #[derive(Default, Debug)]
 pub struct SymbolIndex {
-    forward: HashMap<SymbolKey, Vec<ReferenceLocationData>>,
-    by_file: HashMap<PathBuf, Vec<SymbolKey>>,
+    forward: HashMap<Arc<SymbolKey>, Vec<ReferenceLocationData>>,
+    by_file: HashMap<PathBuf, Vec<Arc<SymbolKey>>>,
     /// Files whose patterns may have changed since their index entries
     /// were last refreshed. Processed lazily in `find_references` so
     /// hot-path edits don't pay re-indexing cost up front.
@@ -100,6 +113,19 @@ pub struct SymbolIndex {
 }
 
 impl SymbolIndex {
+    /// Return the canonical `Arc<SymbolKey>` for `key`: the one already
+    /// stored in `forward` if this `(kind, name)` has been seen before
+    /// (a cheap ref-count bump — no new `String`), or a freshly allocated
+    /// `Arc` if not. Callers use the SAME returned `Arc` both as `forward`'s
+    /// map key and as the entry recorded in `by_file`, which is what keeps
+    /// the two maps from each holding an independent copy of `name`.
+    fn intern_key(&self, key: SymbolKey) -> Arc<SymbolKey> {
+        match self.forward.get_key_value(&key) {
+            Some((existing, _)) => Arc::clone(existing),
+            None => Arc::new(key),
+        }
+    }
+
     /// Add every pattern entry from `patterns` into the forward map,
     /// and record the resulting keys in `by_file` so we can find them
     /// again for removal.
@@ -107,7 +133,7 @@ impl SymbolIndex {
     /// Idempotent w.r.t. the dirty set: caller is responsible for
     /// pairing this with `remove_file` if the file was already indexed.
     pub fn insert_file(&mut self, path: &Path, patterns: &ParsedPatternsData) {
-        let mut keys: Vec<SymbolKey> = Vec::new();
+        let mut keys: Vec<Arc<SymbolKey>> = Vec::new();
 
         // One macro arm per pattern collection on `ParsedPatternsData`.
         // The `$name` field name varies between collections (it's
@@ -117,17 +143,17 @@ impl SymbolIndex {
         macro_rules! ingest {
             ($field:ident, $kind:expr, $name_field:ident) => {
                 for p in &patterns.$field {
-                    let key = SymbolKey {
+                    let key = self.intern_key(SymbolKey {
                         kind: $kind,
                         name: p.$name_field.clone(),
-                    };
+                    });
                     let loc = ReferenceLocationData {
                         file_path: path.to_path_buf(),
                         line: p.line,
                         column: p.column,
                         end_column: p.end_column,
                     };
-                    self.forward.entry(key.clone()).or_default().push(loc);
+                    self.forward.entry(Arc::clone(&key)).or_default().push(loc);
                     keys.push(key);
                 }
             };
@@ -141,6 +167,12 @@ impl SymbolIndex {
         ingest!(livewire_refs, SymbolKind::Livewire, name);
         ingest!(middleware_refs, SymbolKind::Middleware, name);
         ingest!(binding_refs, SymbolKind::Binding, name);
+        // Vendor `use` imports ARE indexed, deliberately: extends/implements
+        // relationships aren't otherwise indexed anywhere, so a `use` line is
+        // the only recorded evidence that a vendor class depends on an app
+        // (or another vendor) class. That matters most for path-repository
+        // package development under `vendor/`, where find-references on a
+        // class needs to surface those cross-package call sites.
         ingest!(class_refs, SymbolKind::Class, name);
 
         // Chain-aware config/translation entries: a reference to a dotted key
@@ -158,17 +190,17 @@ impl SymbolIndex {
                         if ch != '.' {
                             continue;
                         }
-                        let key = SymbolKey {
+                        let key = self.intern_key(SymbolKey {
                             kind: $kind,
                             name: p.key[..i].to_string(),
-                        };
+                        });
                         let loc = ReferenceLocationData {
                             file_path: path.to_path_buf(),
                             line: p.line,
                             column: p.column,
                             end_column: p.end_column,
                         };
-                        self.forward.entry(key.clone()).or_default().push(loc);
+                        self.forward.entry(Arc::clone(&key)).or_default().push(loc);
                         keys.push(key);
                     }
                 }
@@ -201,19 +233,19 @@ impl SymbolIndex {
         if entries.is_empty() {
             return;
         }
-        let mut keys: Vec<SymbolKey> = Vec::with_capacity(entries.len());
+        let mut keys: Vec<Arc<SymbolKey>> = Vec::with_capacity(entries.len());
         for e in entries {
-            let key = SymbolKey {
+            let key = self.intern_key(SymbolKey {
                 kind: SymbolKind::MagicMember,
                 name: magic_member_key_name(&e.fqcn, &e.member),
-            };
+            });
             let loc = ReferenceLocationData {
                 file_path: path.to_path_buf(),
                 line: e.line,
                 column: e.column,
                 end_column: e.end_column,
             };
-            self.forward.entry(key.clone()).or_default().push(loc);
+            self.forward.entry(Arc::clone(&key)).or_default().push(loc);
             keys.push(key);
         }
         self.by_file
@@ -256,7 +288,7 @@ impl SymbolIndex {
         let Some(keys) = self.by_file.remove(path) else {
             return;
         };
-        let mut retained: Vec<SymbolKey> = Vec::new();
+        let mut retained: Vec<Arc<SymbolKey>> = Vec::new();
         for key in keys {
             if key.kind == SymbolKind::MagicMember {
                 retained.push(key);
@@ -344,7 +376,7 @@ impl SymbolIndex {
         let mut seen_keys: HashSet<&SymbolKey> = HashSet::new();
         let mut seen_locs: HashSet<(PathBuf, u32, u32)> = HashSet::new();
         for key in keys {
-            if key.kind != SymbolKind::MagicMember || !seen_keys.insert(key) {
+            if key.kind != SymbolKind::MagicMember || !seen_keys.insert(key.as_ref()) {
                 continue;
             }
             let Some(locs) = self.forward.get(key) else {

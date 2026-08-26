@@ -80,7 +80,7 @@ fn component_ref(name: &str) -> ComponentReferenceData {
 /// `resolve_component_existing_file` reads `root_path` to build the composer
 /// autoload before walking the candidate paths.
 async fn seed(server: &LaravelLanguageServer, root: &Path, config: LaravelConfigData) {
-    *server.cached_config.write().await = Some(config);
+    *server.cached_config.write().await = Some(std::sync::Arc::new(config));
     *server.root_path.write().await = Some(root.to_path_buf());
 }
 

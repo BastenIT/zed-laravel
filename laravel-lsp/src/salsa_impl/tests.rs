@@ -1868,6 +1868,32 @@ fn member_access_is_indexed_and_found_at_position() {
     assert!(p.find_at_position(1, 2).is_none());
 }
 
+/// Win 2: `sorted_positions` is a lazily-initialized `OnceLock`, built on
+/// `find_at_position`'s own first call rather than by an explicit
+/// `build_position_index()` beforehand. This is the scenario a disk-cache
+/// restore hits every time (the index is skipped on serialize): the very
+/// first read of a restored `ParsedPatternsData` can be a lookup, with no
+/// eager-build step in between.
+#[test]
+fn find_at_position_lazily_builds_the_index_without_an_explicit_call() {
+    let mut p = ParsedPatternsData::default();
+    p.member_access_refs
+        .push(Arc::new(unresolved_member_access("email", 1, 12)));
+    // Deliberately NOT calling `p.build_position_index()`.
+
+    let found = p
+        .find_at_position(1, 14)
+        .expect("find_at_position must build its own index on first use");
+    match found {
+        PatternAtPosition::MemberAccess(m) => assert_eq!(m.member, "email"),
+        other => panic!("expected MemberAccess, got {other:?}"),
+    }
+
+    // A second call reuses the now-cached index and must agree with the first.
+    assert!(p.find_at_position(1, 2).is_none());
+    assert!(p.find_at_position(1, 14).is_some());
+}
+
 #[test]
 fn member_access_capture_defaults_are_unresolved() {
     let m = unresolved_member_access("email", 1, 12);
@@ -5169,5 +5195,124 @@ class P extends ServiceProvider
             ("one".to_string(), Some(PathBuf::from("/pkg/src/a"))),
             ("two".to_string(), Some(PathBuf::from("/pkg/src/b"))),
         ]
+    );
+}
+
+// ─── Pattern-cache sizing and publication ─────────────────────────────────
+
+/// A temp project of `php_files` trivial `.php` files under `app/`, registered
+/// with `handle`. Returns the `TempDir` so the caller keeps it alive.
+async fn register_temp_project(handle: &SalsaHandle, php_files: usize) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = dir.path().join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    for i in 0..php_files {
+        std::fs::write(app.join(format!("F{i}.php")), "<?php\n").unwrap();
+    }
+    handle
+        .register_project_files(
+            dir.path().to_path_buf(),
+            vec![PathBuf::from("app/Http/Controllers")],
+            vec![dir.path().join("resources/views")],
+            None,
+            PathBuf::from("routes"),
+        )
+        .await
+        .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn pattern_cache_is_unpublished_until_a_project_is_registered() {
+    let handle = SalsaActor::spawn();
+
+    assert!(
+        handle.pattern_cache().is_none(),
+        "no project walked yet, so there is no correctly-sized table to hand out"
+    );
+    assert!(
+        handle
+            .bulk_import_patterns(vec![(
+                PathBuf::from("/proj/app/Models/User.php"),
+                Arc::new(ParsedPatternsData::default()),
+            )])
+            .await
+            .is_err(),
+        "importing before publication must fail closed, not write to an unshared table"
+    );
+
+    let _project = register_temp_project(&handle, 4).await;
+    assert!(
+        handle.pattern_cache().is_some(),
+        "registration must publish the table"
+    );
+}
+
+#[tokio::test]
+async fn registration_sizes_the_pattern_cache_for_the_discovered_file_count() {
+    // Comfortably past the bootstrap table's real capacity (~1.8k regardless
+    // of shard count), so a published table that was NOT resized fails here.
+    const FILES: usize = 1_500;
+    let handle = SalsaActor::spawn();
+    let _project = register_temp_project(&handle, FILES).await;
+
+    let cache = handle.pattern_cache().expect("registration must publish");
+    assert!(
+        cache.capacity() >= FILES + PATTERN_CACHE_CAPACITY_PADDING,
+        "table must be sized for the walk's file count plus padding, got {}",
+        cache.capacity()
+    );
+}
+
+#[tokio::test]
+async fn entries_cached_before_registration_survive_the_sizing_swap() {
+    let handle = SalsaActor::spawn();
+
+    // An editor can send `didOpen` for an already-open buffer before project
+    // registration finishes; that lands in the bootstrap table.
+    let early = tempfile::TempDir::new().unwrap();
+    let early_file = early.path().join("Early.php");
+    std::fs::write(&early_file, "<?php\nclass Early {}\n").unwrap();
+    handle.get_patterns(early_file.clone()).await.unwrap();
+
+    let _project = register_temp_project(&handle, 1_500).await;
+
+    let cache = handle.pattern_cache().expect("registration must publish");
+    assert!(
+        cache.contains_key(&early_file),
+        "a pre-registration entry must be migrated into the resized table, not dropped"
+    );
+}
+
+#[tokio::test]
+async fn re_registration_leaves_the_published_table_live() {
+    // The whole point of publishing once: a later registration must not leave
+    // the actor writing to a table that handle holders can no longer see. A
+    // mid-session project-root change re-registers with no flight guard, so
+    // this is reachable in production, not just in theory.
+    let handle = SalsaActor::spawn();
+    let _first = register_temp_project(&handle, 1_500).await;
+    let published = handle.pattern_cache().expect("registration must publish");
+
+    // Second registration, deliberately larger than the first.
+    let _second = register_temp_project(&handle, 3_000).await;
+
+    // Drive an actor-side write through `handle_get_patterns`, then look for
+    // it through the Arc taken BEFORE the re-registration.
+    let late = tempfile::TempDir::new().unwrap();
+    let late_file = late.path().join("Late.php");
+    std::fs::write(&late_file, "<?php\nclass Late {}\n").unwrap();
+    handle.get_patterns(late_file.clone()).await.unwrap();
+
+    assert!(
+        published.contains_key(&late_file),
+        "the actor must still be writing to the table it published, not a newer one"
+    );
+    assert!(
+        Arc::ptr_eq(
+            &published,
+            &handle.pattern_cache().expect("still published")
+        ),
+        "re-registration must not swap the published table"
     );
 }
