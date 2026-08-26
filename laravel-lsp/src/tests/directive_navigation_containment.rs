@@ -243,3 +243,33 @@ fn directive_first_string_extraction_survives_data_arguments() {
         );
     }
 }
+
+/// Regression for the condition-first extractor: `@includeWhen` /
+/// `@includeUnless` put a boolean EXPRESSION first, so the view name is the
+/// FIRST quoted string in the args. The previous version skipped one quoted
+/// string — the two-argument form resolved nothing, and the three-argument
+/// form returned the data array's first key as the "view name" (wrong goto
+/// target, false missing-view diagnostic).
+#[test]
+fn second_arg_extraction_takes_the_first_quoted_string() {
+    let cases = [
+        ("($cond, 'view')", Some("view")),
+        (
+            "($boolean, 'view.name', ['status' => 'complete'])",
+            Some("view.name"),
+        ),
+        (
+            "($cond, \"double.quoted\", ['a' => $b])",
+            Some("double.quoted"),
+        ),
+        ("($cond)", None),
+        ("($cond, '')", None),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(
+            crate::LaravelLanguageServer::extract_second_string_arg(args).as_deref(),
+            expected,
+            "args: {args}"
+        );
+    }
+}
