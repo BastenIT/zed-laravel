@@ -4382,15 +4382,23 @@ impl LaravelLanguageServer {
     }
 
     fn new(client: Client) -> Self {
+        // Bound to locals (rather than built inline in the struct literal
+        // below) so `salsa` can publish `documents` into the salsa layer
+        // right after `spawn()` — see `SalsaHandle::set_documents` for why
+        // bulk_import_patterns needs to see open buffers.
+        let documents: Arc<RwLock<HashMap<Url, (String, i32)>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let salsa = SalsaActor::spawn();
+        salsa.set_documents(documents.clone());
         Self {
             client,
-            documents: Arc::new(RwLock::new(HashMap::new())),
+            documents,
             root_path: Arc::new(RwLock::new(None)),
             workspace_root: Arc::new(RwLock::new(None)),
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
             pending_diagnostics: Arc::new(RwLock::new(HashMap::new())),
             debounce_delay_ms: 200, // 200ms for diagnostics
-            salsa: SalsaActor::spawn(),
+            salsa,
             cache: Arc::new(RwLock::new(None)),
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
@@ -5522,6 +5530,39 @@ impl LaravelLanguageServer {
                 }
             }
             let magic_elapsed = magic_started.elapsed();
+
+            // Re-register every open buffer's live text BEFORE the
+            // code-lens refresh below. The `bulk_import_patterns` guard
+            // (see `SalsaHandle::bulk_import_patterns`) now skips open
+            // paths during the warm import itself, so this loop is no
+            // longer papering over a clobbered cache entry — but it's kept
+            // deliberately: it still re-registers the SourceFile input and
+            // dirties the symbol/hierarchy indexes, repairing any open file
+            // the warm's file-discovery pass touched before the buffer was
+            // opened. Running it before `code_lens_refresh()` closes a
+            // stale-lens window — the refresh triggers client lens queries
+            // gated on `warm_complete`, so those queries must see the
+            // re-synced state, not the pre-sync one. Bounded by open tabs,
+            // idempotent.
+            let open_docs: Vec<(std::path::PathBuf, String, i32)> = server_for_warm
+                .documents
+                .read()
+                .await
+                .iter()
+                .filter_map(|(uri, (text, version))| {
+                    uri.to_file_path().ok().map(|p| (p, text.clone(), *version))
+                })
+                .collect();
+            for (path, text, version) in open_docs {
+                if let Err(e) = server_for_warm
+                    .salsa
+                    .update_file(path.clone(), version, text)
+                    .await
+                {
+                    debug!("post-warm buffer re-sync failed for {:?}: {}", path, e);
+                }
+            }
+
             // The reference indexes are built — ask the client to refresh code
             // lenses requested while warming was still in progress (those
             // resolved against an empty index and read 0). Fire-and-forget, so
