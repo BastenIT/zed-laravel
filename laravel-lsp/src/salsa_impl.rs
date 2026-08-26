@@ -5569,8 +5569,8 @@ pub struct SalsaHandle {
         Arc<std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
     /// The server's open-document map (URI → (text, version)). `None` until
     /// `set_documents` publishes it — every existing `spawn()` call site
-    /// (mostly tests) still compiles unchanged; an unset map is treated as
-    /// "no open buffers", i.e. the pre-fix behaviour. See
+    /// (25+, mostly tests) still compiles unchanged; an unset map is
+    /// treated as "no open buffers", i.e. the pre-fix behaviour. See
     /// `SalsaActor::documents` for the shared-allocation rationale and
     /// `bulk_import_patterns` for the one consumer that matters.
     documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>>,
@@ -5596,9 +5596,9 @@ impl SalsaHandle {
 
     /// Publish the server's open-document map into the salsa layer. Call
     /// once at startup, right after `SalsaActor::spawn()` — mirrors how
-    /// `pattern_cache` above is a single shared cell handed to both sides
+    /// `pattern_cache` above is a single shared `Arc` handed to both sides
     /// at construction. Kept as a post-construction setter (instead of a
-    /// `spawn()` parameter) because `spawn()` has many call sites, mostly
+    /// `spawn()` parameter) because `spawn()` has 25+ call sites, mostly
     /// tests, that don't have a documents map to hand it. A second call is
     /// a no-op — `OnceLock` refuses to overwrite — since only server
     /// startup should ever publish this.
