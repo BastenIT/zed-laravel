@@ -1962,7 +1962,7 @@ struct LaravelLanguageServer {
     /// `vendor_open_magic_lru`) rather than a plain `HashMap`: the TTL only
     /// expires an entry's VALUE on next lookup, it never removes the key, so
     /// an unbounded map grew for every distinct path ever probed over a
-    /// session (goto/hover/diagnostics checking candidate paths that don't
+    /// session (goto/hover/completion checking candidate paths that don't
     /// exist) with nothing ever shrinking it. `std::sync::Mutex`, not
     /// `RwLock`: `lru` mutates on every read to reorder recency, so a "read"
     /// is never actually read-only.
@@ -2160,6 +2160,16 @@ struct LaravelLanguageServer {
     /// `std::sync::Mutex`, not `RwLock`: `lru` mutates on read to reorder
     /// recency, and every critical section is a short map op (same rationale
     /// as the `class_locator` cache).
+    ///
+    /// Poisoning: every `.lock()` on this cache recovers a poisoned mutex with
+    /// `unwrap_or_else(|e| e.into_inner())` instead of panicking, so a panic
+    /// anywhere else in the process can't permanently disable this cache. That
+    /// is safe because the worst case of a half-updated entry here is a stale
+    /// hit or a briefly-wrong recency ordering — a vendor path recorded whose
+    /// eviction ripple never ran, so one file's own magic-member references go
+    /// missing until the next re-open or save re-indexes it — never an
+    /// incorrect result, since the cache stores only session bookkeeping and
+    /// resolution always re-derives from Salsa.
     vendor_open_magic_lru: Arc<std::sync::Mutex<lru::LruCache<PathBuf, ()>>>,
     /// Dominant Inertia page extension (`vue` / `tsx` / `jsx` / `svelte`),
     /// detected once at startup by counting files under `resources/js/Pages/`.
@@ -2188,9 +2198,28 @@ const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
 const VENDOR_OPEN_MAGIC_LRU_CAP: usize = 128;
 
 /// Cap on `file_exists_cache`: how many distinct (path, exists, cached_at)
-/// probes stay resident at once. Generous — goto/hover/diagnostics probe many
-/// candidate paths per request, most of which don't exist — but bounded, so
-/// a long session doesn't grow the map for every path ever checked.
+/// probes stay resident at once.
+///
+/// This is a MEMORY CEILING, not a fit to a measured working set, and the
+/// distinction is worth keeping straight before anyone re-tunes it.
+///
+/// `file_exists_cached` is reached from exactly three places —
+/// `goto_definition`, `hover`, and `completion` — via the `resolve_*_file` and
+/// `create_*_location_from_salsa` helpers. All three are cursor-driven: they
+/// resolve ONE symbol, probing that symbol's handful of candidate paths.
+/// Nothing sweeps the project through here; diagnostics in particular resolve
+/// through their own path and never touch this cache. So the live set is
+/// bounded by how many distinct symbols a person navigates to, throttled
+/// further by the 5-second TTL — orders of magnitude below this cap in any
+/// plausible session.
+///
+/// The cap exists because the TTL alone never freed anything: it was only
+/// consulted on read, so a path probed once and never probed again stayed
+/// resident for the life of the process. 8192 entries is on the order of a
+/// megabyte — small enough to not care about, large enough that eviction
+/// pressure isn't a realistic concern. If it ever needs deriving from real
+/// data, measure the distinct-key count from a live session; do NOT scale it
+/// off the project's file count, which is not what keys this cache.
 const FILE_EXISTS_CACHE_CAP: usize = 8192;
 
 // NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
@@ -4922,22 +4951,6 @@ impl LaravelLanguageServer {
 
         info!("Laravel: Project files registered with Salsa for reference finding");
 
-        // Size the shared pattern cache for this project's real file count
-        // now that `register_project_files`'s walk has discovered it — and
-        // BEFORE either of the two bulk-insert paths below (the disk-cache
-        // restore and warming's bulk import) run. Sizing here means neither
-        // one grows the table through a series of rehashes as it inserts.
-        // `list_project_files` just returns the actor's already-discovered
-        // list (no re-walk); a failure here is non-fatal — it only costs
-        // the resize's benefit, not correctness — so we log and continue.
-        match self.salsa.list_project_files().await {
-            Ok(paths) => self.salsa.resize_pattern_cache(paths.len()),
-            Err(e) => debug!(
-                "list_project_files failed, pattern cache stays at its bootstrap capacity: {}",
-                e
-            ),
-        }
-
         // Disk-cache restore. Loads previously-parsed patterns into the
         // shared pattern_cache, dropping any entry whose on-disk mtime
         // doesn't match what was cached. Anything restored here gets
@@ -4947,7 +4960,18 @@ impl LaravelLanguageServer {
         if let Some(p) = progress.as_mut() {
             p.report("Loading cached index…", Some(0), true).await;
         }
-        let pattern_cache = self.salsa.pattern_cache();
+        // Published by the actor at the end of the registration walk above,
+        // sized for the file count that walk discovered. Absent only if that
+        // registration didn't complete — in which case there's no indexed
+        // project to load a cache into or warm, so stop rather than build a
+        // second, unshared table nothing else would ever read.
+        let Some(pattern_cache) = self.salsa.pattern_cache() else {
+            debug!("Pattern cache not published; skipping disk-cache load and warming");
+            if let Some(p) = progress {
+                p.end("Project indexing unavailable.").await;
+            }
+            return;
+        };
         let root_for_load = root_path.to_path_buf();
         let cache_for_load = pattern_cache.clone();
         // The load is a sync, parallel (rayon) pass over ~40k cache
@@ -6906,20 +6930,25 @@ impl LaravelLanguageServer {
                 (view_paths, view_namespaces)
             };
             let changed: HashSet<&str> = changed_views.iter().map(String::as_str).collect();
-            for entry in self.salsa.pattern_cache().iter() {
-                let p = entry.key();
-                if !p.to_string_lossy().ends_with(".blade.php")
-                    || p.components().any(|c| c.as_os_str() == "vendor")
-                {
-                    continue;
-                }
-                if let Some(name) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
-                    p,
-                    &view_paths,
-                    &view_namespaces,
-                ) {
-                    if changed.contains(name.as_str()) {
-                        work.insert(p.clone());
+            // No published cache means nothing has been indexed yet, so there
+            // are no Blade files to re-resolve — an empty work set, not a
+            // missed refresh.
+            if let Some(cache) = self.salsa.pattern_cache() {
+                for entry in cache.iter() {
+                    let p = entry.key();
+                    if !p.to_string_lossy().ends_with(".blade.php")
+                        || p.components().any(|c| c.as_os_str() == "vendor")
+                    {
+                        continue;
+                    }
+                    if let Some(name) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
+                        p,
+                        &view_paths,
+                        &view_namespaces,
+                    ) {
+                        if changed.contains(name.as_str()) {
+                            work.insert(p.clone());
+                        }
                     }
                 }
             }
@@ -7299,7 +7328,10 @@ impl LaravelLanguageServer {
     /// simply go missing again until the next re-open or save re-indexes it.
     async fn record_vendor_open_magic(&self, path: &Path) {
         let evicted = {
-            let mut lru = self.vendor_open_magic_lru.lock().unwrap();
+            let mut lru = self
+                .vendor_open_magic_lru
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             // `push` returns the displaced pair: the SAME key on a re-open
             // (a recency touch — must not evict the entries we just wrote),
             // or the LRU-oldest entry on overflow.
