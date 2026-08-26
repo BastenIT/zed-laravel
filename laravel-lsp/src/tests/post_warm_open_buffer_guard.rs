@@ -82,6 +82,21 @@ async fn bulk_import_skips_open_buffer_and_position_still_resolves() {
         "buffer text parses with the config() call on the shifted line"
     );
 
+    // Register the project so the actor publishes the shared pattern cache
+    // (bulk_import_patterns errors before publication — the real warm only
+    // runs after project registration, and this test mirrors that order).
+    server
+        .salsa
+        .register_project_files(
+            dir.path().to_path_buf(),
+            vec![std::path::PathBuf::from("app/Http/Controllers")],
+            vec![dir.path().join("resources/views")],
+            None,
+            std::path::PathBuf::from("routes"),
+        )
+        .await
+        .unwrap();
+
     // Simulate the warm's disk-parse step for the SAME file: parse the
     // UNEDITED disk content, exactly as `register_project_files_with_salsa`'s
     // warm task does via `parse_owned_with_hierarchy`, then hand it to the
