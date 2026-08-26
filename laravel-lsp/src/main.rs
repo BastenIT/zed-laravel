@@ -1985,6 +1985,11 @@ struct LaravelLanguageServer {
     /// Add space between directive name and parentheses in completions
     /// false: @if($condition)  |  true: @if ($condition)
     directive_spacing: Arc<RwLock<bool>>,
+    /// Extra directive names the user declared as view-rendering (issue #325),
+    /// set via the `blade.viewDirectives` LSP setting. Read by
+    /// [`Self::create_directive_location_from_salsa`]'s goto fallback; the
+    /// diagnostic path never consults it.
+    view_directives: Arc<RwLock<ViewDirectivesSettings>>,
     /// Severity for query-chain diagnostics (unknown column/relation/table).
     /// `None` disables them; defaults to `WARNING`. Set via the
     /// `diagnostics.severity` LSP setting.
@@ -2193,6 +2198,43 @@ const FILE_EXISTS_CACHE_CAP: usize = 8192;
 // NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
 // which scans the Laravel framework, app service providers, and packages.
 
+/// User-declared view-rendering directive names (issue #325). Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "blade": { "viewDirectives": {
+/// "firstArg": ["myDirective"], "secondArg": ["myOtherDirective"] } } } } } }`
+///
+/// The escape hatch for a directive the goto fallback can't or shouldn't infer:
+/// a name listed here resolves exactly like a hardcoded `view_directives_first_arg`
+/// / `view_directives_second_arg` entry. Entries outrank [`NON_VIEW_DIRECTIVES`]
+/// (a user may deliberately re-enable a denylisted name) but never outrank a
+/// directive with dedicated handling — see
+/// [`LaravelLanguageServer::create_directive_location_from_salsa`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewDirectivesSettings {
+    /// Directive names whose FIRST quoted argument is a view name, like
+    /// `@extends`/`@include`.
+    #[serde(default)]
+    first_arg: Vec<String>,
+    /// Directive names whose SECOND quoted argument is a view name (after a
+    /// condition), like `@includeWhen`/`@includeUnless`.
+    #[serde(default)]
+    second_arg: Vec<String>,
+}
+
+/// Whether a missing view behind this directive raises a "View file not found"
+/// diagnostic.
+///
+/// Deliberately far narrower than the set goto-definition resolves (issue
+/// #325): goto and diagnostics have opposite risk profiles. A wrong goto costs
+/// one keystroke; a wrong squiggle marks working code. So the goto path gained a
+/// permissive fallback for third-party `Blade::directive()` registrations while
+/// this gate stayed exactly as it was — a directive reachable only through that
+/// fallback, or through the `blade.viewDirectives` setting, can never produce a
+/// false missing-view diagnostic.
+fn directive_takes_missing_view_diagnostic(name: &str) -> bool {
+    name == "extends" || name == "include"
+}
+
 /// Blade-specific settings
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { "blade": { ... } } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -2203,7 +2245,106 @@ struct BladeSettings {
     /// true:  @if ($condition)
     #[serde(default)]
     directive_spacing: bool,
+    /// Extra directive names to treat as view-rendering in goto-definition.
+    /// Both lists default to empty.
+    #[serde(default)]
+    view_directives: ViewDirectivesSettings,
 }
+
+/// Built-in Blade directives whose argument is NOT a view name, so the
+/// goto-definition fallback in
+/// [`LaravelLanguageServer::create_directive_location_from_salsa`] must never
+/// fire for them (issue #325).
+///
+/// Without this, `@section('content')` would jump to
+/// `resources/views/content.blade.php` whenever a view happens to share the
+/// section's name — a plausible-looking but wrong target. The list is the
+/// container/label directives the outline builder already enumerates (see
+/// `document_symbols.rs`), the section-name pair `@hasSection`/`@sectionMissing`
+/// (identical false-positive shape to `@section`), and the standard
+/// control-flow/utility directives.
+///
+/// A name here is still resolvable if the user explicitly declares it under
+/// `blade.viewDirectives` — see [`ViewDirectivesSettings`].
+const NON_VIEW_DIRECTIVES: &[&str] = &[
+    // Container / label directives (mirrors document_symbols.rs).
+    "section",
+    "endsection",
+    "push",
+    "endpush",
+    "prepend",
+    "endprepend",
+    "slot",
+    "endslot",
+    "endcomponent",
+    "stack",
+    "yield",
+    "props",
+    // Section-name directives — same false-positive shape as @section.
+    "hasSection",
+    "sectionMissing",
+    // Control flow.
+    "if",
+    "elseif",
+    "else",
+    "endif",
+    "unless",
+    "endunless",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "endswitch",
+    "foreach",
+    "endforeach",
+    "forelse",
+    "endforelse",
+    "empty",
+    "endempty",
+    "for",
+    "endfor",
+    "while",
+    "endwhile",
+    // Authorization / environment / state guards.
+    "can",
+    "cannot",
+    "elsecan",
+    "elsecannot",
+    "endcan",
+    "endcannot",
+    "error",
+    "enderror",
+    "env",
+    "production",
+    "endenv",
+    "auth",
+    "endauth",
+    "guest",
+    "endguest",
+    "isset",
+    "endisset",
+    // Utility / output.
+    "php",
+    "endphp",
+    "inject",
+    "method",
+    "csrf",
+    "json",
+    "dump",
+    "dd",
+    "class",
+    "style",
+    "checked",
+    "selected",
+    "disabled",
+    "readonly",
+    "required",
+    "use",
+    "lang",
+    "vite",
+    "aware",
+];
 
 /// Query-chain diagnostics settings (unknown column / relation / table).
 /// Configured via:
@@ -4420,6 +4561,7 @@ impl LaravelLanguageServer {
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
             auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
             directive_spacing: Arc::new(RwLock::new(false)),
+            view_directives: Arc::new(RwLock::new(ViewDirectivesSettings::default())),
             chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
             code_lens_enabled: Arc::new(RwLock::new(false)),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
@@ -4472,6 +4614,19 @@ impl LaravelLanguageServer {
                 old_spacing, new_spacing
             );
             *self.directive_spacing.write().await = new_spacing;
+        }
+
+        // Extra view-rendering directive names (issue #325). The old value is
+        // cloned into a local first: a read guard held in the `if` condition
+        // would outlive the condition and deadlock against the `write()` below.
+        let new_view_directives = &settings.blade.view_directives;
+        let old_view_directives = self.view_directives.read().await.clone();
+        if *new_view_directives != old_view_directives {
+            info!(
+                "⚙️  Updating blade.viewDirectives: firstArg={:?}, secondArg={:?}",
+                new_view_directives.first_arg, new_view_directives.second_arg
+            );
+            *self.view_directives.write().await = new_view_directives.clone();
         }
 
         // Query-chain diagnostics severity
@@ -15686,7 +15841,20 @@ return [
         None
     }
 
-    /// Create LocationLink for a directive reference from Salsa data
+    /// Create LocationLink for a directive reference from Salsa data.
+    ///
+    /// Dispatch is a single `match` on the directive name, deliberately: a
+    /// directive's handling and its exclusion from the catch-all fallback are
+    /// then the *same arm*, so the two cannot drift apart. Adding a dedicated
+    /// arm automatically excludes that name from the fallback, and an arm that
+    /// resolves nothing yields `None` rather than leaking into the fallback's
+    /// heuristic and offering a naively-guessed view file (issue #325).
+    ///
+    /// Containment guard (issue #148, extending #130): every arm resolves its
+    /// argument through [`Self::first_contained_view`], which honours
+    /// `loadViewsFrom`-style namespaces that can point outside the project root
+    /// and so re-checks containment after the existence probe. The `@feature`
+    /// arm builds its path from `root.join(..)` and is contained by construction.
     async fn create_directive_location_from_salsa(
         &self,
         dir: &DirectiveReferenceData,
@@ -15694,158 +15862,141 @@ return [
         let arguments = dir.arguments.as_ref()?;
         let config = self.get_cached_config().await?;
 
-        // Containment guard (issue #148, extending #130): every candidate loop
-        // below resolves a directive argument to a view/component path through
-        // `resolve_view_path`, which honours `loadViewsFrom`-style namespaces that
-        // can point an absolute path outside the project root. Each loop re-checks
-        // `path_within_root(&path, &config.root)` after the existence check and
-        // `continue`s past any out-of-root candidate, so no directive flow hands
-        // the client a navigation target that escapes the root. The `@feature`
-        // branch builds its path from `root.join(..)` and so is already contained.
-
-        // Directives where first argument is a view name
-        let view_directives_first_arg = ["extends", "include", "includeIf", "each"];
-
-        // Directives where second argument is a view name (after a condition)
-        // `@includeUnless($boolean, 'view.name', [...])` is condition-first,
-        // exactly like `@includeWhen` — it never resolved from the
-        // first-argument list.
-        let view_directives_second_arg = ["includeWhen", "includeUnless"];
-
-        // @component directive - resolves to component file
-        if dir.name == "component" {
-            if let Some(component_name) = Self::extract_view_from_directive_args(arguments) {
-                // Try as component path (resources/views/components/...)
-                let component_path = format!("components.{}", component_name);
-                let possible_paths = config.resolve_view_path(&component_path);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
+        // Note: @lang is handled as a Translation pattern and @vite as an Asset
+        // pattern, not as Directive patterns — see parse_file_patterns in
+        // salsa_impl.rs. Neither reaches this method.
+        match dir.name.as_str() {
+            // `@component('foo')` accepts either a components/ path or a plain
+            // view path; the components/ location wins when both exist.
+            "component" => {
+                let name = Self::extract_view_from_directive_args(arguments)?;
+                let mut resolved = self
+                    .first_contained_view(&config, &format!("components.{name}"))
+                    .await;
+                if resolved.is_none() {
+                    resolved = self.first_contained_view(&config, &name).await;
                 }
+                self.create_location_link(dir, &resolved?)
+            }
 
-                // Also try direct view path
-                let possible_paths = config.resolve_view_path(&component_name);
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
+            // First argument is a view name.
+            "extends" | "include" | "includeIf" | "each" => {
+                let view_name = Self::extract_view_from_directive_args(arguments)?;
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
+            }
+
+            // Second argument is a view name, after a condition.
+            // `@includeUnless($boolean, 'view.name', [...])` is condition-first,
+            // exactly like `@includeWhen` — it never resolved from the
+            // first-argument list (issue #327).
+            "includeWhen" | "includeUnless" => {
+                let view_name = Self::extract_second_string_arg(arguments)?;
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
+            }
+
+            // `@includeFirst(['view1', 'view2'])` — first view that exists wins.
+            "includeFirst" => {
+                for view_name in Self::extract_array_string_args(arguments) {
+                    if let Some(path) = self.first_contained_view(&config, &view_name).await {
+                        return self.create_location_link(dir, &path);
                     }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
                 }
+                None
+            }
+
+            // `@livewire('component-name')` navigates to the component's Blade
+            // view. The clickable range covers just the quoted name.
+            "livewire" => {
+                let component_name = Self::extract_view_from_directive_args(arguments)?;
+                let path = self.first_contained_view(&config, &component_name).await?;
+                self.create_location_link_with_string_range(dir, &path)
+            }
+
+            // `@feature('feature-name')` — Laravel Pennant. Resolves against
+            // app/Features/, NOT the view tree, which is why a miss here must
+            // never fall through to the fallback's view-name guess.
+            "feature" => {
+                let feature_name = Self::extract_view_from_directive_args(arguments)?;
+                let root = self.root_path.read().await.clone()?;
+
+                // A feature class may override its key via a $name property;
+                // otherwise derive the class name from the key.
+                let feature_path = match scan_feature_classes(&root)
+                    .iter()
+                    .find(|f| f.feature_key == feature_name)
+                {
+                    Some(info) => root
+                        .join("app/Features")
+                        .join(format!("{}.php", info.class_name)),
+                    None => root.join(format!(
+                        "app/Features/{}.php",
+                        feature_key_to_class_name(&feature_name)
+                    )),
+                };
+
+                if !self.file_exists_cached(&feature_path).await {
+                    return None;
+                }
+                self.create_location_link_with_string_range(dir, &feature_path)
+            }
+
+            // ── Fallback: no dedicated arm above (issue #325) ──
+            //
+            // A package that registers its own view-rendering directive through
+            // `Blade::directive()` matches no arm above, so before this it got
+            // no goto at all. Reaching this arm is itself the proof that no
+            // dedicated handling exists — the `match` makes that structural
+            // rather than a hand-maintained exclusion list that can drift.
+            //
+            // Goto and diagnostics have opposite risk profiles: a wrong goto
+            // costs one keystroke, a wrong "view does not exist" squiggle marks
+            // working code. Only goto gains this permissive fallback —
+            // `validate_and_publish_diagnostics` keeps its strict
+            // `extends`/`include` gate, so a false missing-view diagnostic stays
+            // impossible by construction.
+            name => {
+                // `blade.viewDirectives` is the escape hatch for a directive the
+                // heuristic can't or shouldn't infer, so a declared name
+                // outranks `NON_VIEW_DIRECTIVES` — a user may deliberately
+                // re-enable a denylisted name. It can never outrank a dedicated
+                // arm, which the `match` already consumed.
+                let configured = self.view_directives.read().await.clone();
+                let view_name = if configured.first_arg.iter().any(|d| d == name) {
+                    Self::extract_view_from_directive_args(arguments)
+                } else if configured.second_arg.iter().any(|d| d == name) {
+                    Self::extract_second_string_arg(arguments)
+                } else if NON_VIEW_DIRECTIVES.contains(&name) {
+                    None
+                } else {
+                    Self::extract_view_from_directive_args(arguments)
+                }?;
+
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
             }
         }
+    }
 
-        // Handle view directives (first argument is view name)
-        if view_directives_first_arg.contains(&dir.name.as_str()) {
-            if let Some(view_name) = Self::extract_view_from_directive_args(arguments) {
-                let possible_paths = config.resolve_view_path(&view_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
+    /// First candidate for `view_name` that exists on disk **and** resolves
+    /// inside the project root.
+    ///
+    /// `resolve_view_path` returns one candidate per configured view root (or
+    /// per namespace), in priority order, and honours `loadViewsFrom`-style
+    /// registrations that can map a namespace to an absolute directory outside
+    /// the root (issues #130/#148). Containment is therefore re-checked after
+    /// the existence probe, and every candidate is tried — not just the first.
+    async fn first_contained_view(
+        &self,
+        config: &LaravelConfigData,
+        view_name: &str,
+    ) -> Option<PathBuf> {
+        for path in config.resolve_view_path(view_name) {
+            if self.file_exists_cached(&path).await && path_within_root(&path, &config.root) {
+                return Some(path);
             }
         }
-
-        // Handle @includeWhen($condition, 'view') - second arg is view
-        if view_directives_second_arg.contains(&dir.name.as_str()) {
-            if let Some(view_name) = Self::extract_second_string_arg(arguments) {
-                let possible_paths = config.resolve_view_path(&view_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
-            }
-        }
-
-        // Handle @includeFirst(['view1', 'view2']) - array of views
-        if dir.name == "includeFirst" {
-            let view_names = Self::extract_array_string_args(arguments);
-            for view_name in view_names {
-                let possible_paths = config.resolve_view_path(&view_name);
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
-            }
-        }
-
-        // Note: @lang is now handled as Translation patterns (see parse_file_patterns in salsa_impl.rs)
-        // Note: @vite is handled as Asset patterns, not Directive patterns
-        // See parse_file_patterns in salsa_impl.rs
-
-        // Handle @livewire('component-name') - Livewire component directive
-        // Navigates to the Blade view using view_path resolution
-        if dir.name == "livewire" {
-            if let Some(component_name) = Self::extract_view_from_directive_args(arguments) {
-                // Resolve using view path (e.g., 'navigation-menu' -> resources/views/navigation-menu.blade.php)
-                let possible_paths = config.resolve_view_path(&component_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    // Use string_column/string_end_column for the clickable range (just the component name)
-                    return self.create_location_link_with_string_range(dir, &path);
-                }
-            }
-        }
-
-        // Handle @feature('feature-name') - Laravel Pennant feature directive
-        if dir.name == "feature" {
-            if let Some(feature_name) = Self::extract_view_from_directive_args(arguments) {
-                let root = self.root_path.read().await;
-                if let Some(root) = root.as_ref() {
-                    // First check scanned features for custom $name property matches
-                    let scanned_features = scan_feature_classes(root);
-                    let feature_path = if let Some(feature_info) = scanned_features
-                        .iter()
-                        .find(|f| f.feature_key == feature_name)
-                    {
-                        // Found a feature class with matching $name property or derived key
-                        root.join("app/Features")
-                            .join(format!("{}.php", feature_info.class_name))
-                    } else {
-                        // Fallback: Convert feature key to class name and build path
-                        let class_name = feature_key_to_class_name(&feature_name);
-                        root.join(format!("app/Features/{}.php", class_name))
-                    };
-
-                    if self.file_exists_cached(&feature_path).await {
-                        // Use string_column/string_end_column for the clickable range (just the feature name)
-                        return self.create_location_link_with_string_range(dir, &feature_path);
-                    }
-                }
-            }
-        }
-
         None
     }
 
@@ -17342,6 +17493,7 @@ return [
             pending_salsa_updates: self.pending_salsa_updates.clone(),
             auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
             directive_spacing: self.directive_spacing.clone(),
+            view_directives: self.view_directives.clone(),
             chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
             code_lens_enabled: self.code_lens_enabled.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
@@ -18491,7 +18643,7 @@ return [
         // Check @extends and @include directives using Salsa patterns
         for dir_ref in &patterns.directives {
             // Only validate @extends and @include
-            if dir_ref.name == "extends" || dir_ref.name == "include" {
+            if directive_takes_missing_view_diagnostic(&dir_ref.name) {
                 if let Some(ref args) = dir_ref.arguments {
                     if let Some(view_name) = Self::extract_view_from_directive_args(args) {
                         let possible_paths = config.resolve_view_path(&view_name);
