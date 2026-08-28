@@ -2238,11 +2238,20 @@ fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)
     // Simple regex-based parsing for Laravel translation files
     // This handles: 'key' => 'value', or "key" => "value"
     //
+    // The key capture is ANY quoted string, not an identifier shape:
+    // hyphenated keys (`'variant-color'`), numeric keys (`'404'`), and
+    // keys with other punctuation are all legal Laravel keys. The old
+    // `[a-zA-Z_][a-zA-Z0-9_]*` class silently dropped them — worse, an
+    // unmatched `'variant-help' => [` line didn't register its nesting
+    // level, so its children were attributed one level UP and the closing
+    // `]` then popped the real parent off the stack, misplacing every key
+    // after it. Dots stay excluded: a literal `'a.b'` key is ambiguous in
+    // dot notation and Laravel itself warns against them.
+    //
     // Compiled once: this used to be rebuilt on every completion request, for
     // every catalogue in the locale (issue #293).
-    static KEY_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap()
-    });
+    static KEY_PATTERN: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"['"]([^'".]+)['"][\s]*=>"#).unwrap());
     let key_pattern = &*KEY_PATTERN;
 
     // Track nesting depth and current key path
@@ -2276,8 +2285,10 @@ fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)
             let key_name = caps.get(1).unwrap().as_str();
 
             if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
-                // This is a nested array
-                pending_key = Some(key_name.to_string());
+                // This is a nested array. The level is pushed HERE —
+                // setting `pending_key` as well left a stale value behind
+                // that the next bare `[` line (a `'key' =>` split across
+                // lines) would push a second time.
                 in_array_depth += 1;
                 key_stack.push(key_name.to_string());
             } else {
