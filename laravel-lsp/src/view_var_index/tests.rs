@@ -2016,3 +2016,18 @@ fn namespace_dir_inside_a_view_root_keeps_both_names() {
         ]
     );
 }
+
+#[test]
+fn render_source_files_are_sorted_for_deterministic_first_match() {
+    let mut idx = ViewVarIndex::new();
+    for name in ["zeta", "alpha", "midway"] {
+        idx.insert_file(
+            PathBuf::from(format!("/proj/{name}/Controller.php")),
+            &[render("users.show", &[("user", "App\\Models\\User")])],
+        );
+    }
+    let files = idx.render_source_files("users.show");
+    let mut sorted = files.clone();
+    sorted.sort();
+    assert_eq!(files, sorted, "HashMap order must not leak to callers");
+}
