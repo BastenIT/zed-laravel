@@ -5319,3 +5319,60 @@ async fn re_registration_leaves_the_published_table_live() {
         "re-registration must not swap the published table"
     );
 }
+
+#[test]
+fn translation_key_parser_handles_hyphenated_and_numeric_keys() {
+    // Regression: the key capture was an identifier shape
+    // (`[a-zA-Z_][a-zA-Z0-9_]*`), so hyphenated keys — completely legal and
+    // common in Laravel catalogues — were dropped. Worse, an unmatched
+    // `'variant-help' => [` line didn't register its nesting level: its
+    // children were attributed one level UP, and the closing `]` popped the
+    // real parent, misplacing every key after the nested block.
+    let content = r#"<?php
+return [
+    'form' => [
+        'variant' => 'Variant',
+        'variant-color' => 'Color',
+        'variant-help' => [
+            'color' => 'Suited for online shops.',
+            'black_and_white' => 'Print only.',
+        ],
+        'manufacturer' => 'Manufacturer',
+    ],
+    '404' => 'Not found',
+];
+"#;
+    let keys: std::collections::HashMap<String, String> = parse_translation_keys(content, "page")
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        keys.get("page.form.variant").map(String::as_str),
+        Some("Variant")
+    );
+    assert_eq!(
+        keys.get("page.form.variant-color").map(String::as_str),
+        Some("Color"),
+        "hyphenated keys are legal Laravel keys"
+    );
+    assert_eq!(
+        keys.get("page.form.variant-help.color").map(String::as_str),
+        Some("Suited for online shops."),
+        "a hyphenated NESTING key registers its level"
+    );
+    assert_eq!(
+        keys.get("page.form.variant-help.black_and_white")
+            .map(String::as_str),
+        Some("Print only.")
+    );
+    assert_eq!(
+        keys.get("page.form.manufacturer").map(String::as_str),
+        Some("Manufacturer"),
+        "keys after the nested block stay at their real level"
+    );
+    assert_eq!(keys.get("page.404").map(String::as_str), Some("Not found"));
+    assert!(
+        !keys.contains_key("page.form.color"),
+        "variant-help's children must not flatten a level up: {keys:?}"
+    );
+}
