@@ -294,12 +294,15 @@ fn module_dirs_get_their_own_watcher_pair() {
             GlobPattern::Relative(_) => None,
         })
         .collect();
+    // Expectations built the same way `build_watchers` builds its globs —
+    // `display()` yields backslashes on Windows, the glob base never does.
+    let base = module.display().to_string().replace('\\', "/");
     assert!(
-        globs.contains(&format!("{}/**/*.php", module.display())),
+        globs.contains(&format!("{base}/**/*.php")),
         "php glob covers config/providers/lang: {globs:?}"
     );
     assert!(
-        globs.contains(&format!("{}/**/*.blade.php", module.display())),
+        globs.contains(&format!("{base}/**/*.blade.php")),
         "blade glob covers the module views: {globs:?}"
     );
 }
