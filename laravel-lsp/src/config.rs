@@ -1124,8 +1124,21 @@ pub fn kebab_to_pascal_case(s: &str) -> String {
 /// literally. Results keep the pattern order (ascending config-merge
 /// precedence); within one `*` expansion children are sorted for
 /// determinism; a directory matched by several patterns keeps its first
-/// position. Only existing directories are returned, and anything escaping
-/// the root (e.g. via `..`) is dropped.
+/// position. Only existing directories are returned.
+///
+/// A PATTERN escaping the root (a `..` segment) is rejected — that is a
+/// configuration error, not a deliberate layout. Symlinked results are
+/// deliberately followed and NOT containment-checked, by the
+/// configured-vs-discovered split `path_containment` encodes: these paths
+/// come from the user's own `modules.paths` setting, and composer path
+/// repositories legitimately symlink local packages to targets outside the
+/// repository — refusing them would break local package development. Paths
+/// DISCOVERED under a module (the provider-class walk) are gated instead.
+///
+/// Each pattern logs its match count, and a pattern matching nothing warns:
+/// a typo'd glob (`app/**` matches only a directory literally named `**` —
+/// this expansion has no recursive wildcard) is otherwise indistinguishable
+/// from a working one.
 pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -1161,10 +1174,21 @@ pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
             }
             current = next;
         }
+        let mut matched = 0usize;
         for dir in current {
-            if dir != *root && dir.starts_with(root) && seen.insert(dir.clone()) {
+            if dir != *root && seen.insert(dir.clone()) {
                 out.push(dir);
+                matched += 1;
             }
+        }
+        if matched == 0 {
+            tracing::warn!(
+                "modules.paths pattern {pattern:?} matched no directories — \
+                 a typo'd glob is a silent no-op (note: `*` matches one \
+                 level; there is no recursive `**`)"
+            );
+        } else {
+            tracing::debug!("modules.paths pattern {pattern:?} matched {matched} directories");
         }
     }
 
@@ -1253,7 +1277,15 @@ fn resolve_provider_class_file(
 
     let basename = fqcn.rsplit('\\').next()?;
     let file_name = format!("{basename}.php");
+    // `follow_links(true)` matches `expand_module_dirs`'s `is_dir()`
+    // behaviour, so a symlinked module looks the same to both. These paths
+    // are DISCOVERED rather than configured, so each yielded entry is gated
+    // (#228 convention) — against the module dir, which is itself trusted
+    // configuration: a symlink INSIDE the module escaping it is refused,
+    // while a module that is itself a symlinked composer path repository
+    // keeps working.
     walkdir::WalkDir::new(module_dir)
+        .follow_links(true)
         .max_depth(6)
         .into_iter()
         .filter_entry(|e| {
@@ -1262,23 +1294,32 @@ fn resolve_provider_class_file(
         })
         .filter_map(|e| e.ok())
         .map(|e| e.into_path())
-        .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(file_name.as_str()))
+        .find(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str()) == Some(file_name.as_str())
+                && crate::path_containment::path_within_root_walk_entry(p, module_dir)
+        })
 }
 
 /// All files that contribute to the config group `group` (the top-level
-/// `config('group.…')` key), in **ascending merge precedence**: the project
-/// `config/{group}.php` first, then each module's `config/{group}.php` in
-/// module order. Mirrors the runtime pattern where a module service
-/// provider `array_replace_recursive`s its config files over the existing
-/// repository state. Only existing files are returned.
+/// `config('group.…')` key), in **descending merge precedence** — the file
+/// whose value wins at runtime FIRST: each module's `config/{group}.php` in
+/// reverse module order (the last-merged module wins), then the project
+/// `config/{group}.php` as the fallback. Mirrors the runtime pattern where
+/// a module service provider `array_replace_recursive`s its config files
+/// over the existing repository state. Only existing files are returned.
+///
+/// This helper owns precedence, not just discovery: consumers iterate the
+/// returned order as-is and take the first hit — none of them re-reverses,
+/// so a new consumer cannot silently invert the rule by forgetting a
+/// `.rev()`.
 pub fn config_group_files(root: &Path, module_dirs: &[PathBuf], group: &str) -> Vec<PathBuf> {
     let file_name = format!("{group}.php");
-    std::iter::once(root.join("config").join(&file_name))
-        .chain(
-            module_dirs
-                .iter()
-                .map(|m| m.join("config").join(&file_name)),
-        )
+    module_dirs
+        .iter()
+        .rev()
+        .map(|m| m.join("config").join(&file_name))
+        .chain(std::iter::once(root.join("config").join(&file_name)))
         .filter(|p| p.is_file())
         .collect()
 }

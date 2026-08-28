@@ -172,3 +172,63 @@ class AppServiceProvider
     let reg = map.get("common-ui").expect("common-ui registered");
     assert_eq!(reg.class_namespace, "App\\Common\\UI\\Livewire");
 }
+
+#[test]
+fn unknown_named_argument_skips_the_argument_not_the_call() {
+    // `lazy: true` (or any parameter a future Livewire adds) must not
+    // silently disable the whole namespace registration.
+    let (_tmp, root, provider_path) = module_layout();
+    let source = r#"<?php
+
+namespace App\Common\UI\Providers;
+
+use Livewire\Livewire;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        Livewire::addNamespace(
+            namespace: 'common-ui',
+            classNamespace: 'App\\Common\\UI\\Livewire',
+            classPath: __DIR__.'/../Livewire',
+            lazy: true,
+        );
+    }
+}
+"#;
+    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    assert!(
+        map.contains_key("common-ui"),
+        "one unknown flag must not drop the registration: {map:?}"
+    );
+}
+
+#[test]
+fn within_a_file_the_last_registration_wins() {
+    // PHP executes both statements; Livewire's registry keeps the LATER
+    // one — the extractor must agree.
+    let (_tmp, root, provider_path) = module_layout();
+    std::fs::create_dir_all(root.join("app/Common/UI/app/Alt")).unwrap();
+    let source = r#"<?php
+
+namespace App\Common\UI\Providers;
+
+use Livewire\Livewire;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        Livewire::addNamespace('common-ui', 'App\\Common\\UI\\Livewire', __DIR__.'/../Livewire');
+        Livewire::addNamespace('common-ui', 'App\\Common\\UI\\Alt', __DIR__.'/../Alt');
+    }
+}
+"#;
+    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let reg = map.get("common-ui").expect("registered");
+    assert_eq!(
+        reg.class_namespace, "App\\Common\\UI\\Alt",
+        "the later statement overwrites the earlier one"
+    );
+}

@@ -1239,7 +1239,7 @@ fn expand_module_dirs_rejects_escaping_patterns() {
 }
 
 #[test]
-fn config_group_files_orders_root_before_modules() {
+fn config_group_files_orders_by_descending_precedence() {
     let (_tmp, root, module) = modular_workspace();
     fs::write(root.join("config/app.php"), "<?php return [];").unwrap();
     fs::write(module.join("config/app.php"), "<?php return [];").unwrap();
@@ -1253,7 +1253,9 @@ fn config_group_files_orders_root_before_modules() {
     let app_files = config_group_files(&root, &module_dirs, "app");
     assert_eq!(
         app_files,
-        vec![root.join("config/app.php"), module.join("config/app.php")]
+        vec![module.join("config/app.php"), root.join("config/app.php")],
+        "the winning file (last-merged module) comes FIRST — the helper owns \
+         precedence, consumers take the first hit"
     );
 
     let module_only = config_group_files(&root, &module_dirs, "legal-guaranteelabel");
@@ -1425,4 +1427,55 @@ fn expand_module_dirs_malformed_entries_are_a_no_op() {
         ],
     );
     assert_eq!(dirs, vec![tmp.path().join("app/Common/Ui")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn discovered_provider_walk_refuses_symlink_escapes_but_keeps_symlinked_modules() {
+    // The configured/discovered split: a module dir that IS a symlink
+    // (composer path repository) is trusted configuration and keeps
+    // working; a symlink INSIDE a module pointing outside it is a
+    // discovered path and is refused (#228 convention).
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(outside.join("Providers")).unwrap();
+    fs::write(
+        outside.join("Providers/EscapeServiceProvider.php"),
+        "<?php class EscapeServiceProvider {}",
+    )
+    .unwrap();
+
+    // Module with a composer manifest naming a provider that only exists
+    // BEHIND an escaping symlink.
+    let module = tmp.path().join("proj/app/Legal/Sneaky");
+    fs::create_dir_all(&module).unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{ "extra": { "laravel": { "providers": ["Acme\\EscapeServiceProvider"] } } }"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&outside, module.join("linked")).unwrap();
+    assert!(
+        module_provider_files(std::slice::from_ref(&module)).is_empty(),
+        "a symlink escaping the module must not become a provider source"
+    );
+
+    // The module dir itself being a symlink stays supported.
+    let real = tmp.path().join("packages/real-module");
+    fs::create_dir_all(real.join("Providers")).unwrap();
+    fs::write(
+        real.join("composer.json"),
+        r#"{ "extra": { "laravel": { "providers": ["Acme\\RealServiceProvider"] } } }"#,
+    )
+    .unwrap();
+    fs::write(
+        real.join("Providers/RealServiceProvider.php"),
+        "<?php class RealServiceProvider {}",
+    )
+    .unwrap();
+    let linked_module = tmp.path().join("proj/app/Legal/Linked");
+    fs::create_dir_all(linked_module.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &linked_module).unwrap();
+    let files = module_provider_files(std::slice::from_ref(&linked_module));
+    assert_eq!(files.len(), 1, "symlinked composer path repo keeps working");
 }

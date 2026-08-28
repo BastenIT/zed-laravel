@@ -46,8 +46,8 @@ pub fn locate_key(root: &Path, dotted_key: &str) -> Option<KeyPosition> {
 
 /// Locate `dotted_key` in **every** file contributing to its config group —
 /// the project `config/{group}.php` plus each module's config file (see
-/// [`crate::config::config_group_files`]). Returned in descending merge
-/// precedence (the file whose value wins at runtime first), so `.first()`
+/// [`crate::config::config_group_files`], which already orders by
+/// descending merge precedence — the file whose value wins first), so `.first()`
 /// is the primary declaration and the full list feeds find-references and
 /// rename across merged declarations.
 pub fn locate_key_all(
@@ -66,7 +66,6 @@ pub fn locate_key_all(
 
     crate::config::config_group_files(root, module_dirs, file)
         .into_iter()
-        .rev()
         .filter_map(|config_path| {
             let content = std::fs::read_to_string(&config_path).ok()?;
             let position = locate_in_source(&content, &path_segments)?;

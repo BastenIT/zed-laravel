@@ -310,3 +310,66 @@ async fn unset_and_stale_glob_produce_identical_output() {
         "sanity: the root config is still scanned: {unset:?}"
     );
 }
+
+#[test]
+fn non_leaf_lookup_returns_the_winning_files_subtree_by_design() {
+    // Pinned intentionally: `config('group')` for a PARENT array split
+    // across files returns the winning file's subtree, not an
+    // `array_replace_recursive` merge of all contributors. Per-key nested
+    // resolution (the tests above) is merged; whole-array hover shows the
+    // highest-precedence declaration. Full-array merging is a deliberate
+    // non-goal for now.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let module = modular_fixture(tmp.path());
+
+    let (value, source) =
+        resolve_value_with_source(tmp.path(), std::slice::from_ref(&module), "app.features")
+            .expect("parent key resolves");
+    assert_eq!(source, module.join("config/app.php"), "winning file");
+    assert!(
+        value.contains("module_only") && !value.contains("root_only"),
+        "the subtree is the winning file's alone: {value}"
+    );
+}
+
+#[tokio::test]
+async fn unset_and_stale_glob_produce_identical_translation_completions() {
+    // The other half of the opt-in diff check: translation completion —
+    // the surface the Salsa namespaced-catalogue scan actually changed —
+    // is byte-identical between `modules.paths` unset and a stale glob.
+    // (Namespaces registered by VENDOR packages appear in both alike:
+    // that scan is deliberately unconditional — the #293/#328 gap — and
+    // documented as such, independent of the modules setting.)
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lang = tmp.path().join("lang/en");
+    fs::create_dir_all(&lang).unwrap();
+    fs::write(
+        lang.join("messages.php"),
+        "<?php\nreturn [\n    'welcome' => 'Welcome',\n];\n",
+    )
+    .unwrap();
+
+    let run = |patterns: Vec<String>| {
+        let root = tmp.path().to_path_buf();
+        async move {
+            let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+            let backend = service.inner().clone();
+            *backend.root_path.write().await = Some(root);
+            *backend.module_path_patterns.write().await = patterns;
+            backend
+                .get_all_translation_keys()
+                .await
+                .into_iter()
+                .map(|k| format!("{}={} ({})", k.key, k.value, k.source))
+                .collect::<Vec<String>>()
+        }
+    };
+
+    let unset = run(Vec::new()).await;
+    let stale = run(vec!["app/Gone/*".to_string()]).await;
+    assert_eq!(unset, stale);
+    assert!(
+        unset.iter().any(|k| k.starts_with("messages.welcome")),
+        "sanity: the root catalogue is scanned: {unset:?}"
+    );
+}
