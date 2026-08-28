@@ -61,9 +61,13 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
         //     extra.laravel.providers (never by filename convention) are
         //     indexed like app/Providers: their loadViewsFrom /
         //     loadTranslationsFrom / Blade::directive / Livewire
-        //     registrations all resolve. On a namespace conflict the
-        //     last-registered module provider wins; an app/Providers
-        //     registration overrides modules, because the app boots last.
+        //     registrations all resolve. Modules form their own precedence
+        //     tier between packages and the app (framework < package <
+        //     module < app), so on a namespace conflict an app/Providers
+        //     registration always wins — the app boots last — and between
+        //     two modules the later (higher glob-match precedence) one
+        //     wins. Paths a provider registers are containment-checked:
+        //     a registration pointing outside the project is dropped.
         // All of it is parsed statically (tree-sitter) — no project PHP is
         // ever executed. Two operational notes: changing "paths" MID-SESSION
         // re-resolves everything except the file watchers — restart the

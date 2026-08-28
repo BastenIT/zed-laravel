@@ -278,8 +278,10 @@ pub fn build_watchers(
     // otherwise get no watcher at all: edits to its config, providers,
     // views, or lang catalogues would go unseen until a server restart.
     // The `.php` glob covers config/providers/lang, the `.blade.php` one
-    // the module's views. Same dedup as the PSR-4 loop, so a module dir
-    // nested under a watched source root costs nothing extra.
+    // the module's views. The dedup is exact-string, same as the PSR-4
+    // loop: it collapses a module dir that IS a watched source root, but a
+    // module nested UNDER one still registers its own (overlapping) pair —
+    // harmless duplication of coverage, not a missed watch.
     for module_dir in module_dirs {
         for suffix in ["**/*.php", "**/*.blade.php"] {
             let glob = format!("{}/{}", glob_base(module_dir), suffix);

@@ -136,7 +136,7 @@ pub struct ServiceProviderFile {
     #[returns(ref)]
     pub text: String,
 
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     #[returns(copy)]
     pub priority: u8,
 }
@@ -2557,7 +2557,7 @@ pub struct ParsedMiddlewareReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2582,7 +2582,7 @@ pub struct ParsedBindingReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2613,7 +2613,7 @@ pub struct ParsedMacroReg<'db> {
     /// 0-based definition line — the closure's line, or the mixin method's line.
     #[returns(copy)]
     pub decl_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
 }
@@ -2630,7 +2630,7 @@ pub struct ParsedViewNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2653,7 +2653,7 @@ pub struct ParsedBladeComponentReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2673,7 +2673,7 @@ pub struct ParsedComponentNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2694,7 +2694,7 @@ pub struct ParsedAnonymousComponentPathReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2715,7 +2715,7 @@ pub struct ParsedAnonymousComponentNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -5397,7 +5397,7 @@ pub struct MiddlewareRegistrationData {
     pub source_file: Option<PathBuf>,
     /// Line number in source file (0-based)
     pub source_line: Option<usize>,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5425,7 +5425,7 @@ pub struct BindingRegistrationData {
     pub source_file: Option<PathBuf>,
     /// Line number in source file (0-based)
     pub source_line: Option<usize>,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5443,7 +5443,7 @@ pub struct MacroRegistrationData {
     pub decl_file: PathBuf,
     /// 0-based definition line.
     pub decl_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app (higher wins on key collision).
+    /// Priority: 0=framework, 1=package, 2=module, 3=app (higher wins on key collision).
     pub priority: u8,
 }
 
@@ -5618,7 +5618,7 @@ pub struct ViewNamespaceData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5636,7 +5636,7 @@ pub struct BladeComponentRegData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5652,7 +5652,7 @@ pub struct ComponentNamespaceData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5692,7 +5692,7 @@ pub struct ParsedMiddlewareData {
     pub file_path: Option<PathBuf>,
     /// Line in source file
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     pub priority: u8,
     /// Source file path
     pub source_file: PathBuf,
@@ -5711,7 +5711,7 @@ pub struct ParsedBindingData {
     pub binding_type: BindingTypeEnum,
     /// Line in source file
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     pub priority: u8,
     /// Source file path
     pub source_file: PathBuf,
@@ -10128,9 +10128,12 @@ impl SalsaActor {
             livewire_config,
         );
 
-        // Collect view namespaces from all parsed service providers
-        let mut view_namespaces: HashMap<String, PathBuf> = HashMap::new();
-        let mut component_namespaces: HashMap<String, String> = HashMap::new();
+        // Collect view namespaces from all parsed service providers.
+        // Both maps carry (priority, value) while merging — app > module >
+        // package > framework, last-wins on ties — and drop the priority
+        // once the winner is settled.
+        let mut view_namespaces: HashMap<String, (u8, PathBuf)> = HashMap::new();
+        let mut component_namespaces: HashMap<String, (u8, String)> = HashMap::new();
         let mut anonymous_component_paths: HashMap<String, PathBuf> = HashMap::new();
         let mut anonymous_component_namespaces: HashMap<String, String> = HashMap::new();
         // tag → (priority, class file); higher priority (app > package >
@@ -10143,28 +10146,34 @@ impl SalsaActor {
             for sp_file in self.sorted_sp_files() {
                 let parsed = parse_service_provider_source(&self.db, sp_file, sp_root.clone());
 
-                // Collect view namespaces
+                // Collect view namespaces. Higher priority wins (the app
+                // boots last, so app > module > package); on EQUAL priority
+                // the later provider in the deterministic lexicographic
+                // order wins — matching the documented last-registered-wins
+                // rule and the translation-namespace merge.
                 for vn in parsed.view_namespaces(&self.db) {
                     let ns = vn.namespace(&self.db).namespace(&self.db).clone();
+                    let prio = vn.priority(&self.db);
                     if let Some(path) = vn.view_path(&self.db).clone() {
-                        // Higher priority wins
                         match view_namespaces.get(&ns) {
-                            Some(_) => {} // Keep existing (first wins for now)
-                            None => {
-                                view_namespaces.insert(ns, path);
+                            Some((existing_prio, _)) if *existing_prio > prio => {}
+                            _ => {
+                                view_namespaces.insert(ns, (prio, path));
                             }
                         }
                     }
                 }
 
-                // Collect component namespaces
+                // Collect component namespaces — same precedence rule as the
+                // view namespaces above.
                 for cn in parsed.component_namespaces(&self.db) {
                     let prefix = cn.prefix(&self.db).namespace(&self.db).clone();
+                    let prio = cn.priority(&self.db);
                     let php_ns = cn.php_namespace(&self.db).clone();
                     match component_namespaces.get(&prefix) {
-                        Some(_) => {} // Keep existing (first wins for now)
-                        None => {
-                            component_namespaces.insert(prefix, php_ns);
+                        Some((existing_prio, _)) if *existing_prio > prio => {}
+                        _ => {
+                            component_namespaces.insert(prefix, (prio, php_ns));
                         }
                     }
                 }
@@ -10203,18 +10212,19 @@ impl SalsaActor {
             }
         }
 
-        // Also include any from the legacy cache
+        // Also include any from the legacy cache — fallback-only, so it
+        // never displaces a live parse (priority 0 on insert).
         for (ns, data) in &self.sp_view_namespaces {
             if let Some(path) = &data.view_path {
                 view_namespaces
                     .entry(ns.clone())
-                    .or_insert_with(|| path.clone());
+                    .or_insert_with(|| (0, path.clone()));
             }
         }
         for (prefix, data) in &self.sp_component_namespaces {
             component_namespaces
                 .entry(prefix.clone())
-                .or_insert_with(|| data.php_namespace.clone());
+                .or_insert_with(|| (0, data.php_namespace.clone()));
         }
         for (tag, data) in &self.sp_blade_components {
             if let Some(file) = &data.file_path {
@@ -10246,8 +10256,14 @@ impl SalsaActor {
             component_paths: config_ref.component_paths(&self.db).clone(),
             livewire_path: config_ref.livewire_path(&self.db).clone(),
             has_livewire: config_ref.has_livewire(&self.db),
-            view_namespaces,
-            component_namespaces,
+            view_namespaces: view_namespaces
+                .into_iter()
+                .map(|(ns, (_prio, path))| (ns, path))
+                .collect(),
+            component_namespaces: component_namespaces
+                .into_iter()
+                .map(|(prefix, (_prio, php_ns))| (prefix, php_ns))
+                .collect(),
             anonymous_component_paths,
             anonymous_component_namespaces,
             component_aliases,

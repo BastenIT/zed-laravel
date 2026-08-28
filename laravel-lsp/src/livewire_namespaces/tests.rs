@@ -44,7 +44,7 @@ class AppServiceProvider extends AbstractModuleServiceProvider
 }
 
 #[test]
-fn extracts_direct_add_namespace_with_named_arguments_in_any_order() {
+fn extracts_direct_add_namespace_named_arguments_path_first() {
     let (_tmp, root, provider_path) = module_layout();
     let source = r#"<?php
 
@@ -148,7 +148,7 @@ fn module_root_namespace_variants() {
 }
 
 #[test]
-fn extracts_direct_add_namespace_with_named_arguments_in_declared_order() {
+fn extracts_direct_add_namespace_named_arguments_namespace_first() {
     let (_tmp, root, provider_path) = module_layout();
     let source = r#"<?php
 
@@ -230,5 +230,64 @@ class AppServiceProvider
     assert_eq!(
         reg.class_namespace, "App\\Common\\UI\\Alt",
         "the later statement overwrites the earlier one"
+    );
+}
+
+#[test]
+fn a_skipped_positional_still_consumes_its_slot() {
+    // An unusable leading positional (`$variable`) must not shift the later
+    // literals one parameter to the left — the namespace would silently
+    // take the class-namespace's value.
+    let (_tmp, root, provider_path) = module_layout();
+    let source = r#"<?php
+
+namespace App\Common\UI\Providers;
+
+use Livewire\Livewire;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        Livewire::addNamespace($dynamicPrefix, 'App\\Common\\UI\\Livewire', __DIR__.'/../Livewire');
+    }
+}
+"#;
+    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    assert!(
+        map.is_empty(),
+        "the literals stay in their own slots, so nothing resolves: {map:?}"
+    );
+}
+
+#[test]
+fn a_custom_registrar_wrapper_name_is_honored() {
+    // Proves `modules.livewireRegistrars` is consulted rather than the
+    // extractor recognizing a hardcoded default: this name ships nowhere.
+    let (_tmp, root, provider_path) = module_layout();
+    let source = r#"<?php
+
+namespace App\Common\UI\Providers;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        $this->registerModuleLivewire(__DIR__.'/../Livewire', 'common-ui');
+    }
+}
+"#;
+    let configured = vec!["registerModuleLivewire".to_string()];
+    let map = extract_livewire_namespaces(source, &provider_path, &root, &configured);
+    assert!(
+        map.contains_key("common-ui"),
+        "the configured wrapper name is recognized: {map:?}"
+    );
+
+    let defaults = registrars();
+    assert!(
+        !extract_livewire_namespaces(source, &provider_path, &root, &defaults)
+            .contains_key("common-ui"),
+        "negative control: an unconfigured wrapper name registers nothing"
     );
 }
