@@ -42,7 +42,7 @@ use laravel_lsp::salsa_impl::{
     ComponentReferenceData, ConfigReferenceData, DirectiveReferenceData, EnvReferenceData,
     FeatureReferenceData, LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData,
     PatternAtPosition, ReferenceLocationData, RouteReferenceData, SalsaActor, SalsaHandle,
-    TranslationReferenceData, UrlReferenceData, ViewReferenceData,
+    TranslationKeyTarget, TranslationReferenceData, UrlReferenceData, ViewReferenceData,
 };
 
 // The Linux release binaries are static musl builds; musl's default
@@ -188,7 +188,10 @@ struct ConfigCheck {
 struct ConfigKeyCompletion {
     /// The full dot-notation key (e.g., "app.name")
     key: String,
-    /// The value (truncated for display)
+    /// The resolved value at **full length**, untruncated. Each render site
+    /// clips it to its own budget via
+    /// `completion_display::{COMPLETION_DETAIL_LIMIT, COMPLETION_DOC_LIMIT}`
+    /// (issue #326).
     value: String,
     /// Source file (e.g., "config/app.php")
     source: String,
@@ -258,7 +261,10 @@ struct ModelPropertyCompletion {
 struct TranslationKeyCompletion {
     /// The full dot-notation key (e.g., "messages.welcome")
     key: String,
-    /// The translated value (for display)
+    /// The translated value at **full length**, untruncated. Each render site
+    /// clips it to its own budget via
+    /// `completion_display::{COMPLETION_DETAIL_LIMIT, COMPLETION_DOC_LIMIT}`
+    /// (issue #326).
     value: String,
     /// Source file (e.g., "lang/en/messages.php")
     source: String,
@@ -2003,6 +2009,11 @@ struct LaravelLanguageServer {
     /// Add space between directive name and parentheses in completions
     /// false: @if($condition)  |  true: @if ($condition)
     directive_spacing: Arc<RwLock<bool>>,
+    /// Extra directive names the user declared as view-rendering (issue #325),
+    /// set via the `blade.viewDirectives` LSP setting. Read by
+    /// [`Self::create_directive_location_from_salsa`]'s goto fallback; the
+    /// diagnostic path never consults it.
+    view_directives: Arc<RwLock<ViewDirectivesSettings>>,
     /// Severity for query-chain diagnostics (unknown column/relation/table).
     /// `None` disables them; defaults to `WARNING`. Set via the
     /// `diagnostics.severity` LSP setting.
@@ -2077,7 +2088,6 @@ struct LaravelLanguageServer {
     /// `None` means "not yet scanned"; `Some(map)` means "scanned, here's
     /// what we found" (the map can be empty if no packages register).
     /// Wrapped in `Arc` so clones share memory across hover calls.
-    vendor_translation_namespaces: Arc<RwLock<Option<Arc<HashMap<String, PathBuf>>>>>,
 
     /// Module directory patterns from the `modules.paths` setting. Empty =
     /// modular-monolith support off (the default). See [`ModulesSettings`].
@@ -2225,6 +2235,43 @@ const FILE_EXISTS_CACHE_CAP: usize = 8192;
 // NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
 // which scans the Laravel framework, app service providers, and packages.
 
+/// User-declared view-rendering directive names (issue #325). Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "blade": { "viewDirectives": {
+/// "firstArg": ["myDirective"], "secondArg": ["myOtherDirective"] } } } } } }`
+///
+/// The escape hatch for a directive the goto fallback can't or shouldn't infer:
+/// a name listed here resolves exactly like a hardcoded `view_directives_first_arg`
+/// / `view_directives_second_arg` entry. Entries outrank [`NON_VIEW_DIRECTIVES`]
+/// (a user may deliberately re-enable a denylisted name) but never outrank a
+/// directive with dedicated handling — see
+/// [`LaravelLanguageServer::create_directive_location_from_salsa`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewDirectivesSettings {
+    /// Directive names whose FIRST quoted argument is a view name, like
+    /// `@extends`/`@include`.
+    #[serde(default)]
+    first_arg: Vec<String>,
+    /// Directive names whose SECOND quoted argument is a view name (after a
+    /// condition), like `@includeWhen`/`@includeUnless`.
+    #[serde(default)]
+    second_arg: Vec<String>,
+}
+
+/// Whether a missing view behind this directive raises a "View file not found"
+/// diagnostic.
+///
+/// Deliberately far narrower than the set goto-definition resolves (issue
+/// #325): goto and diagnostics have opposite risk profiles. A wrong goto costs
+/// one keystroke; a wrong squiggle marks working code. So the goto path gained a
+/// permissive fallback for third-party `Blade::directive()` registrations while
+/// this gate stayed exactly as it was — a directive reachable only through that
+/// fallback, or through the `blade.viewDirectives` setting, can never produce a
+/// false missing-view diagnostic.
+fn directive_takes_missing_view_diagnostic(name: &str) -> bool {
+    name == "extends" || name == "include"
+}
+
 /// Blade-specific settings
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { "blade": { ... } } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -2235,7 +2282,106 @@ struct BladeSettings {
     /// true:  @if ($condition)
     #[serde(default)]
     directive_spacing: bool,
+    /// Extra directive names to treat as view-rendering in goto-definition.
+    /// Both lists default to empty.
+    #[serde(default)]
+    view_directives: ViewDirectivesSettings,
 }
+
+/// Built-in Blade directives whose argument is NOT a view name, so the
+/// goto-definition fallback in
+/// [`LaravelLanguageServer::create_directive_location_from_salsa`] must never
+/// fire for them (issue #325).
+///
+/// Without this, `@section('content')` would jump to
+/// `resources/views/content.blade.php` whenever a view happens to share the
+/// section's name — a plausible-looking but wrong target. The list is the
+/// container/label directives the outline builder already enumerates (see
+/// `document_symbols.rs`), the section-name pair `@hasSection`/`@sectionMissing`
+/// (identical false-positive shape to `@section`), and the standard
+/// control-flow/utility directives.
+///
+/// A name here is still resolvable if the user explicitly declares it under
+/// `blade.viewDirectives` — see [`ViewDirectivesSettings`].
+const NON_VIEW_DIRECTIVES: &[&str] = &[
+    // Container / label directives (mirrors document_symbols.rs).
+    "section",
+    "endsection",
+    "push",
+    "endpush",
+    "prepend",
+    "endprepend",
+    "slot",
+    "endslot",
+    "endcomponent",
+    "stack",
+    "yield",
+    "props",
+    // Section-name directives — same false-positive shape as @section.
+    "hasSection",
+    "sectionMissing",
+    // Control flow.
+    "if",
+    "elseif",
+    "else",
+    "endif",
+    "unless",
+    "endunless",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "endswitch",
+    "foreach",
+    "endforeach",
+    "forelse",
+    "endforelse",
+    "empty",
+    "endempty",
+    "for",
+    "endfor",
+    "while",
+    "endwhile",
+    // Authorization / environment / state guards.
+    "can",
+    "cannot",
+    "elsecan",
+    "elsecannot",
+    "endcan",
+    "endcannot",
+    "error",
+    "enderror",
+    "env",
+    "production",
+    "endenv",
+    "auth",
+    "endauth",
+    "guest",
+    "endguest",
+    "isset",
+    "endisset",
+    // Utility / output.
+    "php",
+    "endphp",
+    "inject",
+    "method",
+    "csrf",
+    "json",
+    "dump",
+    "dd",
+    "class",
+    "style",
+    "checked",
+    "selected",
+    "disabled",
+    "readonly",
+    "required",
+    "use",
+    "lang",
+    "vite",
+    "aware",
+];
 
 /// Query-chain diagnostics settings (unknown column / relation / table).
 /// Configured via:
@@ -4504,6 +4650,7 @@ impl LaravelLanguageServer {
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
             auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
             directive_spacing: Arc::new(RwLock::new(false)),
+            view_directives: Arc::new(RwLock::new(ViewDirectivesSettings::default())),
             chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
             code_lens_enabled: Arc::new(RwLock::new(false)),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
@@ -4516,7 +4663,6 @@ impl LaravelLanguageServer {
             indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
             command_index: Arc::new(RwLock::new(None)),
-            vendor_translation_namespaces: Arc::new(RwLock::new(None)),
             module_path_patterns: Arc::new(RwLock::new(Vec::new())),
             cached_module_dirs: Arc::new(RwLock::new(None)),
             module_livewire_registrars: Arc::new(RwLock::new(default_livewire_registrars())),
@@ -4562,6 +4708,19 @@ impl LaravelLanguageServer {
             *self.directive_spacing.write().await = new_spacing;
         }
 
+        // Extra view-rendering directive names (issue #325). The old value is
+        // cloned into a local first: a read guard held in the `if` condition
+        // would outlive the condition and deadlock against the `write()` below.
+        let new_view_directives = &settings.blade.view_directives;
+        let old_view_directives = self.view_directives.read().await.clone();
+        if *new_view_directives != old_view_directives {
+            info!(
+                "⚙️  Updating blade.viewDirectives: firstArg={:?}, secondArg={:?}",
+                new_view_directives.first_arg, new_view_directives.second_arg
+            );
+            *self.view_directives.write().await = new_view_directives.clone();
+        }
+
         // Query-chain diagnostics severity
         let new_severity = parse_chain_diagnostic_severity(&settings.diagnostics.severity);
         let old_severity = *self.chain_diagnostic_severity.read().await;
@@ -4595,8 +4754,10 @@ impl LaravelLanguageServer {
             *self.module_path_patterns.write().await = new_module_paths;
             *self.cached_module_dirs.write().await = None;
             // Translation namespaces include module-provider registrations,
-            // so the merged map must rebuild with the new module set.
-            *self.vendor_translation_namespaces.write().await = None;
+            // so the provider-derived map must rebuild with the new module
+            // set (`module_dirs_for` re-registers the extras on its next
+            // resolve).
+            let _ = self.salsa.invalidate_translation_providers().await;
             // Livewire class namespaces come from module providers too.
             *self.cached_livewire.write().await = None;
         }
@@ -4628,6 +4789,15 @@ impl LaravelLanguageServer {
         let patterns = self.module_path_patterns.read().await.clone();
         let expanded = Arc::new(laravel_lsp::config::expand_module_dirs(root, &patterns));
         *self.cached_module_dirs.write().await = Some(expanded.clone());
+        // Module service providers register translation namespaces via
+        // `loadTranslationsFrom` too — hand them to the Salsa translation
+        // layer as first-party providers (a no-op when the set is
+        // unchanged), so `ns::` hover/goto/completion covers modules.
+        let module_providers = laravel_lsp::config::module_provider_files(&expanded);
+        let _ = self
+            .salsa
+            .set_translation_provider_extras(module_providers)
+            .await;
         expanded
     }
 
@@ -9167,6 +9337,11 @@ impl LaravelLanguageServer {
             })
         {
             // App service provider - Service provider file
+            //
+            // Also drops the vendor translation-namespace map: an edited
+            // `loadTranslationsFrom` changes where namespaced translation keys
+            // resolve (issue #293).
+            self.invalidate_vendor_translation_namespaces().await;
             if let Some(root) = root_path {
                 debug!("📦 Updating Salsa: ServiceProviderFile ({})", filename);
                 if let Err(e) = self
@@ -9261,6 +9436,25 @@ impl LaravelLanguageServer {
             // deliberate action, not something queried mid-keystroke. The
             // refresh (instant per-file + debounced project reconverge) runs on
             // `did_save` instead. See `refresh_magic_on_save`.
+        }
+
+        // A lang catalogue additionally feeds the translation cache. This is
+        // not an `else if` on the chain above: a `lang/de/validation.php` is
+        // still a SourceFile for pattern extraction, and it is *also* the
+        // authoritative text for translation resolution. Registering the
+        // editor buffer here is what makes an unsaved edit to a lang file show
+        // up in the next hover without a save (issue #293).
+        if let Some(root) = self.root_path.read().await.as_ref() {
+            if laravel_lsp::translation_lookup::is_lang_file(root, &path) {
+                debug!("📦 Updating Salsa: LangFile ({})", filename);
+                if let Err(e) = self
+                    .salsa
+                    .register_lang_source(path.clone(), content.to_string())
+                    .await
+                {
+                    debug!("Failed to update lang file in Salsa: {}", e);
+                }
+            }
         }
 
         // After Salsa update, re-run diagnostics for this file
@@ -15106,203 +15300,32 @@ impl LaravelLanguageServer {
         completions
     }
 
-    /// Get all translation keys from lang/*.php files for autocomplete —
-    /// the project root's own catalogues AND every registered translation
-    /// namespace (vendor packages, modules, app `loadTranslationsFrom`
-    /// calls). Without the latter, a project that keeps a namespace's
-    /// catalogues only under its registered directory (never published to
-    /// root `lang/vendor/…`) got zero completions for `ns::file.key`.
+    /// Get all translation keys from lang/*.php files for autocomplete.
+    ///
+    /// Served from the Salsa translation cache (issue #293). This used to
+    /// re-enumerate the lang root *and* the locale directory, then re-read and
+    /// re-parse every catalogue in that locale — recompiling the key regex each
+    /// time — on **every completion request**. The semantics are unchanged:
+    /// first existing lang root, first locale directory within it, first-wins
+    /// on duplicate keys. See
+    /// [`laravel_lsp::salsa_impl::TranslationCache::completion_keys`] for why
+    /// a single locale is the right answer here where the hover / goto /
+    /// diagnostics trio unions every locale.
     async fn get_all_translation_keys(&self) -> Vec<TranslationKeyCompletion> {
-        let root = match self.root_path.read().await.clone() {
-            Some(r) => r,
-            None => return Vec::new(),
+        let Some(root) = self.root_path.read().await.clone() else {
+            return Vec::new();
         };
-
-        // Laravel 9+ uses lang/, older versions use resources/lang/
-        //
-        // Deliberately NOT routed through
-        // `translation_lookup::available_locales`, which the hover /
-        // go-to-definition / diagnostics trio share (issue #288). That helper
-        // answers "which locales could define *this key*" and unions every
-        // candidate directory; completion asks a different question — "what
-        // keys exist at all" — and any single locale answers it, because a key
-        // present in one locale is offered regardless of which locale defines
-        // it. Enumerating the union here would read every catalogue in the
-        // project on each completion request to produce the same list, and
-        // would surface a key from a partially-translated locale as though it
-        // were project-wide. First-wins is the right shape for this caller.
-        let lang_dirs = [root.join("lang"), root.join("resources").join("lang")];
-
-        let mut completions = Vec::new();
-        if let Some(lang_dir) = lang_dirs.iter().find(|d| d.exists()) {
-            completions.extend(Self::translation_keys_in_lang_dir(lang_dir, None));
-        }
-
-        if let Some(namespaces) = self.vendor_translation_namespaces_for(&root).await {
-            for (namespace, dir) in namespaces.iter() {
-                completions.extend(Self::translation_keys_in_lang_dir(dir, Some(namespace)));
-            }
-        }
-
-        // Sort by key for consistent ordering
-        completions.sort_by(|a, b| a.key.cmp(&b.key));
-
-        // Remove duplicates
-        completions.dedup_by(|a, b| a.key == b.key);
-
-        completions
-    }
-
-    /// Enumerate every translation key under `lang_dir`'s first locale
-    /// subdirectory (see [`Self::get_all_translation_keys`] for the
-    /// "first-locale-wins" rationale), one catalogue file `{file}.php`
-    /// contributing `{file}.{key}` completions. `namespace` prefixes both
-    /// the key (`{ns}::{file}.{key}`, the Laravel namespaced-translation
-    /// syntax) and the reported source, and is `None` for the project's own
-    /// root `lang/` scan. Shared by that root scan and by every registered
-    /// translation namespace so namespaced candidates go through the exact
-    /// same per-file key parsing as root ones.
-    fn translation_keys_in_lang_dir(
-        lang_dir: &Path,
-        namespace: Option<&str>,
-    ) -> Vec<TranslationKeyCompletion> {
-        let mut completions = Vec::new();
-
-        let Ok(entries) = std::fs::read_dir(lang_dir) else {
-            return completions;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let locale = path.file_name().and_then(|n| n.to_str()).unwrap_or("en");
-
-            // Read all PHP files in this locale directory
-            if let Ok(files) = std::fs::read_dir(&path) {
-                for file_entry in files.flatten() {
-                    let file_path = file_entry.path();
-                    if file_path.extension().is_some_and(|e| e == "php") {
-                        if let Some(file_name) = file_path.file_stem().and_then(|s| s.to_str()) {
-                            let base_key = file_name.to_string();
-                            let source = match namespace {
-                                Some(ns) => format!("{ns}::lang/{locale}/{file_name}.php"),
-                                None => format!("lang/{locale}/{file_name}.php"),
-                            };
-
-                            if let Ok(content) = std::fs::read_to_string(&file_path) {
-                                let keys = Self::parse_translation_keys(&content, &base_key);
-                                for (key, value) in keys {
-                                    let key = match namespace {
-                                        Some(ns) => format!("{ns}::{key}"),
-                                        None => key,
-                                    };
-                                    completions.push(TranslationKeyCompletion {
-                                        key,
-                                        value,
-                                        source: source.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Only use the first locale directory found
-            break;
-        }
-
-        completions
-    }
-
-    /// Parse a PHP translation file to extract all keys and values
-    /// Returns a list of (key, value) tuples with dot-notation keys
-    fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)> {
-        let mut results = Vec::new();
-
-        // Simple regex-based parsing for Laravel translation files
-        // This handles: 'key' => 'value', or "key" => "value"
-        let key_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap();
-
-        // Track nesting depth and current key path
-        let mut key_stack: Vec<String> = vec![base_key.to_string()];
-        let mut in_array_depth = 0;
-        let mut pending_key: Option<String> = None;
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-
-            // Skip comments and empty lines
-            if trimmed.is_empty()
-                || trimmed.starts_with("//")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with("*")
-            {
-                continue;
-            }
-
-            // Handle array opening
-            if trimmed.contains("[") && !trimmed.contains("=>") {
-                in_array_depth += 1;
-                if let Some(key) = pending_key.take() {
-                    key_stack.push(key);
-                }
-                continue;
-            }
-
-            // Handle key => [ (nested array on same line)
-            if let Some(caps) = key_pattern.captures(trimmed) {
-                let key_name = caps.get(1).unwrap().as_str();
-
-                if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
-                    // This is a nested array
-                    pending_key = Some(key_name.to_string());
-                    in_array_depth += 1;
-                    key_stack.push(key_name.to_string());
-                } else {
-                    // This is a simple key => value
-                    let full_key = format!("{}.{}", key_stack.join("."), key_name);
-
-                    // Extract value
-                    let value = Self::extract_translation_value(trimmed);
-                    results.push((full_key, value));
-                }
-            }
-
-            // Handle array closing
-            let close_count = trimmed.matches(']').count();
-            for _ in 0..close_count {
-                if in_array_depth > 0 {
-                    in_array_depth -= 1;
-                    if key_stack.len() > 1 {
-                        key_stack.pop();
-                    }
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Extract the value from a translation line like "'key' => 'value',"
-    fn extract_translation_value(line: &str) -> String {
-        if let Some(arrow_pos) = line.find("=>") {
-            let after_arrow = &line[arrow_pos + 2..];
-            let value = after_arrow.trim().trim_end_matches(',').trim();
-
-            // Remove quotes and truncate
-            let unquoted = value
-                .trim_start_matches('\'')
-                .trim_start_matches('"')
-                .trim_end_matches('\'')
-                .trim_end_matches('"');
-
-            laravel_lsp::display_truncate::truncate_for_display(unquoted, 200)
-        } else {
-            String::new()
-        }
+        self.salsa
+            .translation_key_completions(root)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|data| TranslationKeyCompletion {
+                key: data.key,
+                value: data.value,
+                source: data.source,
+            })
+            .collect()
     }
 
     /// Get all validation rules (built-in + custom from app/Rules/)
@@ -15436,6 +15459,11 @@ impl LaravelLanguageServer {
 
     /// Extract the value from a config line like "'key' => value,"
     /// Resolves env() references using the provided env_vars map
+    ///
+    /// Returns the value at full length. Truncation happens at each render
+    /// site instead, because the completion list line and the documentation
+    /// panel want different budgets and one shared cut served neither
+    /// (issue #326) — see `laravel_lsp::completion_display`.
     fn extract_config_value(
         line: &str,
         env_vars: &std::collections::HashMap<String, String>,
@@ -15445,9 +15473,7 @@ impl LaravelLanguageServer {
             let value = after_arrow.trim().trim_end_matches(',').trim();
 
             // Check for env() call pattern: env('VAR_NAME') or env('VAR_NAME', 'default')
-            let resolved = Self::resolve_env_value(value, env_vars);
-
-            laravel_lsp::display_truncate::truncate_for_display(&resolved, 200)
+            Self::resolve_env_value(value, env_vars)
         } else {
             String::new()
         }
@@ -15832,11 +15858,13 @@ return [
 
     /// Does the project define this translation key anywhere?
     ///
-    /// The key is resolved through [`laravel_lsp::translation_lookup`] against
+    /// The key is resolved through the Salsa translation cache against
     /// **every locale** the project defines, in the order
-    /// [`laravel_lsp::translation_lookup::available_locales`] returns — the
-    /// same set and order hover renders and go-to-definition navigates, so all
-    /// three agree about a key present only in, say, `de`.
+    /// [`Self::translation_locales`] returns — the same set and order hover
+    /// renders and go-to-definition navigates, so all three agree about a key
+    /// present only in, say, `de`. Both steps share
+    /// [`Self::resolve_translation`], so the catalogues are read once per edit
+    /// rather than once per request (issue #293).
     ///
     /// All three key shapes go through that one resolver: dotted
     /// (`validation.required` → `{lang_root}/{locale}/validation.php`), text
@@ -15854,14 +15882,13 @@ return [
     /// `expected_path` — where a missing key should be created — points at the
     /// leading locale, which is the project's `APP_LOCALE` when it defines any
     /// translations at all.
-    fn check_translation_file(
+    async fn check_translation_file(
+        &self,
         root: &Path,
         translation_key: &str,
-        vendor_map: Option<&HashMap<String, PathBuf>>,
+        vendor_map: Option<Arc<HashMap<String, PathBuf>>>,
     ) -> TranslationCheck {
-        use laravel_lsp::translation_lookup::{
-            available_locales, project_lang_roots, resolve_translation_detailed,
-        };
+        use laravel_lsp::translation_lookup::{project_lang_roots, DEFAULT_LOCALE};
 
         // The same locale set, in the same order, that hover renders and
         // go-to-definition navigates against — so a key defined only in `de`
@@ -15869,17 +15896,31 @@ return [
         // (issue #288). The key is *resolved* in each locale rather than the
         // lang file merely probed for existence: a file that exists but does
         // not define this key is not evidence the key exists.
-        let locales = available_locales(root, translation_key, vendor_map);
-        let resolution = locales.iter().find_map(|locale| {
-            resolve_translation_detailed(root, translation_key, locale, vendor_map)
-                .map(|r| (locale.clone(), r))
-        });
+        //
+        // Both the locale set and the resolution come from the Salsa
+        // translation cache, so a 25-locale project reads each catalogue once
+        // per edit rather than once per diagnostic pass (issue #293).
+        let locales = self
+            .translation_locales(root, translation_key, vendor_map.clone())
+            .await;
+        let mut resolution = None;
+        for locale in &locales {
+            if let Some(resolved) = self
+                .resolve_translation(root, translation_key, locale, vendor_map.clone())
+                .await
+            {
+                resolution = Some((locale.clone(), resolved));
+                break;
+            }
+        }
         // Where a missing key should be created: the leading locale, which is
         // the project's APP_LOCALE when it defines any translations at all.
+        // `translation_locales` never yields an empty set; the fallback keeps
+        // that a total function rather than a panic.
         let lead_locale = locales
             .first()
             .cloned()
-            .expect("available_locales never yields an empty set");
+            .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
 
         if let Some((namespace, rest)) = translation_key.split_once("::") {
             let file_segment = rest.split('.').next().unwrap_or(rest);
@@ -15888,6 +15929,7 @@ return [
             // Expected location for the diagnostic message: the package's real
             // lang dir when the vendor scan knows it, else the published path.
             let lang_dir = vendor_map
+                .as_deref()
                 .and_then(|m| m.get(namespace).cloned())
                 .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
             let expected = lang_dir
@@ -16389,7 +16431,20 @@ return [
         None
     }
 
-    /// Create LocationLink for a directive reference from Salsa data
+    /// Create LocationLink for a directive reference from Salsa data.
+    ///
+    /// Dispatch is a single `match` on the directive name, deliberately: a
+    /// directive's handling and its exclusion from the catch-all fallback are
+    /// then the *same arm*, so the two cannot drift apart. Adding a dedicated
+    /// arm automatically excludes that name from the fallback, and an arm that
+    /// resolves nothing yields `None` rather than leaking into the fallback's
+    /// heuristic and offering a naively-guessed view file (issue #325).
+    ///
+    /// Containment guard (issue #148, extending #130): every arm resolves its
+    /// argument through [`Self::first_contained_view`], which honours
+    /// `loadViewsFrom`-style namespaces that can point outside the project root
+    /// and so re-checks containment after the existence probe. The `@feature`
+    /// arm builds its path from `root.join(..)` and is contained by construction.
     async fn create_directive_location_from_salsa(
         &self,
         dir: &DirectiveReferenceData,
@@ -16397,158 +16452,141 @@ return [
         let arguments = dir.arguments.as_ref()?;
         let config = self.get_cached_config().await?;
 
-        // Containment guard (issue #148, extending #130): every candidate loop
-        // below resolves a directive argument to a view/component path through
-        // `resolve_view_path`, which honours `loadViewsFrom`-style namespaces that
-        // can point an absolute path outside the project root. Each loop re-checks
-        // `path_within_root(&path, &config.root)` after the existence check and
-        // `continue`s past any out-of-root candidate, so no directive flow hands
-        // the client a navigation target that escapes the root. The `@feature`
-        // branch builds its path from `root.join(..)` and so is already contained.
-
-        // Directives where first argument is a view name
-        let view_directives_first_arg = ["extends", "include", "includeIf", "each"];
-
-        // Directives where second argument is a view name (after a condition)
-        // `@includeUnless($boolean, 'view.name', [...])` is condition-first,
-        // exactly like `@includeWhen` — it never resolved from the
-        // first-argument list.
-        let view_directives_second_arg = ["includeWhen", "includeUnless"];
-
-        // @component directive - resolves to component file
-        if dir.name == "component" {
-            if let Some(component_name) = Self::extract_view_from_directive_args(arguments) {
-                // Try as component path (resources/views/components/...)
-                let component_path = format!("components.{}", component_name);
-                let possible_paths = config.resolve_view_path(&component_path);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
+        // Note: @lang is handled as a Translation pattern and @vite as an Asset
+        // pattern, not as Directive patterns — see parse_file_patterns in
+        // salsa_impl.rs. Neither reaches this method.
+        match dir.name.as_str() {
+            // `@component('foo')` accepts either a components/ path or a plain
+            // view path; the components/ location wins when both exist.
+            "component" => {
+                let name = Self::extract_view_from_directive_args(arguments)?;
+                let mut resolved = self
+                    .first_contained_view(&config, &format!("components.{name}"))
+                    .await;
+                if resolved.is_none() {
+                    resolved = self.first_contained_view(&config, &name).await;
                 }
+                self.create_location_link(dir, &resolved?)
+            }
 
-                // Also try direct view path
-                let possible_paths = config.resolve_view_path(&component_name);
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
+            // First argument is a view name.
+            "extends" | "include" | "includeIf" | "each" => {
+                let view_name = Self::extract_view_from_directive_args(arguments)?;
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
+            }
+
+            // Second argument is a view name, after a condition.
+            // `@includeUnless($boolean, 'view.name', [...])` is condition-first,
+            // exactly like `@includeWhen` — it never resolved from the
+            // first-argument list (issue #327).
+            "includeWhen" | "includeUnless" => {
+                let view_name = Self::extract_second_string_arg(arguments)?;
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
+            }
+
+            // `@includeFirst(['view1', 'view2'])` — first view that exists wins.
+            "includeFirst" => {
+                for view_name in Self::extract_array_string_args(arguments) {
+                    if let Some(path) = self.first_contained_view(&config, &view_name).await {
+                        return self.create_location_link(dir, &path);
                     }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
                 }
+                None
+            }
+
+            // `@livewire('component-name')` navigates to the component's Blade
+            // view. The clickable range covers just the quoted name.
+            "livewire" => {
+                let component_name = Self::extract_view_from_directive_args(arguments)?;
+                let path = self.first_contained_view(&config, &component_name).await?;
+                self.create_location_link_with_string_range(dir, &path)
+            }
+
+            // `@feature('feature-name')` — Laravel Pennant. Resolves against
+            // app/Features/, NOT the view tree, which is why a miss here must
+            // never fall through to the fallback's view-name guess.
+            "feature" => {
+                let feature_name = Self::extract_view_from_directive_args(arguments)?;
+                let root = self.root_path.read().await.clone()?;
+
+                // A feature class may override its key via a $name property;
+                // otherwise derive the class name from the key.
+                let feature_path = match scan_feature_classes(&root)
+                    .iter()
+                    .find(|f| f.feature_key == feature_name)
+                {
+                    Some(info) => root
+                        .join("app/Features")
+                        .join(format!("{}.php", info.class_name)),
+                    None => root.join(format!(
+                        "app/Features/{}.php",
+                        feature_key_to_class_name(&feature_name)
+                    )),
+                };
+
+                if !self.file_exists_cached(&feature_path).await {
+                    return None;
+                }
+                self.create_location_link_with_string_range(dir, &feature_path)
+            }
+
+            // ── Fallback: no dedicated arm above (issue #325) ──
+            //
+            // A package that registers its own view-rendering directive through
+            // `Blade::directive()` matches no arm above, so before this it got
+            // no goto at all. Reaching this arm is itself the proof that no
+            // dedicated handling exists — the `match` makes that structural
+            // rather than a hand-maintained exclusion list that can drift.
+            //
+            // Goto and diagnostics have opposite risk profiles: a wrong goto
+            // costs one keystroke, a wrong "view does not exist" squiggle marks
+            // working code. Only goto gains this permissive fallback —
+            // `validate_and_publish_diagnostics` keeps its strict
+            // `extends`/`include` gate, so a false missing-view diagnostic stays
+            // impossible by construction.
+            name => {
+                // `blade.viewDirectives` is the escape hatch for a directive the
+                // heuristic can't or shouldn't infer, so a declared name
+                // outranks `NON_VIEW_DIRECTIVES` — a user may deliberately
+                // re-enable a denylisted name. It can never outrank a dedicated
+                // arm, which the `match` already consumed.
+                let configured = self.view_directives.read().await.clone();
+                let view_name = if configured.first_arg.iter().any(|d| d == name) {
+                    Self::extract_view_from_directive_args(arguments)
+                } else if configured.second_arg.iter().any(|d| d == name) {
+                    Self::extract_second_string_arg(arguments)
+                } else if NON_VIEW_DIRECTIVES.contains(&name) {
+                    None
+                } else {
+                    Self::extract_view_from_directive_args(arguments)
+                }?;
+
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
             }
         }
+    }
 
-        // Handle view directives (first argument is view name)
-        if view_directives_first_arg.contains(&dir.name.as_str()) {
-            if let Some(view_name) = Self::extract_view_from_directive_args(arguments) {
-                let possible_paths = config.resolve_view_path(&view_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
+    /// First candidate for `view_name` that exists on disk **and** resolves
+    /// inside the project root.
+    ///
+    /// `resolve_view_path` returns one candidate per configured view root (or
+    /// per namespace), in priority order, and honours `loadViewsFrom`-style
+    /// registrations that can map a namespace to an absolute directory outside
+    /// the root (issues #130/#148). Containment is therefore re-checked after
+    /// the existence probe, and every candidate is tried — not just the first.
+    async fn first_contained_view(
+        &self,
+        config: &LaravelConfigData,
+        view_name: &str,
+    ) -> Option<PathBuf> {
+        for path in config.resolve_view_path(view_name) {
+            if self.file_exists_cached(&path).await && path_within_root(&path, &config.root) {
+                return Some(path);
             }
         }
-
-        // Handle @includeWhen($condition, 'view') - second arg is view
-        if view_directives_second_arg.contains(&dir.name.as_str()) {
-            if let Some(view_name) = Self::extract_second_string_arg(arguments) {
-                let possible_paths = config.resolve_view_path(&view_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
-            }
-        }
-
-        // Handle @includeFirst(['view1', 'view2']) - array of views
-        if dir.name == "includeFirst" {
-            let view_names = Self::extract_array_string_args(arguments);
-            for view_name in view_names {
-                let possible_paths = config.resolve_view_path(&view_name);
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
-            }
-        }
-
-        // Note: @lang is now handled as Translation patterns (see parse_file_patterns in salsa_impl.rs)
-        // Note: @vite is handled as Asset patterns, not Directive patterns
-        // See parse_file_patterns in salsa_impl.rs
-
-        // Handle @livewire('component-name') - Livewire component directive
-        // Navigates to the Blade view using view_path resolution
-        if dir.name == "livewire" {
-            if let Some(component_name) = Self::extract_view_from_directive_args(arguments) {
-                // Resolve using view path (e.g., 'navigation-menu' -> resources/views/navigation-menu.blade.php)
-                let possible_paths = config.resolve_view_path(&component_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    // Use string_column/string_end_column for the clickable range (just the component name)
-                    return self.create_location_link_with_string_range(dir, &path);
-                }
-            }
-        }
-
-        // Handle @feature('feature-name') - Laravel Pennant feature directive
-        if dir.name == "feature" {
-            if let Some(feature_name) = Self::extract_view_from_directive_args(arguments) {
-                let root = self.root_path.read().await;
-                if let Some(root) = root.as_ref() {
-                    // First check scanned features for custom $name property matches
-                    let scanned_features = scan_feature_classes(root);
-                    let feature_path = if let Some(feature_info) = scanned_features
-                        .iter()
-                        .find(|f| f.feature_key == feature_name)
-                    {
-                        // Found a feature class with matching $name property or derived key
-                        root.join("app/Features")
-                            .join(format!("{}.php", feature_info.class_name))
-                    } else {
-                        // Fallback: Convert feature key to class name and build path
-                        let class_name = feature_key_to_class_name(&feature_name);
-                        root.join(format!("app/Features/{}.php", class_name))
-                    };
-
-                    if self.file_exists_cached(&feature_path).await {
-                        // Use string_column/string_end_column for the clickable range (just the feature name)
-                        return self.create_location_link_with_string_range(dir, &feature_path);
-                    }
-                }
-            }
-        }
-
         None
     }
 
@@ -16634,34 +16672,16 @@ return [
         }]))
     }
 
-    /// Extract the second string argument from directive args
-    /// For @includeWhen($condition, 'view.name', $data)
+    /// Extract the view name from a condition-first directive's arguments.
+    /// For `@includeWhen($condition, 'view.name', $data)`.
     fn extract_second_string_arg(arguments: &str) -> Option<String> {
-        // Condition-first directives (`@includeWhen($cond, 'view', [...])`,
-        // `@includeUnless(...)`) put a boolean EXPRESSION first — it is not
-        // a quoted string. The name is therefore the FIRST quoted string in
-        // the args. The previous version skipped one quoted string on the
-        // assumption argument one was quoted: the two-argument form then
-        // resolved nothing, and the three-argument form returned the data
-        // array's first key — a wrong goto target and a false missing-view
-        // diagnostic.
-        let mut in_string = false;
-        let mut quote_char = ' ';
-        let mut result = String::new();
-
-        for ch in arguments.chars() {
-            if !in_string {
-                if ch == '\'' || ch == '"' {
-                    in_string = true;
-                    quote_char = ch;
-                }
-            } else if ch == quote_char {
-                return (!result.is_empty()).then_some(result);
-            } else {
-                result.push(ch);
-            }
-        }
-        None
+        // Condition-first directives (`@includeWhen`, `@includeUnless`) put a
+        // boolean EXPRESSION first, so the name is argument *one* — reached by
+        // splitting at the first top-level comma, not by taking the first
+        // quoted string in the list. A condition that compares a string
+        // (`$type === 'admin'`) donates its own literal to a first-string-wins
+        // scan, which then resolves the wrong view. See `directive_args`.
+        laravel_lsp::directive_args::nth_literal(arguments, 1)
     }
 
     /// Extract array of string arguments from directive args
@@ -16897,7 +16917,6 @@ return [
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
         let vendor_map = self.vendor_translation_namespaces_for(root).await;
-        let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
 
         // Resolve the key for real, across every locale the project defines,
         // in the same APP_LOCALE-led order hover renders and diagnostics
@@ -16909,15 +16928,22 @@ return [
         // Resolving rather than probing for the file also means a locale whose
         // lang file exists but does not define this key is correctly skipped,
         // instead of navigating to a file that never had the key in it.
-        let locales = laravel_lsp::translation_lookup::available_locales(root, &trans.key, map_ref);
-        let translation_path = locales
-            .iter()
-            .find_map(|locale| {
-                laravel_lsp::translation_lookup::resolve_translation_detailed(
-                    root, &trans.key, locale, map_ref,
-                )
-            })?
-            .source_file;
+        //
+        // Both steps go through the Salsa translation cache (issue #293).
+        let locales = self
+            .translation_locales(root, &trans.key, vendor_map.clone())
+            .await;
+        let mut translation_path = None;
+        for locale in &locales {
+            if let Some(resolved) = self
+                .resolve_translation(root, &trans.key, locale, vendor_map.clone())
+                .await
+            {
+                translation_path = Some(resolved.source_file);
+                break;
+            }
+        }
+        let translation_path = translation_path?;
 
         // The nested array path to the key *within* the file (the segments
         // after the file name), used to jump to the key's exact line. `None`
@@ -16944,16 +16970,26 @@ return [
 
             // Jump to the key's own line where we can locate it, else the
             // top of the file (the file resolved, only the key didn't).
-            let target_range = match php_key_path.as_deref() {
+            //
+            // Served from the Salsa translation cache, which resolved this very
+            // file a moment ago — before #293 this re-read it from disk, and
+            // for a `.php` catalogue re-ran a whole tree-sitter parse, on every
+            // jump.
+            let target = match php_key_path.as_deref() {
                 // JSON text key: line of the `"key":` property.
-                None => {
-                    Self::find_json_key_location(&translation_path, &trans.key).unwrap_or_default()
-                }
+                None => Some(TranslationKeyTarget::Json(trans.key.clone())),
                 // PHP nested array key: walk the array to the leaf's line.
-                Some(key_path) if !key_path.is_empty() => {
-                    Self::locate_php_key_range(&translation_path, key_path).unwrap_or_default()
-                }
-                Some(_) => Range::default(),
+                Some(key_path) if !key_path.is_empty() => Some(TranslationKeyTarget::Php(
+                    key_path.iter().map(|s| s.to_string()).collect(),
+                )),
+                Some(_) => None,
+            };
+            let target_range = match target {
+                Some(target) => self
+                    .locate_translation_key(root, &translation_path, target)
+                    .await
+                    .unwrap_or_default(),
+                None => Range::default(),
             };
 
             return Some(GotoDefinitionResponse::Link(vec![LocationLink {
@@ -16967,55 +17003,40 @@ return [
         None
     }
 
-    /// Find the line/columns of a nested array key in a PHP lang file via the
-    /// tree-sitter array walker [`config_key_locator`] (translation files are
-    /// the same nested-array shape as config files). `key_path` is the segments
-    /// *inside* the file — e.g. `["task_group_status_change", "title"]` for
-    /// `app::notification.task_group_status_change.title`. `None` when the file
-    /// can't be read or the key path isn't present.
-    fn locate_php_key_range(php_path: &Path, key_path: &[&str]) -> Option<Range> {
-        let content = std::fs::read_to_string(php_path).ok()?;
-        let pos = laravel_lsp::config_key_locator::locate_in_source(&content, key_path)?;
+    /// The `Range` of a translation key's declaration inside the catalogue that
+    /// defines it, for go-to-definition's `target_range`.
+    ///
+    /// Translation `.php` catalogues are the same nested-array shape as config
+    /// files, so the PHP arm delegates to the tree-sitter walker in
+    /// [`laravel_lsp::config_key_locator`]; the JSON arm matches the quoted key
+    /// literal. Both run inside the Salsa cache against the catalogue text that
+    /// resolution already loaded, so a repeat jump costs no disk read and no
+    /// re-parse (issue #293).
+    ///
+    /// `None` when the catalogue can't be read or the key isn't in it — the
+    /// caller then lands at the top of the file, which is what it did before.
+    async fn locate_translation_key(
+        &self,
+        root: &Path,
+        path: &Path,
+        target: TranslationKeyTarget,
+    ) -> Option<Range> {
+        let found = self
+            .salsa
+            .locate_translation_key(root.to_path_buf(), path.to_path_buf(), target)
+            .await
+            .ok()
+            .flatten()?;
         Some(Range {
             start: Position {
-                line: pos.line,
-                character: pos.start_column,
+                line: found.line,
+                character: found.start_column,
             },
             end: Position {
-                line: pos.line,
-                character: pos.end_column,
+                line: found.line,
+                character: found.end_column,
             },
         })
-    }
-
-    /// Find the line and column of a key in a JSON translation file
-    fn find_json_key_location(json_path: &Path, key: &str) -> Option<Range> {
-        let content = std::fs::read_to_string(json_path).ok()?;
-
-        // Search for the key pattern: "key": or "key" :
-        // We look for the key surrounded by quotes at the start of a JSON property
-        let search_pattern = format!("\"{}\"", key);
-
-        for (line_num, line) in content.lines().enumerate() {
-            if let Some(col) = line.find(&search_pattern) {
-                // Found the key, position cursor at the start of the key (after the opening quote)
-                let start_col = col + 1; // Skip the opening quote
-                let end_col = start_col + key.len();
-
-                return Some(Range {
-                    start: Position {
-                        line: line_num as u32,
-                        character: start_col as u32,
-                    },
-                    end: Position {
-                        line: line_num as u32,
-                        character: end_col as u32,
-                    },
-                });
-            }
-        }
-
-        None
     }
 
     /// Create LocationLink for an asset reference from Salsa data
@@ -18103,6 +18124,7 @@ return [
             pending_salsa_updates: self.pending_salsa_updates.clone(),
             auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
             directive_spacing: self.directive_spacing.clone(),
+            view_directives: self.view_directives.clone(),
             chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
             code_lens_enabled: self.code_lens_enabled.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
@@ -18115,7 +18137,6 @@ return [
             indexing_in_flight: self.indexing_in_flight.clone(),
             migration_index: self.migration_index.clone(),
             command_index: self.command_index.clone(),
-            vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
             module_path_patterns: self.module_path_patterns.clone(),
             cached_module_dirs: self.cached_module_dirs.clone(),
             module_livewire_registrars: self.module_livewire_registrars.clone(),
@@ -18898,8 +18919,9 @@ return [
             if let Some(root) = root_guard.as_ref() {
                 let vendor_map = self.vendor_translation_namespaces_for(root).await;
                 for trans_ref in &patterns.translation_refs {
-                    let check =
-                        Self::check_translation_file(root, &trans_ref.key, vendor_map.as_deref());
+                    let check = self
+                        .check_translation_file(root, &trans_ref.key, vendor_map.clone())
+                        .await;
                     if !check.exists {
                         diagnostics.push(Self::create_translation_diagnostic(
                             &trans_ref.key,
@@ -19236,8 +19258,9 @@ return [
         if let Some(root) = root_guard.as_ref() {
             let vendor_map = self.vendor_translation_namespaces_for(root).await;
             for trans_ref in &patterns.translation_refs {
-                let check =
-                    Self::check_translation_file(root, &trans_ref.key, vendor_map.as_deref());
+                let check = self
+                    .check_translation_file(root, &trans_ref.key, vendor_map.clone())
+                    .await;
                 if !check.exists {
                     diagnostics.push(Self::create_translation_diagnostic(
                         &trans_ref.key,
@@ -19255,7 +19278,7 @@ return [
         // Check @extends and @include directives using Salsa patterns
         for dir_ref in &patterns.directives {
             // Only validate @extends and @include
-            if dir_ref.name == "extends" || dir_ref.name == "include" {
+            if directive_takes_missing_view_diagnostic(&dir_ref.name) {
                 if let Some(ref args) = dir_ref.arguments {
                     if let Some(view_name) = Self::extract_view_from_directive_args(args) {
                         let possible_paths = config.resolve_view_path(&view_name);
@@ -19427,11 +19450,9 @@ return [
                     if let Some(ref args) = dir_ref.arguments {
                         if let Some(translation_key) = Self::extract_view_from_directive_args(args)
                         {
-                            let check = Self::check_translation_file(
-                                root,
-                                &translation_key,
-                                vendor_map.as_deref(),
-                            );
+                            let check = self
+                                .check_translation_file(root, &translation_key, vendor_map.clone())
+                                .await;
                             if !check.exists {
                                 diagnostics.push(Self::create_translation_diagnostic(
                                     &translation_key,
@@ -20923,16 +20944,20 @@ return [
             return hover::translation_card(key, "en", None, None);
         };
         let vendor_map = self.vendor_translation_namespaces_for(r).await;
-        let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
 
         // A locale either defines the key — yielding both a value and a link to
         // the file it was read from — or it does not. The two cannot occur
         // apart, so they travel as one.
+        //
+        // Locale discovery and every per-locale resolution come from the Salsa
+        // translation cache, so hovering a key on a 25-locale project reads the
+        // catalogues once per edit rather than 25 times per hover (issue #293).
         let mut entries: Vec<(String, Option<(String, String)>)> = Vec::new();
-        for locale in laravel_lsp::translation_lookup::available_locales(r, key, map_ref) {
-            let hit = match laravel_lsp::translation_lookup::resolve_translation_detailed(
-                r, key, &locale, map_ref,
-            ) {
+        for locale in self.translation_locales(r, key, vendor_map.clone()).await {
+            let hit = match self
+                .resolve_translation(r, key, &locale, vendor_map.clone())
+                .await
+            {
                 Some(res) => Some((
                     laravel_lsp::display_truncate::truncate_for_display(
                         &Self::unquote_php_literal(&res.value),
@@ -21368,56 +21393,87 @@ return [
         }
     }
 
-    /// Return the cached vendor translation-namespace map, building it on
-    /// first call. The scan walks `vendor/` for service providers calling
-    /// `loadTranslationsFrom(...)` — see [`laravel_lsp::vendor_translations`].
-    /// Subsequent hover calls reuse the cached Arc without re-scanning.
+    /// Drop everything derived from service providers, so the next namespace
+    /// lookup rediscovers and re-reads them.
+    async fn invalidate_vendor_translation_namespaces(&self) {
+        let _ = self.salsa.invalidate_translation_providers().await;
+    }
+
+    /// The project's provider-registered `namespace -> lang dir` map — the
+    /// registrations `loadTranslationsFrom(...)` makes, from both `vendor/`
+    /// and `app/Providers/`.
+    ///
+    /// Served from the Salsa translation cache (issue #293). This used to run
+    /// one uncached `walkdir` sweep under `spawn_blocking` and hold the result
+    /// in an `RwLock` for the whole session, with nothing that could ever clear
+    /// it — so a `composer update`, a newly-installed package, or an edited
+    /// registration was invisible until the LSP restarted. Salsa is the cache
+    /// now, which is both warm and invalidatable.
+    ///
+    /// `None` only when the actor is unreachable; an empty map is `Some`, since
+    /// "this project registers no namespaces" is an answer, not a failure.
     async fn vendor_translation_namespaces_for(
         &self,
         root: &Path,
     ) -> Option<Arc<HashMap<String, PathBuf>>> {
-        {
-            let guard = self.vendor_translation_namespaces.read().await;
-            if let Some(ref existing) = *guard {
-                return Some(existing.clone());
-            }
-        }
-        // Cache miss — scan and store. Done under spawn_blocking so the
-        // walkdir traversal doesn't block the LSP event loop.
-        //
-        // Two passes merge into one map: the vendor scan first, then the
-        // app-provider scan, which overrides vendor on namespace conflict —
-        // the app boots last, so an app `loadTranslationsFrom` for a namespace
-        // a package also registers is the one that wins at runtime.
-        let root_clone = root.to_path_buf();
-        let module_dirs = self.module_dirs_for(root).await;
-        let scanned = tokio::task::spawn_blocking(move || {
-            let mut map =
-                laravel_lsp::vendor_translations::scan_vendor_translation_namespaces(&root_clone);
-            // Module providers (`modules.paths`) — first-party like the app
-            // scan below, which still overrides on namespace conflict (the
-            // app boots last at runtime).
-            let module_providers = laravel_lsp::config::module_provider_files(&module_dirs);
-            for (namespace, dir) in
-                laravel_lsp::vendor_translations::scan_provider_files_translation_namespaces(
-                    &root_clone,
-                    &module_providers,
-                )
-            {
-                map.insert(namespace, dir);
-            }
-            for (namespace, dir) in
-                laravel_lsp::vendor_translations::scan_app_translation_namespaces(&root_clone)
-            {
-                map.insert(namespace, dir);
-            }
-            map
-        })
-        .await
-        .ok()?;
-        let arc = Arc::new(scanned);
-        *self.vendor_translation_namespaces.write().await = Some(arc.clone());
-        Some(arc)
+        self.salsa
+            .vendor_translation_namespaces(root.to_path_buf())
+            .await
+            .ok()
+            .map(Arc::new)
+    }
+}
+
+impl LaravelLanguageServer {
+    // === Translation resolution through Salsa (issue #293) ===
+
+    /// Every locale that could define `key`, APP_LOCALE first.
+    ///
+    /// The single locale-discovery entry point for hover, go-to-definition and
+    /// diagnostics, so all three see the same set in the same order
+    /// (issue #288) and enumerate the lang directories once per edit rather
+    /// than once per request (issue #293).
+    ///
+    /// Fails closed to `["en"]` — Laravel's own default — if the Salsa actor is
+    /// unreachable, matching the fallback the cache itself applies to a project
+    /// with no lang directory. Callers may therefore assume a non-empty set.
+    async fn translation_locales(
+        &self,
+        root: &Path,
+        key: &str,
+        vendor_map: Option<Arc<HashMap<String, PathBuf>>>,
+    ) -> Vec<String> {
+        self.salsa
+            .available_locales(root.to_path_buf(), key.to_string(), vendor_map)
+            .await
+            .ok()
+            .filter(|locales| !locales.is_empty())
+            .unwrap_or_else(|| vec![laravel_lsp::translation_lookup::DEFAULT_LOCALE.to_string()])
+    }
+
+    /// Resolve `key` in one locale through the Salsa cache.
+    ///
+    /// The single resolution entry point for hover, go-to-definition and
+    /// diagnostics. An unreachable actor resolves to `None` — the same answer
+    /// an undefined key gives, which degrades to "not found" rather than to a
+    /// wrong location.
+    async fn resolve_translation(
+        &self,
+        root: &Path,
+        key: &str,
+        locale: &str,
+        vendor_map: Option<Arc<HashMap<String, PathBuf>>>,
+    ) -> Option<laravel_lsp::salsa_impl::ResolvedTranslationData> {
+        self.salsa
+            .resolve_translation(
+                root.to_path_buf(),
+                key.to_string(),
+                locale.to_string(),
+                vendor_map,
+            )
+            .await
+            .ok()
+            .flatten()
     }
 }
 
@@ -21855,19 +21911,23 @@ async fn collect_declaration_locations(
             }
         }
         SymbolRef::Translation(key) => {
-            let locs = laravel_lsp::translation_key_locator::locate_keys_across_locales(root, key);
+            let locs = server
+                .salsa
+                .locate_key_across_locales(root.to_path_buf(), key.to_string())
+                .await
+                .unwrap_or_default();
             for loc in locs {
                 if let Ok(uri) = Url::from_file_path(&loc.file_path) {
                     out.push(Location {
                         uri,
                         range: Range {
                             start: Position {
-                                line: loc.position.line,
-                                character: loc.position.start_column,
+                                line: loc.location.line,
+                                character: loc.location.start_column,
                             },
                             end: Position {
-                                line: loc.position.line,
-                                character: loc.position.end_column,
+                                line: loc.location.line,
+                                character: loc.location.end_column,
                             },
                         },
                     });
@@ -21910,20 +21970,24 @@ async fn collect_declaration_locations(
 /// file. The LEAF segment of the new dotted form is written at each
 /// declaration; the file portion is the lang filename and can't change
 /// without moving the file.
-fn collect_translation_declaration_targets(
+async fn collect_translation_declaration_targets(
+    salsa: &laravel_lsp::salsa_impl::SalsaHandle,
     root: &Path,
     old_key: &str,
     new_key: &str,
 ) -> Vec<laravel_lsp::rename::EditTarget> {
-    let locations = laravel_lsp::translation_key_locator::locate_keys_across_locales(root, old_key);
+    let locations = salsa
+        .locate_key_across_locales(root.to_path_buf(), old_key.to_string())
+        .await
+        .unwrap_or_default();
     let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
     locations
         .into_iter()
         .map(|loc| laravel_lsp::rename::EditTarget {
             file_path: loc.file_path,
-            line: loc.position.line,
-            start_column: loc.position.start_column,
-            end_column: loc.position.end_column,
+            line: loc.location.line,
+            start_column: loc.location.start_column,
+            end_column: loc.location.end_column,
             new_text: new_leaf.clone(),
         })
         .collect()
@@ -22826,6 +22890,7 @@ impl LanguageServer for LaravelLanguageServer {
                             legend: SemanticTokensLegend {
                                 token_types: vec![
                                     SemanticTokenType::FUNCTION, // index 0 - @directive
+                                    SemanticTokenType::COMMENT,  // index 1 - .env inline comment
                                 ],
                                 token_modifiers: vec![],
                             },
@@ -23324,6 +23389,10 @@ impl LanguageServer for LaravelLanguageServer {
             if is_config_file {
                 info!("📦 Config file changed, invalidating config cache");
                 self.invalidate_config_cache().await;
+                // A changed `composer.json` can add or remove a package that
+                // ships translations, which changes the vendor
+                // translation-namespace map (issue #293).
+                self.invalidate_vendor_translation_namespaces().await;
             }
 
             match file_name {
@@ -23511,6 +23580,12 @@ impl LanguageServer for LaravelLanguageServer {
         // Did this batch record any `.php` magic change? Gates the debounced
         // incremental batch — an Inertia-only burst does no magic work.
         let mut magic_dirty = false;
+        // Did a service provider change? The vendor translation-namespace map
+        // is built by scanning providers, and is cached for the whole session.
+        let mut providers_changed = false;
+        // Project root, for classifying lang catalogues below. Read once
+        // rather than per event in a burst.
+        let watched_root = self.root_path.read().await.clone();
 
         for change in params.changes {
             if open_docs.contains(&change.uri) {
@@ -23520,6 +23595,30 @@ impl LanguageServer for LaravelLanguageServer {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
             };
+            // Lang catalogues (issue #293). An external create, change or
+            // delete — a `git pull`, a branch switch, `php artisan lang:publish`
+            // — must drop the cached catalogue, or the translation cache would
+            // keep serving the pre-change value for the rest of the session.
+            // Before this cache existed there was nothing to go stale; adding
+            // it without this arm would have traded a perf bug for a
+            // correctness one.
+            //
+            // A `.json` catalogue then stops here: it is not PHP, so the
+            // pattern-index machinery below has nothing to do with it. A `.php`
+            // catalogue falls through, because it is a lang file *and* an
+            // ordinary source file.
+            if let Some(root) = watched_root.as_ref() {
+                if laravel_lsp::translation_lookup::is_lang_file(root, &path) {
+                    let _ = self.salsa.invalidate_lang_path(path.clone()).await;
+                    if path.extension().is_some_and(|ext| ext == "json") {
+                        match change.typ {
+                            FileChangeType::DELETED => deleted += 1,
+                            _ => created_or_changed += 1,
+                        }
+                        continue;
+                    }
+                }
+            }
             // Inertia page files (resources/js/Pages/**/*.{vue,tsx,jsx,svelte})
             // are not PHP — they never enter the Salsa pattern index, so the
             // Salsa update/remove path below doesn't apply. A create/change/
@@ -23565,6 +23664,20 @@ impl LanguageServer for LaravelLanguageServer {
                 && laravel_lsp::path_segments::contains_segments(&path, "database/migrations")
             {
                 migrations_changed = true;
+            }
+            // A service provider registers translation namespaces via
+            // `loadTranslationsFrom`. Both the vendor scan (`vendor/**`) and
+            // the app scan (`app/Providers/**`) feed one session-long cache,
+            // so an edit to either must drop it. Filename gate mirrors the
+            // scan's own: it only ever parses `*ServiceProvider*.php`.
+            if !providers_changed
+                && path.to_string_lossy().ends_with(".php")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("ServiceProvider"))
+            {
+                providers_changed = true;
             }
             // Snapshot the file's pre-change surface for the incremental magic
             // batch (M2) BEFORE the arm's Salsa mutation runs — critically,
@@ -23662,6 +23775,17 @@ impl LanguageServer for LaravelLanguageServer {
             if let Some(root) = self.initialized_root.read().await.clone() {
                 self.rebuild_migration_index(&root).await;
             }
+        }
+
+        // A service provider changed on disk — drop the vendor
+        // translation-namespace map so the next namespaced translation lookup
+        // rescans. The map is built once and was previously cached for the
+        // entire session, so a `composer update`, a newly-installed package, or
+        // an edited `loadTranslationsFrom` was invisible until the LSP
+        // restarted — and since #293 that map decides where a namespaced key
+        // resolves, so a stale one is a wrong answer, not just an old one.
+        if providers_changed {
+            self.invalidate_vendor_translation_namespaces().await;
         }
 
         // A Command class changed on disk — rebuild the Artisan command index so
@@ -24716,9 +24840,10 @@ impl LanguageServer for LaravelLanguageServer {
                 // Same shape as config but applied across every locale's lang
                 // file under lang/<locale>/<file>.php.
                 if let Some(root) = root_path.as_ref() {
-                    targets.extend(collect_translation_declaration_targets(
-                        root, key, &new_name,
-                    ));
+                    targets.extend(
+                        collect_translation_declaration_targets(&self.salsa, root, key, &new_name)
+                            .await,
+                    );
                 }
             }
             laravel_lsp::references::SymbolRef::Env(key) => {
@@ -26202,23 +26327,12 @@ impl LanguageServer for LaravelLanguageServer {
                     .into_iter()
                     .filter(|c| c.key.starts_with(&config_ctx.prefix))
                     .map(|c| {
-                        let detail = if c.value.is_empty() {
-                            format!("({})", c.source)
-                        } else {
-                            format!("{} ({})", c.value, c.source)
-                        };
-
-                        let doc = {
-                            let mut d = CompletionDoc::new().header(&c.key);
-                            if !c.value.is_empty() {
-                                d = d.code(laravel_lsp::completion_format::CodeBlock::new(
-                                    "php",
-                                    format!("return {};", c.value),
-                                ));
-                            }
-                            d.section(format!("Source: {}", c.source))
-                                .into_documentation()
-                        };
+                        let detail =
+                            laravel_lsp::completion_display::completion_detail(&c.value, &c.source);
+                        let doc = laravel_lsp::completion_display::config_documentation(
+                            &c.key, &c.value, &c.source,
+                        )
+                        .into_documentation();
                         CompletionItem {
                             label: c.key.clone(),
                             kind: Some(CompletionItemKind::CONSTANT),
@@ -27136,22 +27250,12 @@ impl LanguageServer for LaravelLanguageServer {
                     .into_iter()
                     .filter(|t| t.key.starts_with(&trans_ctx.prefix))
                     .map(|t| {
-                        let detail = if t.value.is_empty() {
-                            format!("({})", t.source)
-                        } else {
-                            format!("{} ({})", t.value, t.source)
-                        };
-
-                        let doc = {
-                            let mut d = CompletionDoc::new().header(&t.key);
-                            if !t.value.is_empty() {
-                                d = d.summary(&t.value);
-                            } else {
-                                d = d.summary("Translation key.");
-                            }
-                            d.section(format!("Source: {}", t.source))
-                                .into_documentation()
-                        };
+                        let detail =
+                            laravel_lsp::completion_display::completion_detail(&t.value, &t.source);
+                        let doc = laravel_lsp::completion_display::translation_documentation(
+                            &t.key, &t.value, &t.source,
+                        )
+                        .into_documentation();
                         CompletionItem {
                             label: t.key.clone(),
                             kind: Some(CompletionItemKind::TEXT),
@@ -27518,8 +27622,17 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = &params.text_document.uri;
         let path = uri.path();
 
-        // Only process Blade files
-        if !path.ends_with(".blade.php") {
+        // Two buffer kinds carry semantic tokens: Blade files (custom inline
+        // directives the grammar can't colour) and env files (inline comments,
+        // where the bash grammar Zed highlights `.env` with disagrees with
+        // dotenv about where a comment starts — see `env_comment_tokens`).
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let is_blade = path.ends_with(".blade.php");
+        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        if !is_blade && !is_env {
             return Ok(None);
         }
 
@@ -27537,13 +27650,16 @@ impl LanguageServer for LaravelLanguageServer {
             }
         };
 
-        // Extract directive tokens, keeping only names we recognise as real
-        // directives (standard + registered custom) and skipping commented-out ones.
-        let known = self.get_directive_name_set().await;
-        let tokens =
-            laravel_lsp::blade_directive_tokens::extract_blade_directive_tokens(&content, &known);
+        let tokens = if is_env {
+            laravel_lsp::env_comment_tokens::extract_env_comment_tokens(&content)
+        } else {
+            // Extract directive tokens, keeping only names we recognise as real
+            // directives (standard + registered custom) and skipping commented-out ones.
+            let known = self.get_directive_name_set().await;
+            laravel_lsp::blade_directive_tokens::extract_blade_directive_tokens(&content, &known)
+        };
 
-        info!("   Found {} directive tokens", tokens.len());
+        info!("   Found {} semantic tokens", tokens.len());
 
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,

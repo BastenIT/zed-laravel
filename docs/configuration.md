@@ -23,7 +23,23 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
         "blade": {
           // Space between a directive and its parentheses.
           // false → @if($x)    true → @if ($x)                  Default: false
-          "directiveSpacing": false
+          "directiveSpacing": false,
+
+          // Extra directive names to treat as view-rendering in
+          // go-to-definition. A custom Blade::directive() is already resolved
+          // automatically — this is the escape hatch for the two cases that
+          // can't be inferred: a directive on the excluded label list
+          // (@section, @yield, @stack, control flow…), and one whose view name
+          // is the SECOND argument, after a condition (the @includeWhen shape).
+          // Directives with dedicated handling (@component, @livewire,
+          // @feature, @includeFirst, @extends, @include, @includeIf, @each,
+          // @includeWhen, @includeUnless) ignore both lists.
+          // Goto only — never affects diagnostics. Guide:
+          // docs/go-to-definition.md.               Default: both lists empty
+          "viewDirectives": {
+            "firstArg": [],   // view name is the 1st argument (@include shape)
+            "secondArg": []   // view name is the 2nd argument (@includeWhen shape)
+          }
         },
 
         "codeLens": {
@@ -81,6 +97,30 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
           ]
         }
       }
+    },
+
+    // Tailwind completions inside Blade. The Tailwind server only offers
+    // completions in languages it knows, and only inside attributes it's told
+    // to treat as class lists — neither covers Blade out of the box. This block
+    // fixes both. It only takes effect once the server actually attaches, so
+    // also add "tailwindcss-language-server" to the Blade `language_servers`
+    // list further down (it is NOT in the list shown there — that list is the
+    // minimum this extension needs). Nothing here is required by this
+    // extension; skip the whole block if you don't use Tailwind.
+    "tailwindcss-language-server": {
+      "settings": {
+        // Parse Blade (and PHP) as HTML so the server offers completions there.
+        "includeLanguages": { "Blade": "html", "PHP": "html" },
+        // Attributes treated as class lists. Beyond plain `class`: Blade's
+        // @class([...]) directive, Alpine's :class / x-bind:class, and
+        // Livewire's wire:class.
+        "classAttributes": ["class", "@class", ":class", "wire:class", "x-bind:class"],
+        "experimental": {
+          // Completions inside any *:class="…" attribute the list above misses
+          // (e.g. x-transition:class, or a custom wire:*:class).
+          "classRegex": ["\\w?:class=\"([^\"]*)"]
+        }
+      }
     }
   },
 
@@ -114,6 +154,15 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
       // Highlight custom inline @directive() macros tree-sitter can't see
       // (e.g. a @money($x) Blade::directive). Requires Zed semantic-token
       // support; "combined" overlays them on the Blade extension's colors.
+      "semantic_tokens": "combined"
+    },
+    "Shell Script": {
+      // Zed classifies .env (and .env.*) as Shell Script, so the bash grammar
+      // highlights it — and bash treats a mid-word "#" as literal text, while
+      // dotenv treats it as the start of an inline comment. Turning semantic
+      // tokens on lets us paint those comments correctly. Zed defaults this to
+      // "off", so the fix is invisible without this line. Guide:
+      // docs/environment.md.                                  Default: "off"
       "semantic_tokens": "combined"
     }
   }

@@ -1,37 +1,51 @@
 //! Namespaced translation-key completion (`ns::file.key`).
 //!
-//! `get_all_translation_keys` used to enumerate only the project's own root
-//! `lang/` catalogue, so a project keeping a namespace's translations only
-//! under its registered directory (vendor package, module, or an app
+//! Completion used to enumerate only the project's own root `lang/`
+//! catalogue, so a project keeping a namespace's translations only under its
+//! registered directory (vendor package, module, or an app
 //! `loadTranslationsFrom` call — never published to `lang/vendor/…`) got
-//! zero completions for that namespace's keys. It now also walks every
-//! registered namespace — the same map hover/goto/diagnostics already share
-//! via `vendor_translation_namespaces_for` — emitting `{ns}::{file}.{key}`.
+//! zero completions for that namespace's keys. The Salsa translation layer
+//! now also walks every provider-registered namespace — the same map
+//! hover/goto/diagnostics share — emitting `{ns}::{file}.{key}`. Module
+//! service providers reach that map through
+//! `set_translation_provider_extras`, the hook `module_dirs_for` feeds.
 //!
-//! These tests drive the private async method directly on a server built
-//! through the `tower_lsp::LspService` harness, priming `root_path` and
-//! `vendor_translation_namespaces` so the scan runs purely against a tempdir
-//! (same pattern as `translation_namespace_navigation.rs`).
+//! These tests drive the private async method on a server built through the
+//! `tower_lsp::LspService` harness, priming `root_path` and registering a
+//! real module provider file so the scan runs purely against a tempdir.
 
 use crate::LaravelLanguageServer;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tower_lsp::LspService;
 
-/// Build a backend with the project root and the namespace map primed, so
-/// `vendor_translation_namespaces_for` returns the cache without scanning
-/// disk.
-async fn backend_with_namespaces(
-    root: &Path,
-    namespaces: HashMap<String, PathBuf>,
-) -> LaravelLanguageServer {
+/// Build a backend rooted at `root`, with `provider` (a real on-disk module
+/// service provider registering translation namespaces) handed to the Salsa
+/// translation layer the same way `module_dirs_for` does.
+async fn backend_with_module_provider(root: &Path, provider: PathBuf) -> LaravelLanguageServer {
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
     *backend.root_path.write().await = Some(root.to_path_buf());
-    *backend.vendor_translation_namespaces.write().await = Some(Arc::new(namespaces));
     backend
+        .salsa
+        .set_translation_provider_extras(vec![provider])
+        .await
+        .expect("salsa actor should accept provider extras");
+    backend
+}
+
+/// Write a module service provider that registers `namespace` for the
+/// module's own `lang/` directory (the `modules.paths` convention:
+/// `app/{Parent}/{Module}/Providers/…` next to `app/{Parent}/{Module}/lang`).
+fn write_module_provider(module_dir: &Path, namespace: &str) -> PathBuf {
+    let providers = module_dir.join("Providers");
+    fs::create_dir_all(&providers).unwrap();
+    let path = providers.join("ModuleServiceProvider.php");
+    let source = format!(
+        "<?php\nclass ModuleServiceProvider {{\n    public function boot(): void {{\n        $this->loadTranslationsFrom(__DIR__.'/../lang', '{namespace}');\n    }}\n}}\n"
+    );
+    fs::write(&path, source).unwrap();
+    path
 }
 
 /// Write a one-key catalogue at `<lang_dir>/en/<file>.php`. `key` may be
@@ -74,17 +88,16 @@ async fn namespaced_lang_dir_yields_prefixed_completions_alongside_root() {
     // A namespace whose catalogues live only under its registered dir,
     // never published to `lang/vendor/…` (the fixture shape:
     // legal-contractmanagement::contract-management.details.title).
-    let ns_lang_dir = root.join("app/Legal/ContractManagement/lang");
+    let module_dir = root.join("app/Legal/ContractManagement");
     write_catalogue(
-        &ns_lang_dir,
+        &module_dir.join("lang"),
         "contract-management",
         "details.title",
         "Vertragsdetails",
     );
-    let mut namespaces = HashMap::new();
-    namespaces.insert("legal-contractmanagement".to_string(), ns_lang_dir);
+    let provider = write_module_provider(&module_dir, "legal-contractmanagement");
 
-    let backend = backend_with_namespaces(&root, namespaces).await;
+    let backend = backend_with_module_provider(&root, provider).await;
     let keys = backend.get_all_translation_keys().await;
     let all_keys: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
 
@@ -105,17 +118,16 @@ async fn namespace_only_project_still_completes() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
 
-    let ns_lang_dir = root.join("app/Legal/ContractManagement/lang");
+    let module_dir = root.join("app/Legal/ContractManagement");
     write_catalogue(
-        &ns_lang_dir,
+        &module_dir.join("lang"),
         "contract-management",
         "details.title",
         "Vertragsdetails",
     );
-    let mut namespaces = HashMap::new();
-    namespaces.insert("legal-contractmanagement".to_string(), ns_lang_dir);
+    let provider = write_module_provider(&module_dir, "legal-contractmanagement");
 
-    let backend = backend_with_namespaces(&root, namespaces).await;
+    let backend = backend_with_module_provider(&root, provider).await;
     let keys = backend.get_all_translation_keys().await;
     let all_keys: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
 
@@ -143,58 +155,6 @@ fn translation_call_context_passes_namespace_prefix_through_unmangled() {
         ctx.prefix,
         "legal-contractmanagement::contract-management.details."
     );
-}
-
-/// Regression: `extract_translation_value` and `extract_config_value` used
-/// to truncate with a byte slice (`&s[..47]`); index 47 landing inside a
-/// multibyte character (e.g. 'č') aborted the whole server the first time
-/// namespaced catalogues — full of non-ASCII values — were enumerated for
-/// completion. Both now delegate to the shared, char-safe
-/// `display_truncate::truncate_for_display` (also used by `hover.rs`), so
-/// the limit is 200 chars, not 47/50, and the ellipsis is the single `…`
-/// char.
-#[test]
-fn translation_value_truncation_is_char_boundary_safe() {
-    // 199 ASCII chars, then a two-byte 'č', then padding well past the
-    // shared 200-char limit. Truncation operates on chars, not bytes, so the
-    // multibyte char at the cut point can't panic.
-    let value: String = "a".repeat(199) + "č" + &"é".repeat(50);
-    let line = format!("'key' => '{}',", value);
-    let display = LaravelLanguageServer::extract_translation_value(&line);
-    assert!(display.ends_with('…'));
-    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
-}
-
-/// Consequence of the dedup: a 30-char/60-byte Czech string used to get
-/// truncated (and could panic) under the old byte-slice/50-char threshold;
-/// the shared 200-char, char-based limit now passes it through untouched.
-#[test]
-fn translation_value_under_two_hundred_chars_is_not_truncated() {
-    let value = "č".repeat(30);
-    let line = format!("'key' => '{}',", value);
-    let display = LaravelLanguageServer::extract_translation_value(&line);
-    assert_eq!(display, value);
-}
-
-/// Same char-boundary regression, for `extract_config_value` — it shared
-/// the identical byte-slice bug and now shares the identical fix.
-#[test]
-fn config_value_truncation_is_char_boundary_safe() {
-    let value: String = "a".repeat(199) + "ü" + &"ö".repeat(50);
-    let line = format!("'key' => '{}',", value);
-    let env_vars = std::collections::HashMap::new();
-    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
-    assert!(display.ends_with('…'));
-    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
-}
-
-#[test]
-fn config_value_under_two_hundred_chars_is_not_truncated() {
-    let value = "ü".repeat(30);
-    let line = format!("'key' => '{}',", value);
-    let env_vars = std::collections::HashMap::new();
-    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
-    assert_eq!(display, value);
 }
 
 /// Regression: a directive whose args carry a second parameter —

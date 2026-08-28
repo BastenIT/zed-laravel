@@ -215,3 +215,79 @@ async fn under_root_symlink_to_outside_target_returns_none() {
          guard refuses it even though the link path is lexically inside"
     );
 }
+
+/// Regression: a directive whose args carry a second parameter —
+/// `@include('view', ['data' => $x])`, `@lang('key', ['name' => $n])` —
+/// must still yield its first quoted string. The old extractor rejected
+/// any args containing a comma, so goto and the missing-view diagnostic
+/// were dead for every data-carrying directive.
+#[test]
+fn directive_first_string_extraction_survives_data_arguments() {
+    let cases = [
+        (
+            "('ns::pages.editor.block-outline', ['rowBlocks' => $rowBlocks])",
+            Some("ns::pages.editor.block-outline"),
+        ),
+        ("('plain.view')", Some("plain.view")),
+        ("(\"double.quoted\", ['a' => 1])", Some("double.quoted")),
+        // First token not a string literal (condition-first directives are
+        // handled by the second-arg extractor) — must yield None.
+        ("($condition, 'view.name')", None),
+        ("('')", None),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(
+            crate::LaravelLanguageServer::extract_view_from_directive_args(args).as_deref(),
+            expected,
+            "args: {args}"
+        );
+    }
+}
+
+/// Regression for the condition-first extractor: `@includeWhen` /
+/// `@includeUnless` put a boolean EXPRESSION first, so the view name is
+/// argument ONE — found by splitting the list at its first *top-level* comma,
+/// one that is not inside a quoted string, a nested `(...)`, or a `[...]`
+/// array literal. A first-quoted-string-wins scan resolved the condition's
+/// own literal (`$type === 'admin'` → `admin`) as the view name, and the
+/// version before that skipped one literal and returned the data array's
+/// first key. Both produced a wrong goto-definition target.
+#[test]
+fn second_arg_extraction_splits_at_top_level_comma() {
+    let cases = [
+        ("($cond, 'view')", Some("view")),
+        (
+            "($boolean, 'view.name', ['status' => 'complete'])",
+            Some("view.name"),
+        ),
+        (
+            "($cond, \"double.quoted\", ['a' => $b])",
+            Some("double.quoted"),
+        ),
+        ("($cond)", None),
+        ("($cond, '')", None),
+        // A condition that compares a string — the bug this fixes.
+        ("($type === 'admin', 'pages.admin')", Some("pages.admin")),
+        (
+            "($user->role == 'editor', 'panels.editor', ['x' => 1])",
+            Some("panels.editor"),
+        ),
+        // Two commas inside the condition's own array literal, both before
+        // the real split point: bracket tracking is load-bearing here.
+        (
+            "(in_array($k, ['a', 'b']), 'pages.list')",
+            Some("pages.list"),
+        ),
+        // A comma inside the condition's own string is not structure.
+        ("($status === 'a,b', 'view.name')", Some("view.name")),
+        // A top-level comma exists, but neither argument is a literal.
+        ("($cond1, $cond2)", None),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(
+            crate::LaravelLanguageServer::extract_second_string_arg(args).as_deref(),
+            expected,
+            "args: {args}"
+        );
+    }
+}

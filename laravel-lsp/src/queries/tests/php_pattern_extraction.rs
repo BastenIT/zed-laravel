@@ -129,69 +129,6 @@ fn test_extract_all_php_patterns_views_conditional_argument_skips_interpolated_a
 }
 
 #[test]
-fn test_extract_all_php_patterns_view_property_literal() {
-    // Filament-style `protected string $view = '…';` — the class-property
-    // counterpart of a `view()` call, not reachable via a function-call
-    // query at all.
-    let php_code = r#"<?php
-    class ContractViewPage
-    {
-        protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
-    }
-    "#;
-
-    let tree = parse_php(php_code).expect("Should parse PHP");
-    let lang = language_php();
-    let patterns =
-        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
-
-    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
-    assert_eq!(
-        patterns.views[0].view_name,
-        "legal-contractmanagement::filament.pages.contract-edit-page"
-    );
-    assert!(!patterns.views[0].is_route_view);
-}
-
-#[test]
-fn test_extract_all_php_patterns_view_property_static_variant() {
-    // Filament `Widget`s declare `$view` as `static`.
-    let php_code = r#"<?php
-    class StatsWidget
-    {
-        protected static string $view = 'widgets.stats';
-    }
-    "#;
-
-    let tree = parse_php(php_code).expect("Should parse PHP");
-    let lang = language_php();
-    let patterns =
-        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
-
-    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
-    assert_eq!(patterns.views[0].view_name, "widgets.stats");
-}
-
-#[test]
-fn test_extract_all_php_patterns_view_property_non_literal_is_skipped() {
-    // `self::VIEW` isn't a string literal — no resolvable render site.
-    let php_code = r#"<?php
-    class DynamicPage
-    {
-        const VIEW = 'pages.dynamic';
-        protected string $view = self::VIEW;
-    }
-    "#;
-
-    let tree = parse_php(php_code).expect("Should parse PHP");
-    let lang = language_php();
-    let patterns =
-        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
-
-    assert!(patterns.views.is_empty(), "got {:?}", patterns.views);
-}
-
-#[test]
 fn test_extract_all_php_patterns_views_elvis_first_argument() {
     // Elvis `$x ?: 'fallback'` parses as a conditional_expression with NO
     // `body` field — this exercises the walker's absent-body path.
@@ -343,6 +280,69 @@ fn test_extract_all_php_patterns_volt_route_match_second_argument() {
     assert!(view_names.contains(&"counter.v2"));
     assert!(view_names.contains(&"counter.v1"));
     assert!(patterns.views.iter().all(|v| v.is_route_view));
+}
+
+#[test]
+fn test_extract_all_php_patterns_view_property_literal() {
+    // Filament-style `protected string $view = '…';` — the class-property
+    // counterpart of a `view()` call, not reachable via a function-call
+    // query at all.
+    let php_code = r#"<?php
+    class ContractViewPage
+    {
+        protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+    }
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(
+        patterns.views[0].view_name,
+        "legal-contractmanagement::filament.pages.contract-edit-page"
+    );
+    assert!(!patterns.views[0].is_route_view);
+}
+
+#[test]
+fn test_extract_all_php_patterns_view_property_static_variant() {
+    // Filament `Widget`s declare `$view` as `static`.
+    let php_code = r#"<?php
+    class StatsWidget
+    {
+        protected static string $view = 'widgets.stats';
+    }
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    assert_eq!(patterns.views[0].view_name, "widgets.stats");
+}
+
+#[test]
+fn test_extract_all_php_patterns_view_property_non_literal_is_skipped() {
+    // `self::VIEW` isn't a string literal — no resolvable render site.
+    let php_code = r#"<?php
+    class DynamicPage
+    {
+        const VIEW = 'pages.dynamic';
+        protected string $view = self::VIEW;
+    }
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    assert!(patterns.views.is_empty(), "got {:?}", patterns.views);
 }
 
 #[test]
