@@ -373,3 +373,71 @@ async fn unset_and_stale_glob_produce_identical_translation_completions() {
         "sanity: the root catalogue is scanned: {unset:?}"
     );
 }
+
+#[test]
+fn rename_rewrites_the_key_in_every_declaring_file() {
+    // The seventh surface. A key merged from the project config AND a
+    // module config must be rewritten in BOTH — leaving one behind would
+    // resurrect the old key at runtime through the merge.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let module = modular_fixture(tmp.path());
+
+    let targets = crate::collect_config_declaration_target(
+        tmp.path(),
+        std::slice::from_ref(&module),
+        "app.features.shared",
+        "app.features.renamed",
+    );
+    let mut files: Vec<PathBuf> = targets.iter().map(|t| t.file_path.clone()).collect();
+    files.sort();
+    let mut expected = vec![
+        module.join("config/app.php"),
+        tmp.path().join("config/app.php"),
+    ];
+    expected.sort();
+    assert_eq!(files, expected, "both declarations are rewritten");
+    assert!(
+        targets.iter().all(|t| t.new_text == "renamed"),
+        "each edit replaces the leaf segment only: {targets:?}"
+    );
+}
+
+#[tokio::test]
+async fn completion_and_the_shared_helper_agree_on_precedence() {
+    // Binds the two implementations: enumeration finds WHICH groups exist,
+    // but the winning declaration of a key must be the one
+    // `config_group_files` puts first. A future change landing in only one
+    // of them fails here.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let module = modular_fixture(tmp.path());
+    let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+    let backend = service.inner().clone();
+    *backend.root_path.write().await = Some(tmp.path().to_path_buf());
+    *backend.module_path_patterns.write().await = vec!["app/*/*".to_string()];
+
+    let completions = backend.get_all_config_keys().await;
+    let shared = completions
+        .iter()
+        .find(|k| k.key == "app.features.shared")
+        .expect("collision key offered");
+
+    let winner =
+        laravel_lsp::config::config_group_files(tmp.path(), std::slice::from_ref(&module), "app")
+            .into_iter()
+            .next()
+            .expect("at least one contributing file");
+    let winner_rel = winner
+        .strip_prefix(tmp.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    assert_eq!(
+        shared.source, winner_rel,
+        "completion's winning source must be the helper's first file"
+    );
+    assert_eq!(
+        shared.value, "module-value",
+        "…which is the module's value, per the documented rule"
+    );
+}

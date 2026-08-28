@@ -6263,7 +6263,7 @@ impl LaravelLanguageServer {
                             .register_service_provider_source(
                                 path.to_path_buf(),
                                 content,
-                                2, // app priority
+                                3, // app priority
                                 root.to_path_buf(),
                             )
                             .await
@@ -6298,7 +6298,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         path,
                         content,
-                        2, // same priority as app providers
+                        2, // module priority — above packages, below the app
                         root.to_path_buf(),
                     )
                     .await
@@ -6371,7 +6371,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         bootstrap_app,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -6401,7 +6401,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         kernel_path,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -6740,7 +6740,7 @@ impl LaravelLanguageServer {
                             .register_service_provider_source(
                                 path.to_path_buf(),
                                 content,
-                                2, // app priority
+                                3, // app priority
                                 root.to_path_buf(),
                             )
                             .await
@@ -6773,7 +6773,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         path,
                         content,
-                        2, // same priority as app providers
+                        2, // module priority — above packages, below the app
                         root.to_path_buf(),
                     )
                     .await
@@ -6844,7 +6844,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         bootstrap_app,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -6874,7 +6874,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         kernel_path,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -9057,11 +9057,17 @@ impl LaravelLanguageServer {
 
         // Imperative `Livewire::addNamespace(...)` registrations (direct or
         // via a `modules.livewireRegistrars` wrapper method) from app and
-        // module service providers. First registration wins on prefix
-        // conflict, so scan order is app providers, then modules.
+        // module service providers. On a prefix
+        // conflict the LAST registration wins — the same rule the
+        // translation-namespace merge follows — so modules are scanned first
+        // (in ascending `modules.paths` precedence) and app providers LAST:
+        // an app registration overrides any module's, because the app boots
+        // last, and between two modules the higher-precedence (later) one
+        // wins.
         let registrars = self.module_livewire_registrars.read().await.clone();
         let module_dirs = self.module_dirs_for(root).await;
-        let mut provider_files: Vec<PathBuf> = Vec::new();
+        let mut provider_files: Vec<PathBuf> =
+            laravel_lsp::config::module_provider_files(&module_dirs);
         let app_providers = root.join("app/Providers");
         if app_providers.is_dir() {
             for entry in WalkDir::new(&app_providers)
@@ -9075,7 +9081,6 @@ impl LaravelLanguageServer {
                 }
             }
         }
-        provider_files.extend(laravel_lsp::config::module_provider_files(&module_dirs));
 
         for provider_path in provider_files {
             let Ok(provider_source) = std::fs::read_to_string(&provider_path) else {
@@ -9087,7 +9092,7 @@ impl LaravelLanguageServer {
                 root,
                 &registrars,
             ) {
-                config.class_namespaces.entry(prefix).or_insert(reg);
+                config.class_namespaces.insert(prefix, reg);
             }
         }
 
@@ -9330,7 +9335,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         path.clone(),
                         content.to_string(),
-                        2, // priority: app = 2
+                        3, // priority: app = 3
                         root,
                     )
                     .await
@@ -9365,7 +9370,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         path.clone(),
                         content.to_string(),
-                        2, // priority: app = 2
+                        3, // priority: app = 3
                         root,
                     )
                     .await
@@ -14629,10 +14634,12 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // The project config dir plus each module's config dir
-        // (`modules.paths`), in ascending merge precedence: a key defined
-        // in both keeps the later (module) definition, mirroring the
-        // runtime array_replace_recursive merge.
+        // Enumeration discovers WHICH groups exist (the union of file stems
+        // across the root and module config dirs); the per-group file order
+        // — and with it the precedence of a key declared in several files —
+        // comes from `config_group_files`, the single owner of that rule.
+        // The helper returns descending precedence, so the FIRST file
+        // declaring a key wins here, exactly as it does for hover/goto.
         let module_dirs = self.module_dirs_for(&root).await;
         let config_dirs: Vec<PathBuf> = std::iter::once(root.join("config"))
             .chain(module_dirs.iter().map(|m| m.join("config")))
@@ -14641,6 +14648,24 @@ impl LaravelLanguageServer {
         if config_dirs.is_empty() {
             return Vec::new();
         }
+        let mut groups: Vec<String> = config_dirs
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "php") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
 
         // Get env vars for resolving env() references
         let env_vars: std::collections::HashMap<String, String> =
@@ -14653,42 +14678,28 @@ impl LaravelLanguageServer {
                 Err(_) => std::collections::HashMap::new(),
             };
 
-        // BTreeMap dedups keys declared in several merged files (the
-        // last-inserted, highest-precedence source wins) and keeps the
-        // sorted order the old Vec sort provided.
+        // BTreeMap dedups keys declared in several merged files (first
+        // insertion wins — the files arrive highest-precedence first) and
+        // keeps the sorted order the old Vec sort provided.
         let mut merged: std::collections::BTreeMap<String, ConfigKeyCompletion> =
             std::collections::BTreeMap::new();
 
-        for config_dir in &config_dirs {
-            let Ok(entries) = std::fs::read_dir(config_dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "php") {
-                    if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
-                        let base_key = file_name.to_string();
-                        let source = path
-                            .strip_prefix(&root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .to_string();
-
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            // Parse the config file and extract keys
-                            let keys = Self::parse_config_keys(&content, &base_key, &env_vars);
-                            for (key, value) in keys {
-                                merged.insert(
-                                    key.clone(),
-                                    ConfigKeyCompletion {
-                                        key,
-                                        value,
-                                        source: source.clone(),
-                                    },
-                                );
-                            }
-                        }
-                    }
+        for group in &groups {
+            for path in laravel_lsp::config::config_group_files(&root, &module_dirs, group) {
+                let source = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (key, value) in Self::parse_config_keys(&content, group, &env_vars) {
+                    merged.entry(key.clone()).or_insert(ConfigKeyCompletion {
+                        key,
+                        value,
+                        source: source.clone(),
+                    });
                 }
             }
         }
@@ -15040,8 +15051,14 @@ impl LaravelLanguageServer {
                 if !reg.class_path.is_dir() {
                     continue;
                 }
+                // Depth-bounded: registrations are containment-gated at
+                // extraction, but this walk runs on every completion
+                // request, so a deep in-root tree must not turn one
+                // keystroke into a full-subtree traversal. Livewire
+                // component nesting is shallow in practice.
                 for entry in walkdir::WalkDir::new(&reg.class_path)
                     .follow_links(true)
+                    .max_depth(8)
                     .into_iter()
                     .filter_map(|e| e.ok())
                     .filter(|e| {

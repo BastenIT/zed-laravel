@@ -139,13 +139,13 @@ fn classify_add_namespace(
     // quoted text instead of the (truncated) first string_content chunk.
     let class_namespace =
         unescape_php_namespace(&string_literal_raw(*args.get(1)?.as_ref()?, bytes)?);
-    let class_path = resolve_path_arg(*args.get(2)?.as_ref()?, bytes, provider_dir, root)?;
+    let class_path = contained_class_path(*args.get(2)?.as_ref()?, bytes, provider_dir, root)?;
 
     Some((
         prefix,
         LivewireClassNamespace {
             class_namespace,
-            class_path: class_path.canonicalize().unwrap_or(class_path),
+            class_path,
         },
     ))
 }
@@ -170,7 +170,7 @@ fn classify_registrar_call(
     }
 
     let args = collect_arguments(node, bytes, &["path", "prefix"])?;
-    let class_path = resolve_path_arg(*args.first()?.as_ref()?, bytes, provider_dir, root)?;
+    let class_path = contained_class_path(*args.first()?.as_ref()?, bytes, provider_dir, root)?;
     let prefix = string_literal_text(*args.get(1)?.as_ref()?, bytes)?;
     if prefix.is_empty() {
         return None;
@@ -182,9 +182,30 @@ fn classify_registrar_call(
         prefix,
         LivewireClassNamespace {
             class_namespace,
-            class_path: class_path.canonicalize().unwrap_or(class_path),
+            class_path,
         },
     ))
+}
+
+/// Resolve, canonicalize, and CONTAIN a registration's class path.
+///
+/// The path argument is provider-source-derived — discovered data — and the
+/// resolved value is consumed without further gating by the component
+/// completion walk and by `try_namespaced_class`. Gating here, at the single
+/// point where a registration is minted, covers both: a
+/// `__DIR__.'/../../../..'` never enters the config, so nothing downstream
+/// can walk or probe outside the project. Fail-closed via
+/// [`crate::path_containment::path_within_root`]: a path that cannot be
+/// proven inside `root` yields no registration.
+fn contained_class_path(
+    arg: tree_sitter::Node,
+    bytes: &[u8],
+    provider_dir: &Path,
+    root: &Path,
+) -> Option<PathBuf> {
+    let resolved = resolve_path_arg(arg, bytes, provider_dir, root)?;
+    let canonical = resolved.canonicalize().unwrap_or(resolved);
+    crate::path_containment::path_within_root(&canonical, root).then_some(canonical)
 }
 
 /// Order a call's arguments by the given parameter names: positional
@@ -208,9 +229,7 @@ fn collect_arguments<'t>(
         if arg.kind() != "argument" {
             continue;
         }
-        let Some(value) = argument_value(arg) else {
-            continue;
-        };
+        let value = argument_value(arg);
         match arg.child_by_field_name("name") {
             Some(label) => {
                 let Some(label_text) = label.utf8_text(bytes).ok() else {
@@ -219,13 +238,16 @@ fn collect_arguments<'t>(
                 let Some(slot) = parameter_names.iter().position(|p| *p == label_text) else {
                     continue;
                 };
-                slots[slot] = Some(value);
+                slots[slot] = value;
             }
             None => {
-                if next_positional >= slots.len() {
-                    continue;
+                // A positional argument consumes its slot even when its
+                // value is unusable ($variable, an expression): skipping the
+                // slot too would shift every LATER positional one place
+                // left, silently pairing values with the wrong parameters.
+                if next_positional < slots.len() {
+                    slots[next_positional] = value;
                 }
-                slots[next_positional] = Some(value);
                 next_positional += 1;
             }
         }

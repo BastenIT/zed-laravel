@@ -1259,16 +1259,39 @@ fn resolve_provider_class_file(
     let mut best: Option<(usize, PathBuf)> = None;
     for (prefix, dir) in psr4 {
         let prefix_trimmed = prefix.trim_end_matches('\\');
-        if let Some(rest) = fqcn
-            .strip_prefix(prefix_trimmed)
-            .and_then(|r| r.strip_prefix('\\').or(Some(r)).filter(|r| !r.is_empty()))
-        {
-            let candidate = module_dir
-                .join(dir)
-                .join(format!("{}.php", rest.replace('\\', "/")));
-            if candidate.is_file() && best.as_ref().is_none_or(|(len, _)| prefix.len() > *len) {
-                best = Some((prefix.len(), candidate));
+        // Composer matches PSR-4 prefixes at a NAMESPACE boundary — prefix
+        // `App\Legal\ContractManagement` must not match FQCN
+        // `App\Legal\ContractManagementSupport\X`. After stripping a
+        // non-empty prefix the remainder therefore has to start with `\`;
+        // only the empty catch-all prefix (`"": "src/"`) takes the FQCN
+        // whole.
+        let Some(rest) = fqcn.strip_prefix(prefix_trimmed) else {
+            continue;
+        };
+        let rest = if prefix_trimmed.is_empty() {
+            rest
+        } else {
+            match rest.strip_prefix('\\') {
+                Some(r) => r,
+                None => continue,
             }
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let candidate = module_dir
+            .join(dir)
+            .join(format!("{}.php", rest.replace('\\', "/")));
+        // The manifest's `autoload.psr-4` value is DISCOVERED data: an
+        // absolute path replaces the join base entirely and `..` segments
+        // walk out, so the candidate is gated against the module dir
+        // before it is ever probed — lexically first (no out-of-root
+        // existence oracle), then canonicalized (#228 convention).
+        if !crate::path_containment::path_within_root_lexical(&candidate, module_dir) {
+            continue;
+        }
+        if candidate.is_file() && best.as_ref().is_none_or(|(len, _)| prefix.len() > *len) {
+            best = Some((prefix.len(), candidate));
         }
     }
     if let Some((_, path)) = best {

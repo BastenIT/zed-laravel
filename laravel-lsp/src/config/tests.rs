@@ -1479,3 +1479,111 @@ fn discovered_provider_walk_refuses_symlink_escapes_but_keeps_symlinked_modules(
     let files = module_provider_files(std::slice::from_ref(&linked_module));
     assert_eq!(files.len(), 1, "symlinked composer path repo keeps working");
 }
+
+#[test]
+fn psr4_entries_escaping_the_module_resolve_nothing() {
+    // `autoload.psr-4` values are manifest-derived — DISCOVERED data. An
+    // absolute value replaces `Path::join`'s base entirely, and `..`
+    // segments walk out lexically; both must be refused before the
+    // candidate is ever probed.
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside/Providers");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("EscapeServiceProvider.php"),
+        "<?php class X {}",
+    )
+    .unwrap();
+
+    for psr4_dir in [
+        outside.to_string_lossy().to_string(), // absolute
+        "../../outside".to_string(),           // traversal
+    ] {
+        let module = tmp
+            .path()
+            .join(format!("proj/app/Legal/{}", psr4_dir.len()));
+        fs::create_dir_all(&module).unwrap();
+        fs::write(
+            module.join("composer.json"),
+            format!(
+                r#"{{
+    "autoload": {{ "psr-4": {{ "Acme\\": {} }} }},
+    "extra": {{ "laravel": {{ "providers": ["Acme\\Providers\\EscapeServiceProvider"] }} }}
+}}"#,
+                serde_json::to_string(&psr4_dir).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            module_provider_files(std::slice::from_ref(&module)).is_empty(),
+            "psr-4 value {psr4_dir:?} must not resolve outside the module"
+        );
+    }
+}
+
+#[test]
+fn psr4_prefix_matches_only_at_a_namespace_boundary() {
+    // Composer compares prefixes WITH their trailing separator, so
+    // `App\Legal\ContractManagement` must not match
+    // `App\Legal\ContractManagementSupport\…`. Without the boundary check
+    // the textual match wins the longest-prefix tie-break and resolves the
+    // wrong file.
+    let tmp = TempDir::new().unwrap();
+    let module = tmp.path().join("app/Legal/Suite");
+    fs::create_dir_all(module.join("support/Providers")).unwrap();
+    fs::create_dir_all(module.join("contract/Providers")).unwrap();
+    fs::write(
+        module.join("support/Providers/Registrar.php"),
+        "<?php class Support {}",
+    )
+    .unwrap();
+    // The decoy the bogus prefix match would resolve to.
+    fs::create_dir_all(module.join("contract/Support/Providers")).unwrap();
+    fs::write(
+        module.join("contract/Support/Providers/Registrar.php"),
+        "<?php class Decoy {}",
+    )
+    .unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{
+    "autoload": { "psr-4": {
+        "App\\Legal\\ContractManagement\\": "contract/",
+        "App\\Legal\\ContractManagementSupport\\": "support/"
+    } },
+    "extra": { "laravel": { "providers": [
+        "App\\Legal\\ContractManagementSupport\\Providers\\Registrar"
+    ] } }
+}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        module_provider_files(std::slice::from_ref(&module)),
+        vec![module.join("support/Providers/Registrar.php")],
+        "the true mapping wins; the overlapping-prefix decoy is not matched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn expand_module_dirs_follows_a_symlinked_module_directory() {
+    // The documented configured-path behaviour, driven through the glob
+    // expansion itself rather than only through the provider walk: a
+    // composer path repository symlinked into the module tree expands like
+    // any real directory.
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("packages/ui-kit");
+    fs::create_dir_all(&real).unwrap();
+    let modules = tmp.path().join("proj/app/Common");
+    fs::create_dir_all(&modules).unwrap();
+    std::os::unix::fs::symlink(&real, modules.join("Ui")).unwrap();
+
+    let dirs = expand_module_dirs(&tmp.path().join("proj"), &["app/Common/*".to_string()]);
+    assert_eq!(
+        dirs,
+        vec![modules.join("Ui")],
+        "a symlinked module expands (configured paths are trusted)"
+    );
+}

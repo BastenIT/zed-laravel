@@ -75,6 +75,29 @@ class ContractRegistrar
 }
 "#;
 
+async fn view_namespace_dir_named(
+    backend: &LaravelLanguageServer,
+    root: &Path,
+    namespace: &str,
+) -> Option<PathBuf> {
+    backend
+        .salsa
+        .register_config_files(root.to_path_buf(), None, None, None)
+        .await
+        .expect("salsa actor accepts config root");
+    backend
+        .register_service_provider_files_with_salsa(root)
+        .await;
+    let config = backend
+        .salsa
+        .get_laravel_config()
+        .await
+        .ok()
+        .flatten()
+        .expect("salsa config");
+    config.view_namespaces.get(namespace).cloned()
+}
+
 async fn view_namespace_dir(backend: &LaravelLanguageServer, root: &Path) -> Option<PathBuf> {
     backend
         .salsa
@@ -217,5 +240,113 @@ class DirectiveProvider {
     assert!(
         !without_modules.iter().any(|d| d.name == "contractdate"),
         "negative control: without modules.paths nothing is scanned"
+    );
+}
+
+// ---- view-namespace precedence (app > module, later module wins) ----------
+
+/// A module at `app/{parent}/{name}` registering `namespace` for its own
+/// views directory, holding one template at `pages/edit.blade.php`.
+fn registering_module(root: &Path, parent: &str, name: &str, namespace: &str) -> PathBuf {
+    let module = root.join(format!("app/{parent}/{name}"));
+    fs::create_dir_all(module.join("app/Providers")).unwrap();
+    fs::create_dir_all(module.join("resources/views/pages")).unwrap();
+    fs::write(
+        module.join("resources/views/pages/edit.blade.php"),
+        "<div/>",
+    )
+    .unwrap();
+    fs::write(
+        module.join("composer.json"),
+        format!(
+            r#"{{
+    "autoload": {{ "psr-4": {{ "App\\{parent}\\{name}\\": "app/" }} }},
+    "extra": {{ "laravel": {{ "providers": [
+        "App\\{parent}\\{name}\\Providers\\Registrar"
+    ] }} }}
+}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        module.join("app/Providers/Registrar.php"),
+        format!(
+            r#"<?php
+
+namespace App\{parent}\{name}\Providers;
+
+class Registrar
+{{
+    public function boot(): void
+    {{
+        $this->loadViewsFrom(__DIR__.'/../../resources/views', '{namespace}');
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    module
+}
+
+#[tokio::test]
+async fn app_provider_view_namespace_overrides_a_module_registration() {
+    // docs/configuration.md promises "an app/Providers registration
+    // overrides modules" — the app boots last. The module's provider path
+    // sorts BEFORE `app/Providers/…` lexicographically, so a first-wins
+    // merge would have resolved this backwards.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    registering_module(root, "Legal", "ContractManagement", "shared-ns");
+
+    let app_views = root.join("resources/views/app-owned");
+    fs::create_dir_all(&app_views).unwrap();
+    fs::create_dir_all(root.join("app/Providers")).unwrap();
+    fs::write(
+        root.join("app/Providers/AppServiceProvider.php"),
+        r#"<?php
+
+namespace App\Providers;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        $this->loadViewsFrom(__DIR__.'/../../resources/views/app-owned', 'shared-ns');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let backend = backend_for(root).await;
+    let dir = view_namespace_dir_named(&backend, root, "shared-ns")
+        .await
+        .expect("shared-ns registered");
+    assert_eq!(
+        dir.canonicalize().unwrap(),
+        app_views.canonicalize().unwrap(),
+        "the app registration wins over the module's"
+    );
+}
+
+#[tokio::test]
+async fn later_module_view_namespace_wins_over_an_earlier_one() {
+    // Two modules claiming one namespace: the LAST-registered (higher
+    // `modules.paths` precedence) wins, matching the documented rule and
+    // the translation-namespace merge.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    registering_module(root, "Legal", "Alpha", "shared-ns");
+    let beta = registering_module(root, "Legal", "Beta", "shared-ns");
+
+    let backend = backend_for(root).await;
+    let dir = view_namespace_dir_named(&backend, root, "shared-ns")
+        .await
+        .expect("shared-ns registered");
+    assert_eq!(
+        dir.canonicalize().unwrap(),
+        beta.join("resources/views").canonicalize().unwrap(),
+        "the later module wins"
     );
 }
