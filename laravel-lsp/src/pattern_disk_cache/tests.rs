@@ -548,3 +548,40 @@ fn save_borrowed_then_load_owned_round_trips() {
     // borrowed-then-owned-round-tripped entry.
     assert!(restored.find_at_position(3, 5).is_some());
 }
+
+#[test]
+fn old_schema_version_is_treated_as_stale() {
+    // bincode is non-self-describing, so a blob written by an older build
+    // could silently decode into today's shapes with default-empty new
+    // fields — a restored Filament-page file would keep resolving its
+    // template's vars as empty until an unrelated edit. The version check
+    // must reject the whole file BEFORE any entry decodes.
+    let project = TempDir::new().unwrap();
+    let cache = Arc::new(DashMap::new());
+
+    let file = touch(project.path(), "home.blade.php", "<x-foo/>");
+    cache.insert(file.clone(), (0, Arc::new(fake_patterns("home"))));
+    save_from(&cache, &Default::default(), project.path()).unwrap();
+
+    // Rewrite the saved blob with the previous schema version, keeping the
+    // entries byte-identical — exactly what a cache left behind by the
+    // previous release looks like.
+    let path = cache_file_path(project.path()).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let (mut on_disk, _): (CacheFile, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    on_disk.schema_version = SCHEMA_VERSION - 1;
+    std::fs::write(
+        &path,
+        bincode::serde::encode_to_vec(&on_disk, bincode::config::standard()).unwrap(),
+    )
+    .unwrap();
+
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into(&restored_cache, project.path());
+    assert_eq!(lr.restored, 0, "a stale-schema cache must not restore");
+    assert!(
+        restored_cache.is_empty(),
+        "no entries may leak out of a stale-schema cache"
+    );
+}

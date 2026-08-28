@@ -181,12 +181,158 @@ class StatsWidget {
 }
 
 #[test]
+fn view_property_public_untyped_variant_is_render_site() {
+    // Neither visibility nor a type hint gates detection — only the
+    // property's NAME and a literal initializer.
+    let src = r#"<?php
+class BannerWidget {
+    public $view = 'widgets.banner';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "widgets.banner");
+}
+
+#[test]
+fn view_property_private_typed_variant_is_render_site() {
+    let src = r#"<?php
+class SecretPage {
+    private string $view = 'pages.secret';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "pages.secret");
+}
+
+#[test]
+fn view_property_static_untyped_variant_is_render_site() {
+    let src = r#"<?php
+class LegacyWidget {
+    protected static $view = 'widgets.legacy';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "widgets.legacy");
+}
+
+#[test]
+fn view_property_get_view_data_is_render_var() {
+    // `getViewData()` is Filament's `with()`-equivalent extension point on
+    // `Page`/`Widget` — its returned array folds into the view's variables.
+    let src = r#"<?php
+use App\Models\User;
+class ReportPage {
+    protected string $view = 'pages.report';
+
+    protected function getViewData(): array {
+        return ['user' => User::first()];
+    }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_surface_is_scoped_to_owning_class() {
+    // Two classes in one file, only one declares `$view`: the other class's
+    // typed surface must never leak into this render site's vars.
+    let src = r#"<?php
+use App\Models\Order;
+use App\Models\User;
+class UnrelatedHelper {
+    public Order $order;
+}
+class ProfilePage {
+    public User $user;
+    protected string $view = 'pages.profile';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+    assert!(
+        !r[0].vars.contains_key("order"),
+        "the other class's property leaked: {:?}",
+        r[0].vars
+    );
+}
+
+#[test]
 fn view_property_non_literal_is_skipped() {
     // `self::VIEW` isn't a string literal — no resolvable render site.
     let src = r#"<?php
 class DynamicPage {
     const VIEW = 'pages.dynamic';
     protected string $view = self::VIEW;
+}
+
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_interpolated_string_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view = "pages.{$type}";
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_call_initializer_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view = self::defaultView();
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_concatenation_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view = 'pages.' . 'home';
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_without_initializer_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view;
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_constructor_promoted_is_skipped() {
+    // A promoted parameter's default is a PARAMETER default — the actual
+    // value depends on the caller, so it is not a resolvable render site.
+    let src = r#"<?php
+class DynamicPage {
+    public function __construct(protected string $view = 'pages.injected') {}
 }
 "#;
     let r = renders(src);
