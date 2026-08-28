@@ -3809,10 +3809,13 @@ async fn build_magic_member_entries(
                                 )
                             } else {
                                 let view_name =
-                                    laravel_lsp::view_var_index::view_name_for_path_namespaced(
-                                        &path,
-                                        &view_paths,
-                                        &view_namespaces,
+                                    laravel_lsp::view_var_index::best_indexed_view_name(
+                                        laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                            &path,
+                                            &view_paths,
+                                            &view_namespaces,
+                                        ),
+                                        &view_var_index,
                                     )?;
                                 laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
                                     ctx,
@@ -3870,10 +3873,13 @@ async fn build_magic_member_entries(
                                 )
                             } else {
                                 let view_name =
-                                    laravel_lsp::view_var_index::view_name_for_path_namespaced(
-                                        &path,
-                                        &view_paths,
-                                        &view_namespaces,
+                                    laravel_lsp::view_var_index::best_indexed_view_name(
+                                        laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                            &path,
+                                            &view_paths,
+                                            &view_namespaces,
+                                        ),
+                                        &view_var_index,
                                     )?;
                                 laravel_lsp::view_var_index::resolve_blade_member_accesses(
                                     &data.member_access_refs,
@@ -5750,16 +5756,16 @@ impl LaravelLanguageServer {
                             {
                                 continue;
                             }
-                            if let Some(name) =
-                                laravel_lsp::view_var_index::view_name_for_path_namespaced(
-                                    p,
-                                    &view_paths_for_warm,
-                                    &view_namespaces_for_warm,
-                                )
+                            let names = laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                p,
+                                &view_paths_for_warm,
+                                &view_namespaces_for_warm,
+                            );
+                            if names
+                                .iter()
+                                .any(|name| changed_views.contains(name.as_str()))
                             {
-                                if changed_views.contains(name.as_str()) {
-                                    work.insert(p.clone());
-                                }
+                                work.insert(p.clone());
                             }
                         }
                     }
@@ -7112,14 +7118,13 @@ impl LaravelLanguageServer {
                     {
                         continue;
                     }
-                    if let Some(name) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
+                    let names = laravel_lsp::view_var_index::view_names_for_path_namespaced(
                         p,
                         &view_paths,
                         &view_namespaces,
-                    ) {
-                        if changed.contains(name.as_str()) {
-                            work.insert(p.clone());
-                        }
+                    );
+                    if names.iter().any(|name| changed.contains(name.as_str())) {
+                        work.insert(p.clone());
                     }
                 }
             }
@@ -7365,11 +7370,16 @@ impl LaravelLanguageServer {
                         Some(&mut deps),
                     )
                 } else if is_blade {
-                    match laravel_lsp::view_var_index::view_name_for_path_namespaced(
-                        path,
-                        &view_paths,
-                        &view_namespaces,
-                    ) {
+                    match self.view_vars.read().ok().and_then(|vv| {
+                        laravel_lsp::view_var_index::best_indexed_view_name(
+                            laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                path,
+                                &view_paths,
+                                &view_namespaces,
+                            ),
+                            &vv,
+                        )
+                    }) {
                         Some(view_name) => match self.view_vars.read() {
                             Ok(vv) => {
                                 laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
@@ -7417,11 +7427,16 @@ impl LaravelLanguageServer {
                         Some(&mut deps),
                     )
                 } else if is_blade {
-                    match laravel_lsp::view_var_index::view_name_for_path_namespaced(
-                        path,
-                        &view_paths,
-                        &view_namespaces,
-                    ) {
+                    match self.view_vars.read().ok().and_then(|vv| {
+                        laravel_lsp::view_var_index::best_indexed_view_name(
+                            laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                path,
+                                &view_paths,
+                                &view_namespaces,
+                            ),
+                            &vv,
+                        )
+                    }) {
                         Some(view_name) => match self.view_vars.read() {
                             Ok(vv) => laravel_lsp::view_var_index::resolve_blade_member_accesses(
                                 &patterns.member_access_refs,
@@ -11218,7 +11233,7 @@ impl LaravelLanguageServer {
                 Some(config) => (config.view_paths.clone(), config.view_namespaces.clone()),
                 None => (vec![root.join("resources/views")], HashMap::new()),
             };
-            if let Some(vn) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
+            for vn in laravel_lsp::view_var_index::view_names_for_path_namespaced(
                 &file_path,
                 &view_paths,
                 &view_namespaces,
@@ -11230,6 +11245,7 @@ impl LaravelLanguageServer {
                     .and_then(|idx| idx.var_types(&vn, var_without_dollar).into_iter().next());
                 if indexed_type.is_some() {
                     resolved_type = indexed_type;
+                    break;
                 }
             }
         }
@@ -11847,7 +11863,7 @@ impl LaravelLanguageServer {
                 None => (vec![root.join("resources/views")], HashMap::new()),
             });
         if let Some((view_paths, view_namespaces)) = namespaced_config {
-            if let Some(vn) = laravel_lsp::view_var_index::view_name_for_path_namespaced(
+            for vn in laravel_lsp::view_var_index::view_names_for_path_namespaced(
                 &file_path,
                 &view_paths,
                 &view_namespaces,
@@ -11857,11 +11873,19 @@ impl LaravelLanguageServer {
                         if seen.insert(name.clone()) {
                             variables.push(BladeVariableInfo {
                                 name,
-                                php_type: types
-                                    .into_iter()
-                                    .next()
-                                    .unwrap_or_else(|| "mixed".to_string()),
-                                source: "component".to_string(),
+                                // The full union across render sites — one
+                                // render site may type `$user` as `User`,
+                                // another as `Authenticatable`; picking one
+                                // silently would misreport the other site.
+                                php_type: if types.is_empty() {
+                                    "mixed".to_string()
+                                } else {
+                                    types.join("|")
+                                },
+                                // These come from a controller or a
+                                // `$view`-property page — the render index —
+                                // not from a view component.
+                                source: "render site".to_string(),
                             });
                         }
                     }
@@ -18602,6 +18626,14 @@ return [
         if is_php {
             // Check view() calls using Salsa patterns
             for view_ref in &patterns.views {
+                // A `$view = '…'` class PROPERTY keeps goto/hover but never
+                // raises the missing-view ERROR: any PHP class may declare a
+                // string property named `view` that isn't a Blade view, and
+                // the render-index contribution is inert on a false
+                // positive — the diagnostic is not.
+                if view_ref.is_property_site {
+                    continue;
+                }
                 let possible_paths = config.resolve_view_path(&view_ref.name);
                 // Containment guard (issue #194, secondary): out-of-root
                 // candidates are filtered out before the `.exists()` probe, so an

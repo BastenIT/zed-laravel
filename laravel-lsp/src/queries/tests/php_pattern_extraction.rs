@@ -497,3 +497,38 @@ fn test_extract_helper_identifier_position_is_the_name_span() {
     assert_eq!(route.column, 0, "starts at column 0");
     assert_eq!(route.end_column, 5, "ends after the 5-char name `route`");
 }
+
+#[test]
+fn test_view_property_matches_are_flagged_and_one_per_class() {
+    // Property-form ViewMatches carry `is_property_site` (goto/hover yes,
+    // missing-view diagnostic no) and every declaring class emits its own —
+    // call-form matches stay unflagged.
+    let php_code = r#"<?php
+    class PageA { protected string $view = 'pages.a'; }
+    class PageB {
+        protected string $view = 'pages.b';
+        public function fallback() { return view('pages.fallback'); }
+    }
+    "#;
+
+    let tree = parse_php(php_code).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
+
+    let mut property_names: Vec<&str> = patterns
+        .views
+        .iter()
+        .filter(|v| v.is_property_site)
+        .map(|v| v.view_name)
+        .collect();
+    property_names.sort();
+    assert_eq!(property_names, vec!["pages.a", "pages.b"]);
+
+    let call = patterns
+        .views
+        .iter()
+        .find(|v| v.view_name == "pages.fallback")
+        .expect("call-form match");
+    assert!(!call.is_property_site);
+}

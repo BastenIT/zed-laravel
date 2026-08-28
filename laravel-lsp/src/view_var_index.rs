@@ -217,20 +217,47 @@ pub fn view_name_for_path(file: &Path, view_roots: &[PathBuf]) -> Option<String>
 /// Namespace-aware sibling of [`view_name_for_path`]: also given the
 /// project's registered view namespaces (`loadViewsFrom()` prefix → absolute
 /// view directory — module/package views), a file under one of those
-/// directories maps to `ns::dotted.rel` instead of falling through to the
-/// plain view roots. A namespace directory wins over a plain root when a file
-/// matches both — the namespace registration is the more specific one — so
-/// namespace dirs are checked first, longest-first (mirroring
-/// `view_name_for_path`'s longest-root preference).
+/// directories maps to `ns::dotted.rel`. The forward direction
+/// (`resolve_view_path`) also probes the PUBLISHED override location,
+/// `{view_root}/vendor/{ns}/…`, so the reverse direction recognizes it too —
+/// editing a published package template resolves the same `ns::` name as the
+/// package's own copy.
+///
+/// The single-name form of [`view_names_for_path_namespaced`] — the FIRST
+/// candidate, i.e. the namespaced name when one applies.
 pub fn view_name_for_path_namespaced(
     file: &Path,
     view_roots: &[PathBuf],
     namespaces: &HashMap<String, PathBuf>,
 ) -> Option<String> {
-    let mut dirs: Vec<(&String, &PathBuf)> = namespaces.iter().collect();
-    dirs.sort_by_key(|(_, dir)| std::cmp::Reverse(dir.components().count()));
+    view_names_for_path_namespaced(file, view_roots, namespaces)
+        .into_iter()
+        .next()
+}
 
-    for (name, dir) in dirs {
+/// Every view name `file` is addressable as, most specific first: the
+/// namespaced name (registered directory or published
+/// `{view_root}/vendor/{ns}/` override), then the plain dotted name when the
+/// file ALSO sits under a plain view root. Returning both keeps a
+/// namespace-registered directory nested inside a view root connected to
+/// controllers that render it by its plain name.
+///
+/// Namespace candidates are ordered deepest-directory-first, then
+/// alphabetically by namespace — `HashMap` iteration order is per-instance,
+/// so without the name tiebreak two prefixes registered against the same
+/// directory would flip the winning name between runs (matching the
+/// deterministic-order convention from #255).
+pub fn view_names_for_path_namespaced(
+    file: &Path,
+    view_roots: &[PathBuf],
+    namespaces: &HashMap<String, PathBuf>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let mut dirs: Vec<(&String, &PathBuf)> = namespaces.iter().collect();
+    dirs.sort_by_key(|(name, dir)| (std::cmp::Reverse(dir.components().count()), (*name).clone()));
+
+    'namespaces: for (name, dir) in dirs {
         let Ok(rel) = file.strip_prefix(dir) else {
             continue;
         };
@@ -244,10 +271,60 @@ pub fn view_name_for_path_namespaced(
         if stem.is_empty() {
             continue;
         }
-        return Some(format!("{name}::{}", stem.replace(['/', '\\'], ".")));
+        out.push(format!("{name}::{}", stem.replace(['/', '\\'], ".")));
+        break 'namespaces;
     }
 
-    view_name_for_path(file, view_roots)
+    if out.is_empty() {
+        // Published override: `{view_root}/vendor/{ns}/rel` for a REGISTERED
+        // namespace. Only registered names qualify — an arbitrary directory
+        // under `vendor/` is not a namespace.
+        'roots: for root in view_roots {
+            let Ok(rel) = file.strip_prefix(root.join("vendor")) else {
+                continue;
+            };
+            let mut components = rel.components();
+            let Some(ns) = components.next().and_then(|c| c.as_os_str().to_str()) else {
+                continue;
+            };
+            if !namespaces.contains_key(ns) {
+                continue;
+            }
+            let rest = components.as_path().to_string_lossy();
+            let Some(stem) = rest
+                .strip_suffix(".blade.php")
+                .or_else(|| rest.strip_suffix(".php"))
+            else {
+                continue;
+            };
+            if stem.is_empty() {
+                continue;
+            }
+            out.push(format!("{ns}::{}", stem.replace(['/', '\\'], ".")));
+            break 'roots;
+        }
+    }
+
+    if let Some(plain) = view_name_for_path(file, view_roots) {
+        if !out.contains(&plain) {
+            out.push(plain);
+        }
+    }
+    out
+}
+
+/// Of a file's addressable view names (see
+/// [`view_names_for_path_namespaced`]), the one to key index lookups by:
+/// the first name the render index actually has variables for, falling back
+/// to the first (most specific) candidate. Keeps a namespace-registered
+/// directory nested inside a plain view root connected to whichever name its
+/// controllers render it under.
+pub fn best_indexed_view_name(names: Vec<String>, idx: &ViewVarIndex) -> Option<String> {
+    names
+        .iter()
+        .find(|name| !idx.vars_for_view(name).is_empty())
+        .cloned()
+        .or_else(|| names.into_iter().next())
 }
 
 /// Resolve the property-form member accesses captured in a Blade file into
@@ -733,7 +810,7 @@ fn class_surface_types(
             }
             // Functional-API `with(fn () => ['posts' => Post::all()]);`.
             "function_call_expression" if call_function_name(n, bytes) == Some("with") => {
-                if let Some(closure) = first_closure_arg(n) {
+                if let Some(closure) = leading_closure_arg(n) {
                     if let Some(ret) = function_return_expr(closure) {
                         let mut temp = HashMap::new();
                         collect_vars(
@@ -1067,6 +1144,23 @@ fn method_has_attribute(node: Node, bytes: &[u8], name: &str) -> bool {
     found
 }
 
+/// The call's leading argument, ONLY when it is a closure. Distinguishes
+/// Volt's functional API (`with(fn () => [...])`, closure first) from
+/// Laravel's global `with($value, $callback)` helper, whose first argument
+/// is a value — matching any-position closures let a `boot()` method's
+/// `with(User::first(), fn () => ['leaked' => …])` pollute the surface.
+fn leading_closure_arg(call: Node) -> Option<Node> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut c = args.walk();
+    let first = args.named_children(&mut c).next()?;
+    let inner = if first.kind() == "argument" {
+        first.named_child(0)?
+    } else {
+        first
+    };
+    matches!(inner.kind(), "anonymous_function" | "arrow_function").then_some(inner)
+}
+
 /// The first `function (...) { … }` / `fn (...) => …` argument of a call.
 fn first_closure_arg(call: Node) -> Option<Node> {
     let args = call.child_by_field_name("arguments")?;
@@ -1226,8 +1320,11 @@ pub fn view_renders_in_file(
             stack.push(ch);
         }
     }
-    if let Some(value) = declared_view_value_node(tree.root_node(), bytes) {
-        if let Some(view_name) = declared_view_plain_literal(value, bytes) {
+    if mentions_view_property(source) {
+        for value in declared_view_value_nodes(tree.root_node(), bytes) {
+            let Some(view_name) = declared_view_plain_literal(value, bytes) else {
+                continue;
+            };
             let surface_root = owning_class_like(value).unwrap_or_else(|| tree.root_node());
             let vars = class_surface_types(
                 surface_root,
@@ -1243,14 +1340,17 @@ pub fn view_renders_in_file(
     out
 }
 
-/// The `$view` property's raw initializer node — `protected [static] string
-/// $view = <expr>;` — whatever `<expr>` is. Visibility and `static` don't
-/// matter, only the property's NAME. `None` when the class declares no
-/// `$view` property. The one place that walks the AST for "which property
-/// declaration is `$view`" — the render-site walks and
-/// [`declared_view_literal_node`] build on it so that detection rule lives
+/// Every `$view` property's raw initializer node — `protected [static]
+/// string $view = <expr>;` — whatever `<expr>` is, in document order.
+/// Visibility and `static` don't matter, only the property's NAME. One entry
+/// per declaring class-like, so a file with several classes (or an anonymous
+/// class nested in a method) yields each class's own candidate instead of
+/// one class hijacking the file. The one place that walks the AST for "which
+/// property declaration is `$view`" — the render-site walks and
+/// [`declared_view_literal_nodes`] build on it so that detection rule lives
 /// once.
-fn declared_view_value_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>> {
+fn declared_view_value_nodes<'t>(root: Node<'t>, bytes: &[u8]) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         if n.kind() == "property_declaration" {
@@ -1267,7 +1367,9 @@ fn declared_view_value_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>
                 if !is_view {
                     continue;
                 }
-                return element.child_by_field_name("default_value");
+                if let Some(value) = element.child_by_field_name("default_value") {
+                    out.push(value);
+                }
             }
         }
         let mut c = n.walk();
@@ -1275,7 +1377,18 @@ fn declared_view_value_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>
             stack.push(ch);
         }
     }
-    None
+    // The stack DFS visits in reverse; hand candidates back in document
+    // order so per-class emission order is stable.
+    out.sort_by_key(|n| n.start_byte());
+    out
+}
+
+/// Cheap pre-gate for the `$view`-property walks: a file whose source never
+/// mentions `$view` cannot declare the property, and that is nearly every
+/// file — a substring scan is orders of magnitude cheaper than a whole-AST
+/// traversal on the hot extraction path.
+pub(crate) fn mentions_view_property(source: &str) -> bool {
+    source.contains("$view")
 }
 
 /// Strict literal check for the `$view` property's initializer: only a plain
@@ -1319,24 +1432,28 @@ fn owning_class_like(node: Node) -> Option<Node> {
     None
 }
 
-/// Same `$view`-property lookup as the render-site walks, but returns
-/// the literal's CONTENT node — the span between the quotes — instead of the
-/// trimmed value, so a capture site can report a position (goto/hover/
-/// diagnostics on a `ViewReferenceData`). `None` both when there's no
-/// `$view` property and when its initializer isn't a PLAIN literal: unlike
-/// the looser [`string_literal_value`], this needs
-/// an actual `string_content` node to position at, so an empty `''` or an
-/// interpolated string also yields `None` here.
-pub(crate) fn declared_view_literal_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>> {
-    let value_node = declared_view_value_node(root, bytes)?;
-    if !matches!(value_node.kind(), "string" | "encapsed_string") {
-        return None;
-    }
-    if value_node.named_child_count() != 1 {
-        return None;
-    }
-    let content = value_node.named_child(0)?;
-    (content.kind() == "string_content").then_some(content)
+/// Same `$view`-property lookup as the render-site walks, but returns each
+/// literal's CONTENT node — the span between the quotes — instead of the
+/// trimmed value, so a capture site can report a position (goto/hover on a
+/// `ViewReferenceData`), one entry per declaring class. Candidates whose
+/// initializer isn't a PLAIN literal are dropped: unlike the looser
+/// [`string_literal_value`], this needs an actual `string_content` node to
+/// position at, so an empty `''` or an interpolated string contributes
+/// nothing.
+pub(crate) fn declared_view_literal_nodes<'t>(root: Node<'t>, bytes: &[u8]) -> Vec<Node<'t>> {
+    declared_view_value_nodes(root, bytes)
+        .into_iter()
+        .filter_map(|value_node| {
+            if !matches!(value_node.kind(), "string" | "encapsed_string") {
+                return None;
+            }
+            if value_node.named_child_count() != 1 {
+                return None;
+            }
+            let content = value_node.named_child(0)?;
+            (content.kind() == "string_content").then_some(content)
+        })
+        .collect()
 }
 
 /// Build a [`ViewRender`] from a `view('name', data)` call, also folding in any
@@ -1584,20 +1701,22 @@ pub(crate) fn capture_render_plans(
             stack.push(ch);
         }
     }
-    if let Some(value) = declared_view_value_node(tree.root_node(), bytes) {
-        let Some(view_name) = declared_view_plain_literal(value, bytes) else {
-            return out;
-        };
-        let surface_root = owning_class_like(value).unwrap_or_else(|| tree.root_node());
-        let items = capture_class_surface_items(surface_root, bytes, aliases);
-        out.push(ViewRenderPlanData {
-            view_name,
-            items: Vec::new(),
-            surface: Some(VoltSurfaceData {
-                items,
-                aliases: aliases.clone(),
-            }),
-        });
+    if mentions_view_property(source) {
+        for value in declared_view_value_nodes(tree.root_node(), bytes) {
+            let Some(view_name) = declared_view_plain_literal(value, bytes) else {
+                continue;
+            };
+            let surface_root = owning_class_like(value).unwrap_or_else(|| tree.root_node());
+            let items = capture_class_surface_items(surface_root, bytes, aliases);
+            out.push(ViewRenderPlanData {
+                view_name,
+                items: Vec::new(),
+                surface: Some(VoltSurfaceData {
+                    items,
+                    aliases: aliases.clone(),
+                }),
+            });
+        }
     }
     out
 }
@@ -1842,7 +1961,7 @@ fn capture_class_surface_items(
                 }
             }
             "function_call_expression" if call_function_name(n, bytes) == Some("with") => {
-                if let Some(closure) = first_closure_arg(n) {
+                if let Some(closure) = leading_closure_arg(n) {
                     if let Some(ret) = function_return_expr(closure) {
                         items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
                             ret, bytes, aliases,

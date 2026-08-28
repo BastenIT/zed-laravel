@@ -282,6 +282,7 @@ fn push_php_patterns(
             column: col,
             end_column: end_col,
             is_route_view: v.is_route_view,
+            is_property_site: v.is_property_site,
         }));
     }
     for e in &snippet.env_calls {

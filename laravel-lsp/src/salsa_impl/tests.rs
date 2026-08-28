@@ -1105,6 +1105,7 @@ fn collect_view_matches_only_named_classifications() {
         column: 5,
         end_column: 24,
         is_route_view: false,
+        is_property_site: false,
     }));
     p.views.push(Arc::new(ViewReferenceData {
         name: "other.view".into(),
@@ -1112,6 +1113,7 @@ fn collect_view_matches_only_named_classifications() {
         column: 5,
         end_column: 20,
         is_route_view: false,
+        is_property_site: false,
     }));
     p.build_position_index();
 
@@ -1291,6 +1293,7 @@ fn collect_returns_empty_for_no_matches() {
         column: 5,
         end_column: 9,
         is_route_view: false,
+        is_property_site: false,
     }));
     p.build_position_index();
 

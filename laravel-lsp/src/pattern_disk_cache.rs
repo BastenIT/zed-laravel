@@ -112,13 +112,16 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        positive on a component the string scan now sees.
 ///   v14 — a class's `protected string $view = '…';` property (the Filament
 ///        `Page`/`Widget` convention) is now a render site: `member_context`'s
-///        `view_renders` gained a plan for it, and `ViewRenderPlanData` grew a
-///        `surface` field carrying the class's typed surface. `#[serde(default)]`
-///        would decode a v13 entry's `ViewRenderPlanData`s without error (no
-///        shape change there), but its `view_renders` list itself lacks the new
-///        plan entirely — a restored Filament-page file would keep resolving
-///        its Blade template's vars as empty until an unrelated edit. Bump to
-///        force a re-parse that captures it.
+///        `view_renders` gained a plan for it, `ViewRenderPlanData` grew a
+///        `surface` field carrying the class's typed surface, and
+///        `ViewReferenceData` grew `is_property_site` (goto/hover yes,
+///        missing-view diagnostic no). `#[serde(default)]` would decode a
+///        v13 entry's `ViewRenderPlanData`s without error (no shape change
+///        there), but its `view_renders` list itself lacks the new plan
+///        entirely — a restored Filament-page file would keep resolving its
+///        Blade template's vars as empty until an unrelated edit, and its
+///        `$view` reference would be missing from the position index. Bump
+///        to force a re-parse that captures both.
 ///   v15 — vendor-file entries no longer carry `member_access_refs` (memory
 ///        win: ~110MB on a large project). The SHAPE of `ParsedPatternsData`
 ///        didn't change, so a v14 entry would decode without error — but its
