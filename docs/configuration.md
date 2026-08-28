@@ -42,6 +42,41 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
           }
         },
 
+        // ── Modular monoliths ──────────────────────────────────────────
+        // Where your first-party modules live, as glob patterns relative to
+        // the project root ("*" matches one directory level). OPT-IN: unset
+        // or empty means the feature is off and behavior is exactly today's
+        // — a pattern that matches nothing on disk is likewise a no-op, and
+        // a malformed entry is skipped (logged), never a failure.
+        // What a matched module contributes:
+        //   • config/{group}.php files merge into the top-level config
+        //     group. Precedence mirrors the runtime
+        //     array_replace_recursive: the project config/ file merges
+        //     first, then each module in glob-match order — the LAST-merged
+        //     declaration of a key wins, and nested arrays merge per key
+        //     rather than replacing. The same rule applies uniformly when a
+        //     module group name collides with a core group (app.php,
+        //     database.php) and when two modules define the same group.
+        //   • Service providers named by the module composer.json's
+        //     extra.laravel.providers (never by filename convention) are
+        //     indexed like app/Providers: their loadViewsFrom /
+        //     loadTranslationsFrom / Blade::directive / Livewire
+        //     registrations all resolve. On a namespace conflict the
+        //     last-registered module provider wins; an app/Providers
+        //     registration overrides modules, because the app boots last.
+        // All of it is parsed statically (tree-sitter) — no project PHP is
+        // ever executed. Guide examples:
+        //   "paths": ["app/Common/*", "app/*/*"]        Default: [] (off)
+        "modules": {
+          "paths": [],
+
+          // App-defined wrapper methods that internally call
+          // Livewire::addNamespace(...), so the extractor also recognizes
+          // e.g. $this->registerLivewireNamespace('ns', $path).
+          //              Default: ["loadLivewireComponentsFrom"]
+          "livewireRegistrars": ["loadLivewireComponentsFrom"]
+        },
+
         "codeLens": {
           // Reference-count lenses + unused-symbol diagnostic (opt-in while
           // the feature matures). Guide: docs/code-lens.md.     Default: false

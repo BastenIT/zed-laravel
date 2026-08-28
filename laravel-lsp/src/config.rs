@@ -1171,36 +1171,98 @@ pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     out
 }
 
-/// Service-provider files inside the configured module directories: any
-/// `*ServiceProvider.php` up to a few levels deep, skipping nested vendor
-/// and node_modules trees. Modules register their providers via composer
-/// `extra.laravel.providers` (merged manifests), not
-/// `bootstrap/providers.php`, so the filename convention is the static
-/// discovery signal — mirroring the vendor provider scan.
+/// Service-provider files of the configured module directories, discovered
+/// through each module's own `composer.json`: the classes its
+/// `extra.laravel.providers` array names are the providers Laravel actually
+/// boots (via the merged manifests), so THAT list — not a filename
+/// convention — decides what gets indexed. A `*ServiceProvider.php` file the
+/// manifest doesn't name is not a booted provider and is not indexed; a
+/// provider the manifest names under any filename is.
+///
+/// Each named FQCN resolves to a file through the module manifest's
+/// `autoload.psr-4` mapping (longest matching prefix wins), falling back to
+/// a bounded walk for `{ClassBasename}.php` inside the module when no PSR-4
+/// prefix matches. A module without a `composer.json`, without the `extra`
+/// entry, or whose entries don't resolve on disk simply contributes nothing.
 pub fn module_provider_files(module_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for module_dir in module_dirs {
-        for entry in walkdir::WalkDir::new(module_dir)
-            .max_depth(6)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                name != "vendor" && name != "node_modules"
-            })
-            .filter_map(|e| e.ok())
+        out.extend(composer_declared_providers(module_dir));
+    }
+    out
+}
+
+/// The provider files one module's `composer.json` declares. See
+/// [`module_provider_files`].
+fn composer_declared_providers(module_dir: &Path) -> Vec<PathBuf> {
+    let Ok(manifest) = std::fs::read_to_string(module_dir.join("composer.json")) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return Vec::new();
+    };
+    let Some(providers) = json
+        .pointer("/extra/laravel/providers")
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let psr4: Vec<(String, String)> = json
+        .pointer("/autoload/psr-4")
+        .and_then(|v| v.as_object())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(prefix, dir)| Some((prefix.clone(), dir.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    providers
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(|fqcn| resolve_provider_class_file(module_dir, &psr4, fqcn))
+        .collect()
+}
+
+/// Resolve one provider FQCN to a file inside `module_dir`: PSR-4 first
+/// (longest matching prefix), then a bounded `{Basename}.php` walk.
+fn resolve_provider_class_file(
+    module_dir: &Path,
+    psr4: &[(String, String)],
+    fqcn: &str,
+) -> Option<PathBuf> {
+    let fqcn = fqcn.trim_start_matches('\\');
+    let mut best: Option<(usize, PathBuf)> = None;
+    for (prefix, dir) in psr4 {
+        let prefix_trimmed = prefix.trim_end_matches('\\');
+        if let Some(rest) = fqcn
+            .strip_prefix(prefix_trimmed)
+            .and_then(|r| r.strip_prefix('\\').or(Some(r)).filter(|r| !r.is_empty()))
         {
-            let path = entry.path();
-            if path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with("ServiceProvider.php"))
-            {
-                out.push(path.to_path_buf());
+            let candidate = module_dir
+                .join(dir)
+                .join(format!("{}.php", rest.replace('\\', "/")));
+            if candidate.is_file() && best.as_ref().is_none_or(|(len, _)| prefix.len() > *len) {
+                best = Some((prefix.len(), candidate));
             }
         }
     }
-    out
+    if let Some((_, path)) = best {
+        return Some(path);
+    }
+
+    let basename = fqcn.rsplit('\\').next()?;
+    let file_name = format!("{basename}.php");
+    walkdir::WalkDir::new(module_dir)
+        .max_depth(6)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != "vendor" && name != "node_modules"
+        })
+        .filter_map(|e| e.ok())
+        .map(|e| e.into_path())
+        .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(file_name.as_str()))
 }
 
 /// All files that contribute to the config group `group` (the top-level

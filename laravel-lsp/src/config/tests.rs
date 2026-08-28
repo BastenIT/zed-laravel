@@ -1262,3 +1262,167 @@ fn config_group_files_orders_root_before_modules() {
         vec![module.join("config/legal-guaranteelabel.php")]
     );
 }
+
+// ---- composer-driven module provider discovery -----------------------------
+
+/// A module with a composer.json declaring one conventional and one
+/// non-conventional provider, plus a decoy `*ServiceProvider.php` the
+/// manifest does NOT name.
+fn module_with_manifest(root: &Path) -> PathBuf {
+    let module = root.join("app/Legal/ContractManagement");
+    let providers = module.join("app/Providers");
+    fs::create_dir_all(&providers).unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{
+    "name": "acme/legal-contractmanagement",
+    "autoload": {
+        "psr-4": {
+            "App\\Legal\\ContractManagement\\": "app/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "App\\Legal\\ContractManagement\\Providers\\ContractServiceProvider",
+                "App\\Legal\\ContractManagement\\Providers\\Bootstrap"
+            ]
+        }
+    }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        providers.join("ContractServiceProvider.php"),
+        "<?php class ContractServiceProvider {}",
+    )
+    .unwrap();
+    fs::write(providers.join("Bootstrap.php"), "<?php class Bootstrap {}").unwrap();
+    fs::write(
+        providers.join("UnregisteredServiceProvider.php"),
+        "<?php class UnregisteredServiceProvider {}",
+    )
+    .unwrap();
+    module
+}
+
+#[test]
+fn module_providers_come_from_composer_extra_laravel_providers() {
+    let tmp = TempDir::new().unwrap();
+    let module = module_with_manifest(tmp.path());
+
+    let mut files = module_provider_files(std::slice::from_ref(&module));
+    files.sort();
+
+    // The manifest-listed providers are indexed — including `Bootstrap`,
+    // whose filename matches no `*ServiceProvider.php` convention…
+    assert_eq!(
+        files,
+        vec![
+            module.join("app/Providers/Bootstrap.php"),
+            module.join("app/Providers/ContractServiceProvider.php"),
+        ],
+        "…and the conventionally-named but UNLISTED provider is not: only \
+         what composer boots is a provider"
+    );
+}
+
+#[test]
+fn module_without_manifest_contributes_no_providers() {
+    let tmp = TempDir::new().unwrap();
+    let module = tmp.path().join("app/Legal/Bare");
+    let providers = module.join("app/Providers");
+    fs::create_dir_all(&providers).unwrap();
+    fs::write(
+        providers.join("BareServiceProvider.php"),
+        "<?php class BareServiceProvider {}",
+    )
+    .unwrap();
+
+    assert!(module_provider_files(&[module]).is_empty());
+}
+
+#[test]
+fn provider_fqcn_resolves_via_basename_walk_without_matching_psr4() {
+    let tmp = TempDir::new().unwrap();
+    let module = tmp.path().join("app/Common/Ui");
+    let src = module.join("src/Support");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{
+    "extra": { "laravel": { "providers": ["Acme\\Ui\\Support\\UiServiceProvider"] } }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        src.join("UiServiceProvider.php"),
+        "<?php class UiServiceProvider {}",
+    )
+    .unwrap();
+
+    assert_eq!(
+        module_provider_files(std::slice::from_ref(&module)),
+        vec![module.join("src/Support/UiServiceProvider.php")]
+    );
+}
+
+// ---- modules.paths glob behavior -------------------------------------------
+
+#[test]
+fn expand_module_dirs_single_and_double_wildcard_depths() {
+    let tmp = TempDir::new().unwrap();
+    // `app/Common/*` matches one level below Common…
+    fs::create_dir_all(tmp.path().join("app/Common/Ui")).unwrap();
+    fs::create_dir_all(tmp.path().join("app/Common/Billing")).unwrap();
+    // …while `app/*/*` matches two levels below app/ — a different depth.
+    fs::create_dir_all(tmp.path().join("app/Legal/ContractManagement")).unwrap();
+
+    let single = expand_module_dirs(tmp.path(), &["app/Common/*".to_string()]);
+    assert_eq!(
+        single,
+        vec![
+            tmp.path().join("app/Common/Billing"),
+            tmp.path().join("app/Common/Ui"),
+        ]
+    );
+
+    let double = expand_module_dirs(tmp.path(), &["app/*/*".to_string()]);
+    assert!(
+        double.contains(&tmp.path().join("app/Legal/ContractManagement")),
+        "double wildcard reaches two levels deep: {double:?}"
+    );
+    assert!(
+        double.contains(&tmp.path().join("app/Common/Ui")),
+        "double wildcard also spans the single-wildcard matches: {double:?}"
+    );
+}
+
+#[test]
+fn expand_module_dirs_stale_glob_matches_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("app/Common/Ui")).unwrap();
+    assert!(
+        expand_module_dirs(tmp.path(), &["app/Removed/*".to_string()]).is_empty(),
+        "a glob whose literal segments no longer exist is simply off"
+    );
+}
+
+#[test]
+fn expand_module_dirs_malformed_entries_are_a_no_op() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("app/Common/Ui")).unwrap();
+    // `**`, stray brackets, and an empty string are not crash inputs — each
+    // entry that matches no directory contributes nothing, while a valid
+    // entry in the same list still expands.
+    let dirs = expand_module_dirs(
+        tmp.path(),
+        &[
+            "**".to_string(),
+            "app/[oops".to_string(),
+            String::new(),
+            "app/Common/*".to_string(),
+        ],
+    );
+    assert_eq!(dirs, vec![tmp.path().join("app/Common/Ui")]);
+}
