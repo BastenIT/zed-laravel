@@ -163,6 +163,13 @@ pub enum WireTarget {
 /// [`extract_blade_variable_at_cursor`]'s convention.
 pub fn wire_attribute_target_at(line: &str, cursor_col: u32) -> Option<WireTarget> {
     let cursor = cursor_col as usize;
+    // Same cursor guard as every other cursor site (alpine.rs,
+    // method_name_completion.rs): the LSP position is not a trustworthy
+    // byte index — past-the-end and mid-UTF-8-codepoint offsets both
+    // arrive in practice, and slicing on them panics.
+    if cursor > line.len() || !line.is_char_boundary(cursor) {
+        return None;
+    }
     let bytes = line.as_bytes();
     let mut search_from = 0usize;
 
@@ -200,7 +207,7 @@ pub fn wire_attribute_target_at(line: &str, cursor_col: u32) -> Option<WireTarge
             continue;
         };
         let value_end = value_start + rel_end;
-        search_from = value_end + 1;
+        search_from = (value_end + 1).min(line.len());
 
         if cursor < value_start || cursor > value_end {
             continue;
@@ -262,6 +269,11 @@ pub fn wire_attribute_completion_context(
     cursor_col: u32,
 ) -> Option<(WireValueKind, String)> {
     let cursor = cursor_col as usize;
+    // See wire_attribute_target_at — identical cursor guard, identical
+    // reason.
+    if cursor > line.len() || !line.is_char_boundary(cursor) {
+        return None;
+    }
     let bytes = line.as_bytes();
     let mut search_from = 0usize;
 
@@ -300,7 +312,9 @@ pub fn wire_attribute_completion_context(
             .find(quote as char)
             .map(|rel_end| value_start + rel_end)
             .unwrap_or(line.len());
-        search_from = value_end + 1;
+        // An unclosed value ends AT line.len(); the resume point must not
+        // step past it — `line[search_from..]` on len()+1 panics.
+        search_from = (value_end + 1).min(line.len());
 
         if cursor < value_start || cursor > value_end {
             continue;

@@ -142,11 +142,18 @@ impl ViewVarIndex {
     /// fallback jump straight from the template into whichever class(es)
     /// declare its variables.
     pub fn render_source_files(&self, view_name: &str) -> Vec<PathBuf> {
-        self.by_file
+        let mut files: Vec<PathBuf> = self
+            .by_file
             .iter()
             .filter(|(_, renders)| renders.iter().any(|r| r.view_name == view_name))
             .map(|(path, _)| path.clone())
-            .collect()
+            .collect();
+        // Sorted for the same reason `vars_for_view` sorts: `by_file` is a
+        // HashMap, and `locate_in_backing_class_files` takes the FIRST hit
+        // over this list — unsorted, a member declared by two contributing
+        // classes would flap between targets run to run.
+        files.sort();
+        files
     }
 
     /// Every variable `view_name` has a render site for, as `(name, sorted

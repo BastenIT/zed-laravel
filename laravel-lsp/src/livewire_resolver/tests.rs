@@ -793,3 +793,34 @@ fn class_property_reference_is_not_shadowed() {
 </div>";
     assert!(!is_template_local_binding(content, 1, "prefillStatus"));
 }
+
+#[test]
+fn unclosed_quote_with_cursor_elsewhere_on_the_line_does_not_panic() {
+    // Regression: with an unclosed value, the scan's resume point stepped
+    // one byte past the end of the line — any cursor NOT inside that value
+    // (which returns early) then sliced out of bounds and killed the serve
+    // loop. Cursor in `class=""`, half-typed wire:click to its right.
+    let line = r#"<div class="" wire:click="save"#;
+    assert!(wire_attribute_completion_context(line, 5).is_none());
+    assert!(wire_attribute_target_at(line, 5).is_none());
+}
+
+#[test]
+fn non_ascii_value_with_mid_codepoint_cursor_does_not_panic() {
+    // Regression: `position.character` is a UTF-16 code-unit offset, not a
+    // byte index — a caret after `prü` arrives as column 22, which lands
+    // INSIDE the two-byte `ü` when used as a byte offset and panicked on
+    // the slice. The guard (same as every other cursor site) bails out
+    // instead of unwinding the server.
+    let line = r#"<input wire:model="prüfung">"#;
+    assert!(wire_attribute_completion_context(line, 22).is_none());
+    assert!(wire_attribute_target_at(line, 22).is_none());
+}
+
+#[test]
+fn cursor_past_end_of_line_does_not_panic() {
+    let line = r#"<input wire:model="title">"#;
+    let past = line.len() as u32 + 5;
+    assert!(wire_attribute_completion_context(line, past).is_none());
+    assert!(wire_attribute_target_at(line, past).is_none());
+}
