@@ -12,6 +12,7 @@ mod code_action_create_containment;
 mod code_lens_opt_in;
 mod completion_value_pipeline;
 mod component_file_navigation_containment;
+mod component_member_navigation;
 mod component_navigation_containment;
 mod composer_autoload_containment;
 mod controllers_dir_containment;

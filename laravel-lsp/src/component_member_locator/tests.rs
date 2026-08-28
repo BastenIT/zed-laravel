@@ -129,3 +129,123 @@ class Page {
         "mixed"
     );
 }
+
+#[test]
+fn public_property_types_excludes_static_properties() {
+    // A `static` property isn't part of the component's template surface —
+    // Livewire only serializes instance state.
+    let source = r#"<?php
+class Page {
+    public static string $registry = 'none';
+    protected static $view = 'pages.x';
+    public string $title = '';
+}
+"#;
+    let names: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(names, vec!["title".to_string()]);
+}
+
+#[test]
+fn action_names_lifecycle_prefix_requires_camel_case_boundary() {
+    // `updatedFoo` is Livewire's per-property hook; `updates` and
+    // `hydraulics` merely share the prefix letters and ARE actions.
+    let source = r#"<?php
+class Page {
+    public function updatedTitle(): void {}
+    public function updating(): void {}
+    public function updates(): void {}
+    public function hydraulics(): void {}
+}
+"#;
+    assert_eq!(
+        public_action_method_names(source),
+        vec!["hydraulics".to_string(), "updates".to_string()]
+    );
+}
+
+#[test]
+fn member_declaration_summary_renders_a_method_signature() {
+    let source = r#"<?php
+class Page {
+    public function save(
+        string $status,
+        ?int $retries = null,
+    ): bool { return true; }
+}
+"#;
+    assert_eq!(
+        member_declaration_summary(source, "save").as_deref(),
+        Some("public function save( string $status, ?int $retries = null, ): bool")
+    );
+}
+
+#[test]
+fn member_declaration_summary_renders_a_property_header_without_initializer() {
+    let source = r#"<?php
+class Page {
+    protected static string $view = 'pages.report';
+    public ?\App\Models\User $user = null;
+}
+"#;
+    assert_eq!(
+        member_declaration_summary(source, "user").as_deref(),
+        Some("public ?\\App\\Models\\User $user")
+    );
+    assert_eq!(
+        member_declaration_summary(source, "view").as_deref(),
+        Some("protected static string $view")
+    );
+    assert!(member_declaration_summary(source, "missing").is_none());
+}
+
+#[test]
+fn locates_member_inside_an_inline_sfc_blade_source() {
+    // Livewire v4 single-file component: the class lives in the template's
+    // own front matter, so the .blade.php content IS the source to parse —
+    // positions land inside the blade file.
+    let source = r#"<?php
+
+use Livewire\Component;
+
+new class extends Component {
+    public int $count = 0;
+
+    public function increment(): void
+    {
+        $this->count++;
+    }
+};
+?>
+
+<div>
+    <span>{{ $count }}</span>
+    <button wire:click="increment">+</button>
+</div>
+"#;
+    let count = locate_member(source, "count").expect("property in front matter");
+    assert_eq!(count.kind, MemberKind::Property);
+    assert_eq!(count.line, 5, "0-based line of `public int $count = 0;`");
+    let increment = locate_member(source, "increment").expect("method in front matter");
+    assert_eq!(increment.kind, MemberKind::Method);
+    assert_eq!(increment.line, 7);
+}
+
+#[test]
+fn locates_member_inside_a_volt_class_blade_source() {
+    let source = r#"<?php
+
+use Livewire\Volt\Component;
+
+new class extends Component {
+    public string $search = '';
+}; ?>
+
+<div><input wire:model="search"></div>
+"#;
+    let loc = locate_member(source, "search").expect("Volt front-matter property");
+    assert_eq!(loc.kind, MemberKind::Property);
+    assert_eq!(loc.line, 5);
+}

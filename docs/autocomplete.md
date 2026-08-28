@@ -155,6 +155,29 @@ Variables are resolved from:
 
 A variable typed from a query-builder terminal (`$users = User::all();`, `User::where(...)->get()`, …) honors the model's custom collection — when `User` declares `protected $collectionClass = UserCollection::class;` (or a `newCollection()` override), `$users` resolves as `UserCollection<User>` instead of the default `Collection<User>`, matching the relationship-completion behavior above.
 
+## ⚡ `wire:` Attribute Values
+
+Inside a `wire:*="…"` value, completion offers the backing component's members — with either quote style, and before the closing quote is typed:
+
+```blade
+<button wire:click="
+{{--                ^ enterEditMode()   ← public, non-static methods --}}
+{{--                  checkPrefillStatus() --}}
+
+<input wire:model.live="
+{{--                    ^ contractData (ContractData)   ← public, non-static properties --}}
+{{--                      prefillStatus (string) --}}
+
+<input wire:model="contractData.
+{{--                            ^ title (string)   ← the segment resolves through ContractData --}}
+```
+
+- **Action bindings** (`wire:click`, `wire:submit`, any DOM-event directive) offer public, non-static **methods** — excluding the lifecycle surface (`mount`, `boot`, `booted`, `hydrate`, `dehydrate`, `rendering`, `rendered`, `exception`) and the per-property `updatedFoo`/`updatingFoo` hook families. Dotted values are rejected for actions.
+- **Data bindings** (`wire:model` with any modifiers, `wire:show`, `wire:text`) offer public, non-static **properties**. Dotted paths complete segment by segment: each leading segment resolves to its declared class, and that class's properties are offered — at any depth while the types stay resolvable.
+- Values that are already a JS expression (`$wire.count++`, `open = true`) get no member completion, so nothing conflicts with Alpine.
+
+`$` completion in the template body offers the same public, non-static property surface, merged (and de-duplicated) with the view-data variables below — properties declared only on framework base classes are not offered. Trait- and parent-provided members are a known limitation: only members declared in the component's own class (or SFC/Volt front matter) appear.
+
 ## 🔄 Loop Variables (Scope-Aware)
 
 Variables from loop directives are available **only inside** the loop block:
