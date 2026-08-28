@@ -1890,15 +1890,24 @@ class PageB { protected string $view = 'pages.b'; }
 }
 
 #[test]
-fn anonymous_class_does_not_hijack_its_host_page() {
-    // The anonymous class nested in a method gets its OWN render site; the
-    // host page keeps its site AND its typed surface.
+fn anonymous_class_and_host_never_absorb_each_other() {
+    // BOTH directions: the anonymous class nested in a method gets its OWN
+    // render site without the host's members, AND the host's surface walk
+    // stops at the class boundary instead of descending through the method
+    // body into the anonymous class — each site's vars are EXACTLY its own
+    // class's members.
     let src = r#"<?php
+use App\Models\Secret;
 use App\Models\User;
 class SettingsPage {
     public User $user;
     protected string $view = 'pages.settings';
-    public function modal() { return new class { protected string $view = 'pages.modal'; }; }
+    public function modal() {
+        return new class {
+            public Secret $secret;
+            protected string $view = 'pages.modal';
+        };
+    }
 }
 "#;
     let r = renders(src);
@@ -1907,18 +1916,61 @@ class SettingsPage {
         .iter()
         .find(|v| v.view_name == "pages.settings")
         .expect("the host page keeps its render site");
+    let mut settings_vars: Vec<&str> = settings.vars.keys().map(String::as_str).collect();
+    settings_vars.sort_unstable();
     assert_eq!(
-        settings.vars.get("user").map(String::as_str),
-        Some("App\\Models\\User"),
-        "…and its typed surface"
+        settings_vars,
+        vec!["user"],
+        "the host's surface is exactly its own members — the anonymous \
+         class's $secret must not fold in: {:?}",
+        settings.vars
     );
     let modal = r
         .iter()
         .find(|v| v.view_name == "pages.modal")
         .expect("the anonymous class contributes its own site");
+    let mut modal_vars: Vec<&str> = modal.vars.keys().map(String::as_str).collect();
+    modal_vars.sort_unstable();
+    assert_eq!(
+        modal_vars,
+        vec!["secret"],
+        "…and vice versa: the host's $user stays out: {:?}",
+        modal.vars
+    );
+}
+
+#[test]
+fn captured_plan_surface_stops_at_the_class_boundary_too() {
+    // The plan path (`capture_class_surface_items`) shares the bounded
+    // descent — parity with the live walk on the two-directional fixture.
+    let src = r#"<?php
+use App\Models\Secret;
+use App\Models\User;
+class SettingsPage {
+    public User $user;
+    protected string $view = 'pages.settings';
+    public function modal() {
+        return new class {
+            public Secret $secret;
+            protected string $view = 'pages.modal';
+        };
+    }
+}
+"#;
+    let p = blade_project();
+    let (live, captured) = render_both_ways(&p.index, &p.root, src);
+    assert_eq!(
+        live, captured,
+        "captured $view render plans diverged from live"
+    );
+    let settings = live
+        .iter()
+        .find(|v| v.view_name == "pages.settings")
+        .expect("host site");
     assert!(
-        modal.vars.is_empty(),
-        "the host's $user must not leak into the anonymous class's site"
+        !settings.vars.contains_key("secret"),
+        "plan path leaked the anonymous class's member: {:?}",
+        settings.vars
     );
 }
 

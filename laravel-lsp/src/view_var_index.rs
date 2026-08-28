@@ -713,8 +713,18 @@ fn class_surface_types(
 ) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
 
-    let mut stack = vec![root];
-    while let Some(n) = stack.pop() {
+    // Each stack entry carries whether a class boundary has already been
+    // crossed on the way to it — see [`opens_class_body`]: a second
+    // boundary (an anonymous class inside a method body) is a different
+    // component's surface and its subtree is not descended into, so the
+    // host class can never absorb a nested class's members (nor a Volt
+    // component a nested anonymous class's).
+    let mut stack = vec![(root, false)];
+    while let Some((n, inside_class)) = stack.pop() {
+        let crosses = opens_class_body(n);
+        if crosses && inside_class {
+            continue;
+        }
         match n.kind() {
             // Typed public property — authoritative, so plain `insert`.
             "property_declaration" if is_public(n, bytes) => {
@@ -845,7 +855,7 @@ fn class_surface_types(
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
-            stack.push(ch);
+            stack.push((ch, inside_class || crosses));
         }
     }
     out
@@ -1418,6 +1428,29 @@ fn declared_view_plain_literal(value: Node, bytes: &[u8]) -> Option<String> {
     content.utf8_text(bytes).ok().map(str::to_string)
 }
 
+/// Whether `node` opens a class body of its own — a named class-like
+/// declaration, or an anonymous class (`new class { … }`, the
+/// `object_creation_expression` that actually carries a `declaration_list`;
+/// a plain `new Foo(...)` call does not count). The surface walks cross at
+/// most ONE such boundary from their root: the owning class (or a Volt
+/// front-matter's own component class under a `program` root) is entered,
+/// while any class body nested deeper is a DIFFERENT component's surface
+/// and must not fold into this one.
+fn opens_class_body(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "class_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+            | "interface_declaration"
+            // `new class { … }` — the `anonymous_class` node carries the
+            // `declaration_list`; the surrounding
+            // `object_creation_expression` (also produced by plain
+            // `new Foo(...)` calls) is NOT the boundary.
+            | "anonymous_class"
+    )
+}
+
 /// The class-like declaration (`class`, `trait`, `enum`, or an anonymous
 /// class body) that owns `node`. Scopes the typed-surface walk to the
 /// `$view`-bearing class alone — a second class in the same file must never
@@ -1898,8 +1931,15 @@ fn capture_class_surface_items(
 ) -> Vec<VoltPropPlanData> {
     let mut items: Vec<VoltPropPlanData> = Vec::new();
 
-    let mut stack = vec![root];
-    while let Some(n) = stack.pop() {
+    // Same bounded descent as `class_surface_types` — at most one class
+    // boundary from the root, so a nested anonymous class's members never
+    // fold into this surface's plan.
+    let mut stack = vec![(root, false)];
+    while let Some((n, inside_class)) = stack.pop() {
+        let crosses = opens_class_body(n);
+        if crosses && inside_class {
+            continue;
+        }
         match n.kind() {
             "property_declaration" if is_public(n, bytes) => {
                 if let (Some(ty), Some(name)) = (
@@ -1985,7 +2025,7 @@ fn capture_class_surface_items(
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
-            stack.push(ch);
+            stack.push((ch, inside_class || crosses));
         }
     }
     items
