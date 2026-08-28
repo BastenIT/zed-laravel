@@ -9378,8 +9378,14 @@ impl LaravelLanguageServer {
                     self.invalidate_config_cache().await;
                 }
             }
-        } else if filename.starts_with(".env") {
-            // Env file (.env, .env.local, .env.example)
+        } else if laravel_lsp::env_key_locator::is_env_file_name(filename) {
+            // Env file (.env, .env.local, .env.example).
+            //
+            // Gated on the shared predicate, not `starts_with(".env")`: that
+            // prefix also swallows `.envrc` (direnv's file, common in Laravel
+            // repositories), `.environment`, and `.env-backup`, registering
+            // each as a Laravel env source that Salsa then merges into
+            // completion and hover results.
             let priority = match filename {
                 ".env" => 2,
                 ".env.local" => 1,
@@ -15402,9 +15408,11 @@ impl LaravelLanguageServer {
     /// Served from the Salsa translation cache (issue #293). This used to
     /// re-enumerate the lang root *and* the locale directory, then re-read and
     /// re-parse every catalogue in that locale — recompiling the key regex each
-    /// time — on **every completion request**. The semantics are unchanged:
-    /// first existing lang root, first locale directory within it, first-wins
-    /// on duplicate keys. See
+    /// time — on **every completion request**. The semantics are unchanged
+    /// except for which locale answers: first existing lang root, one locale
+    /// directory within it — the app's configured locale since #340, the
+    /// alphabetically-first before that and still when the config names none
+    /// this project defines — and first-wins on duplicate keys. See
     /// [`laravel_lsp::salsa_impl::TranslationCache::completion_keys`] for why
     /// a single locale is the right answer here where the hover / goto /
     /// diagnostics trio unions every locale.
@@ -22357,7 +22365,7 @@ impl LaravelLanguageServer {
 
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let file_stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
-        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        let is_env = laravel_lsp::env_key_locator::is_env_file_name(file_name);
         let root = self.root_path.read().await.clone();
         // A `config/<file>.php` — direct child of the project's config dir,
         // or of a configured module's config dir (`modules.paths`).
@@ -25781,7 +25789,12 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Determine context based on file type
         let path = uri.path();
-        let is_env_file = path.contains(".env");
+        // Gate on the file NAME, not the whole path. `path.contains(".env")`
+        // also matches anything under a directory like `.envs/`, which routed
+        // shell scripts — and `.php` files, checked before the PHP branch
+        // below — into env-interpolation completion. Same gate the code-lens
+        // and semantic-token paths use.
+        let is_env_file = laravel_lsp::env_key_locator::path_is_env_file(path);
         let is_phpunit_file = path.ends_with("phpunit.xml")
             || path.ends_with("phpunit.xml.dist")
             || path.ends_with("phpunit.dist.xml");
@@ -27639,9 +27652,6 @@ impl LanguageServer for LaravelLanguageServer {
         // Build completion items, filtering by prefix
         let filter_upper = env_ctx.prefix.to_uppercase();
 
-        // Track which var names we've seen (from .env files)
-        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         // Create the text_edit range once for reuse
         let edit_range = Range {
             start: Position {
@@ -27654,13 +27664,19 @@ impl LanguageServer for LaravelLanguageServer {
             },
         };
 
-        // First, add .env file vars (project-specific, higher priority)
-        let mut items: Vec<CompletionItem> = env_vars
+        // Only variables the project declares in its `.env` files are offered.
+        // The language server's own process environment is deliberately NOT
+        // merged in (issue #342): it is inherited from Zed and thus from the
+        // login shell, so it routinely holds credentials that have no business
+        // in a completion popup — and `${...}` interpolation in `.env` and
+        // `env()` at runtime both resolve against the dotenv file set, never
+        // against the editor's environment, so those names would not exist
+        // wherever the application actually runs.
+        let items: Vec<CompletionItem> = env_vars
             .into_iter()
             .filter(|v| !v.is_commented)
             .filter(|v| v.name.to_uppercase().starts_with(&filter_upper))
             .map(|v| {
-                seen_names.insert(v.name.clone());
                 let source_file = v
                     .source_file
                     .file_name()
@@ -27690,32 +27706,6 @@ impl LanguageServer for LaravelLanguageServer {
                 }
             })
             .collect();
-
-        // Then, add system env vars (lower priority, only if not already in .env)
-        for (name, value) in std::env::vars() {
-            if !seen_names.contains(&name) && name.to_uppercase().starts_with(&filter_upper) {
-                let doc = CompletionDoc::new()
-                    .header(&name)
-                    .summary(if value.is_empty() {
-                        "(empty)".to_string()
-                    } else {
-                        value.clone()
-                    })
-                    .section("Source: system environment")
-                    .into_documentation();
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    detail: Some(format!("{} (from system)", value)),
-                    documentation: Some(doc),
-                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range: edit_range,
-                        new_text: name,
-                    })),
-                    ..Default::default()
-                });
-            }
-        }
 
         debug!("   Returning {} env completion items", items.len());
 
@@ -27751,7 +27741,7 @@ impl LanguageServer for LaravelLanguageServer {
             .and_then(|n| n.to_str())
             .unwrap_or("");
         let is_blade = path.ends_with(".blade.php");
-        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        let is_env = laravel_lsp::env_key_locator::is_env_file_name(file_name);
         if !is_blade && !is_env {
             return Ok(None);
         }
