@@ -426,14 +426,14 @@ async fn completion_and_the_shared_helper_agree_on_precedence() {
             .into_iter()
             .next()
             .expect("at least one contributing file");
-    let winner_rel = winner
-        .strip_prefix(tmp.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let winner_rel = winner.strip_prefix(tmp.path()).unwrap();
 
+    // Compared by path COMPONENTS, not as strings: the fixture builds its
+    // module path from a forward-slash literal, so on Windows the two sides
+    // spell the same path with different separators.
     assert_eq!(
-        shared.source, winner_rel,
+        Path::new(&shared.source).components().collect::<Vec<_>>(),
+        winner_rel.components().collect::<Vec<_>>(),
         "completion's winning source must be the helper's first file"
     );
     assert_eq!(
