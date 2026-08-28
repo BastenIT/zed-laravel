@@ -122,5 +122,26 @@ Two escape hatches cover what the heuristic can't infer — a directive that tak
 
 Names with dedicated handling (`@component`, `@livewire`, `@feature`, `@includeFirst`, `@extends`, `@include`, `@includeIf`, `@each`, `@includeWhen`, `@includeUnless`) ignore both lists — their own resolution always wins. See [Configuration](configuration.md).
 
+**Component members in Blade** — inside a template backed by a component class (a Livewire component in any format, a class-based Volt component, or a Filament `$view`-property page), `$this->member`, bare `$variable` references, and `wire:` attribute values all jump to the member's declaration in the backing class. For a Livewire v4 single-file component or a class-based Volt component the class lives in the template's own front matter, so the jump lands inside the `.blade.php` itself:
+
+```blade
+<button wire:click="enterEditMode">Edit</button>
+{{--                ^^^^^^^^^^^^^ → app/Livewire/ContractPage.php  (public function enterEditMode()) --}}
+
+<input wire:model.live="contractData.title">
+{{--                    ^^^^^^^^^^^^ → app/Livewire/ContractPage.php  (public ContractData $contractData) --}}
+
+<input wire:keydown.enter="performSearch">
+{{--                       ^^^^^^^^^^^^^ any DOM-event directive works, not just click/submit/poll --}}
+
+{{ $this->getCalculatedEndDateForDisplay() }}
+{{--      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ → the method declaration in the backing class --}}
+
+{{ $prefillStatus }}
+{{-- ^^^^^^^^^^^^ → public string $prefillStatus in the backing class --}}
+```
+
+A `wire:` value that isn't a plain member reference (`$wire.count++`, `count++`, `open = true`) is left alone entirely, so nothing conflicts with Alpine. A bare `$variable` bound locally in the template first — an enclosing `@foreach`/`@for` loop variable, a `@php` assignment, a component `@props` entry, or Blade's own `$loop` — is NOT treated as a class member: local scope wins and no navigation is offered. Members inherited from traits or parent classes are a known limitation — only members declared in the component's own class file (or front matter) resolve.
+
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@includeIf` `@includeWhen` `@includeUnless` `@includeFirst` `@each` `@component` custom `Blade::directive()` view directives `@use` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, scopes, accessors, columns, dynamic finders)
+`view()` `View::make()` `@extends` `@include` `@includeIf` `@includeWhen` `@includeUnless` `@includeFirst` `@each` `@component` custom `Blade::directive()` view directives `@use` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, scopes, accessors, columns, dynamic finders) · `wire:*` attribute values · `$this->member` / bare `$variable` in component-backed Blade

@@ -22,6 +22,19 @@ $tz = config('app.timezone');
 {{-- ^^^^^ hover →  App\Models\User::$email, its PHPDoc summary, and the declaration --}}
 ```
 
+**Component members in Blade** — `$this->member` in a template backed by a component class (Livewire in any format, class-based Volt, a Filament `$view`-property page) gets a card with the member's kind, the backing class, the full declaration header, and a click-to-open link. This card is emitted unconditionally in Blade: Intelephense cannot resolve `$this` inside a template's PHP context, so there is no PHP-tooling card to defer to.
+
+```blade
+{{ $this->getCalculatedEndDateForDisplay() }}
+{{--      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ hover →  App\Livewire\ContractPage::getCalculatedEndDateForDisplay()
+                                                   public function getCalculatedEndDateForDisplay(): ?string
+                                                   + click-to-open link to the declaration --}}
+
+{{ $this->uploadedFile }}
+{{--      ^^^^^^^^^^^^ hover →  App\Livewire\ContractPage::$uploadedFile
+                                public ?TemporaryUploadedFile $uploadedFile --}}
+```
+
 **Eloquent magic members** get semantic cards explaining what the magic actually is — the classification, the declaring class, and the method source that backs it:
 
 ```php

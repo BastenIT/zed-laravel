@@ -454,3 +454,373 @@ fn reverse_none_for_non_livewire_file() {
 
     assert!(livewire_name_for_path(&path, &cfg, LivewireVersion::V4).is_none());
 }
+
+// ---- wire_attribute_target_at --------------------------------------------
+
+#[test]
+fn wire_click_method_call() {
+    let line = r#"<button wire:click="enterEditMode">Edit</button>"#;
+    let cursor = line.find("enterEditMode").unwrap() as u32 + 3;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("enterEditMode".to_string()))
+    );
+}
+
+#[test]
+fn wire_poll_with_modifier_and_method_call_with_args() {
+    let line = r#"<div wire:poll.2000ms="checkPrefillStatus"></div>"#;
+    let cursor = line.find("checkPrefillStatus").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("checkPrefillStatus".to_string()))
+    );
+}
+
+#[test]
+fn wire_submit_prevent_method_call_with_arguments() {
+    let line = r#"<form wire:submit.prevent="save('draft')">"#;
+    let cursor = line.find("save(").unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("save".to_string()))
+    );
+}
+
+#[test]
+fn wire_model_targets_the_first_dot_segment_as_a_property() {
+    let line = r#"<input wire:model="contractData.title">"#;
+    let cursor = line.find("contractData").unwrap() as u32 + 2;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Property("contractData".to_string()))
+    );
+}
+
+#[test]
+fn wire_model_live_modifier_still_targets_the_property() {
+    let line = r#"<input wire:model.live.debounce.500ms="filters.search">"#;
+    let cursor = line.find("filters").unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Property("filters".to_string()))
+    );
+}
+
+#[test]
+fn wire_click_js_expression_has_no_target() {
+    let line = r#"<button wire:click="$wire.count++">+</button>"#;
+    let cursor = line.find("count").unwrap() as u32;
+    assert!(wire_attribute_target_at(line, cursor).is_none());
+}
+
+#[test]
+fn cursor_outside_the_quoted_value_has_no_target() {
+    let line = r#"<button wire:click="enterEditMode">Edit</button>"#;
+    let cursor = line.find("wire:click").unwrap() as u32;
+    assert!(wire_attribute_target_at(line, cursor).is_none());
+}
+
+#[test]
+fn no_wire_attribute_on_line_has_no_target() {
+    let line = r#"<button class="btn">Edit</button>"#;
+    assert!(wire_attribute_target_at(line, 10).is_none());
+}
+
+#[test]
+fn wire_completion_context_empty_value_is_method_kind() {
+    let line = r#"<button wire:click="">"#;
+    let col = line.find('"').unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Method, String::new()))
+    );
+}
+
+#[test]
+fn wire_completion_context_partial_value_carries_prefix() {
+    let line = r#"<div wire:poll.2000ms="check">"#;
+    let col = (line.find("check").unwrap() + "check".len()) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Method, "check".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_model_is_property_kind() {
+    let line = r#"<input wire:model="contract">"#;
+    let col = (line.find("contract").unwrap() + 3) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Property, "con".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_unclosed_quote_still_matches() {
+    let line = r#"<button wire:click="sa"#;
+    let col = line.len() as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Method, "sa".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_rejects_expression_values() {
+    let line = r#"<button wire:click="$wire.count++">"#;
+    let col = (line.find("count").unwrap() + 2) as u32;
+    assert_eq!(wire_attribute_completion_context(line, col), None);
+}
+
+#[test]
+fn wire_completion_context_non_member_attribute_is_none() {
+    let line = r#"<div wire:key="row-1">"#;
+    let col = (line.find("row").unwrap() + 1) as u32;
+    assert_eq!(wire_attribute_completion_context(line, col), None);
+}
+
+#[test]
+fn wire_target_show_and_text_bind_properties() {
+    let line = r#"<span wire:text="prefillStatus">"#;
+    let col = (line.find("prefill").unwrap() + 2) as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, col),
+        Some(WireTarget::Property("prefillStatus".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_accepts_dotted_binding_paths() {
+    let line = r#"<input wire:model="formData.">"#;
+    let col = (line.find("formData.").unwrap() + "formData.".len()) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Property, "formData.".to_string()))
+    );
+
+    let line = r#"<input wire:model="formData.ti">"#;
+    let col = (line.find("ti\"").unwrap() + 2) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, col),
+        Some((WireValueKind::Property, "formData.ti".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_still_rejects_dotted_action_values() {
+    let line = r#"<button wire:click="save.now">"#;
+    let col = (line.find("save").unwrap() + 6) as u32;
+    assert_eq!(wire_attribute_completion_context(line, col), None);
+}
+
+#[test]
+fn property_path_prefix_rejects_malformed_paths() {
+    assert!(is_property_path_prefix("a.b.c"));
+    assert!(is_property_path_prefix("a."));
+    assert!(is_property_path_prefix(""));
+    assert!(!is_property_path_prefix(".a"));
+    assert!(!is_property_path_prefix("a..b"));
+    assert!(!is_property_path_prefix("a.b c"));
+}
+
+#[test]
+fn wire_keydown_enter_is_an_action_binding() {
+    // Any DOM-event directive is an action binding, not just click/submit/
+    // poll — and the method name need not echo the event name.
+    let line = r#"<input wire:keydown.enter="performSearch">"#;
+    let cursor = line.find("performSearch").unwrap() as u32 + 2;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("performSearch".to_string()))
+    );
+}
+
+#[test]
+fn wire_submit_with_mismatched_method_name_navigates() {
+    let line = r#"<form wire:submit="handleSubmit">"#;
+    let cursor = line.find("handleSubmit").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("handleSubmit".to_string()))
+    );
+}
+
+#[test]
+fn wire_change_and_blur_are_action_bindings() {
+    for line in [
+        r#"<select wire:change="applyFilter">"#,
+        r#"<input wire:blur="validateField">"#,
+    ] {
+        let value_start = line.find('"').unwrap() as u32 + 1;
+        assert!(
+            matches!(
+                wire_attribute_target_at(line, value_start),
+                Some(WireTarget::Method(_))
+            ),
+            "line: {line}"
+        );
+    }
+}
+
+#[test]
+fn wire_confirm_value_is_a_message_not_a_member() {
+    // Deviation from the issue's example list, deliberately: `wire:confirm`'s
+    // value is the confirmation MESSAGE shown to the user, not a method name.
+    let line = r#"<button wire:confirm="Delete" wire:click="delete">x</button>"#;
+    let cursor = line.find("Delete").unwrap() as u32;
+    assert!(wire_attribute_target_at(line, cursor).is_none());
+}
+
+#[test]
+fn non_wire_prefixed_js_expressions_have_no_target() {
+    // The `$wire.`-prefixed case is covered above; these two prove the
+    // exclusion is the value GRAMMAR, not a `$wire` special case.
+    for line in [
+        r#"<button wire:click="count++">+</button>"#,
+        r#"<button wire:click="open = true">go</button>"#,
+    ] {
+        let value_start = line.find('"').unwrap() as u32 + 1;
+        assert!(
+            wire_attribute_target_at(line, value_start).is_none(),
+            "line: {line}"
+        );
+    }
+}
+
+#[test]
+fn wire_target_works_with_single_quoted_values() {
+    let line = "<button wire:click='enterEditMode'>Edit</button>";
+    let cursor = line.find("enterEditMode").unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("enterEditMode".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_single_quotes_and_unclosed_mid_line() {
+    // Single-quote style.
+    let line = "<input wire:model='contract";
+    let cursor = line.len() as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, cursor),
+        Some((WireValueKind::Property, "contract".to_string()))
+    );
+    // Unclosed double quote while the document continues past this line —
+    // the value ends at end-of-line for completion purposes.
+    let line = r#"    <button wire:click="ent"#;
+    let cursor = line.len() as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, cursor),
+        Some((WireValueKind::Method, "ent".to_string()))
+    );
+}
+
+// ---- template-local bindings shadow class properties ----------------------
+
+#[test]
+fn foreach_loop_variable_is_local_inside_the_loop_only() {
+    let content = "\
+<div>
+@foreach ($users as $user)
+    <span>{{ $user->name }}</span>
+@endforeach
+<span>{{ $user }}</span>
+</div>";
+    assert!(is_template_local_binding(content, 2, "user"));
+    assert!(
+        is_template_local_binding(content, 1, "user"),
+        "binding and use on the @foreach line itself count as in scope"
+    );
+    assert!(
+        !is_template_local_binding(content, 4, "user"),
+        "after @endforeach the loop variable is out of scope"
+    );
+}
+
+#[test]
+fn foreach_key_value_binds_both_names_and_loop() {
+    let content = "\
+@foreach ($rows as $index => $row)
+    {{ $loop->iteration }} {{ $index }} {{ $row }}
+@endforeach";
+    assert!(is_template_local_binding(content, 1, "row"));
+    assert!(is_template_local_binding(content, 1, "index"));
+    assert!(is_template_local_binding(content, 1, "loop"));
+    assert!(!is_template_local_binding(content, 1, "rows"));
+}
+
+#[test]
+fn php_block_assignment_persists_after_endphp() {
+    let content = "\
+@php
+    $total = 0;
+@endphp
+<span>{{ $total }}</span>";
+    assert!(
+        is_template_local_binding(content, 3, "total"),
+        "PHP locals persist in the compiled template scope"
+    );
+    assert!(!is_template_local_binding(content, 3, "other"));
+}
+
+#[test]
+fn inline_php_and_for_and_props_bind_locals() {
+    let content = "\
+@props(['variant', 'size' => 'md'])
+@php($discount = 5)
+@for ($i = 0; $i < 3; $i++)
+    {{ $i }} {{ $variant }} {{ $discount }}
+@endfor
+{{ $i }}";
+    assert!(is_template_local_binding(content, 3, "variant"));
+    assert!(is_template_local_binding(content, 3, "size"));
+    assert!(is_template_local_binding(content, 3, "discount"));
+    assert!(is_template_local_binding(content, 3, "i"));
+    assert!(
+        !is_template_local_binding(content, 5, "i"),
+        "@endfor closes the loop-variable scope"
+    );
+}
+
+#[test]
+fn class_property_reference_is_not_shadowed() {
+    let content = "\
+<div>
+    <span>{{ $prefillStatus }}</span>
+</div>";
+    assert!(!is_template_local_binding(content, 1, "prefillStatus"));
+}
+
+#[test]
+fn unclosed_quote_with_cursor_elsewhere_on_the_line_does_not_panic() {
+    // Regression: with an unclosed value, the scan's resume point stepped
+    // one byte past the end of the line — any cursor NOT inside that value
+    // (which returns early) then sliced out of bounds and killed the serve
+    // loop. Cursor in `class=""`, half-typed wire:click to its right.
+    let line = r#"<div class="" wire:click="save"#;
+    assert!(wire_attribute_completion_context(line, 5).is_none());
+    assert!(wire_attribute_target_at(line, 5).is_none());
+}
+
+#[test]
+fn non_ascii_value_with_mid_codepoint_cursor_does_not_panic() {
+    // Regression: `position.character` is a UTF-16 code-unit offset, not a
+    // byte index — a caret after `prü` arrives as column 22, which lands
+    // INSIDE the two-byte `ü` when used as a byte offset and panicked on
+    // the slice. The guard (same as every other cursor site) bails out
+    // instead of unwinding the server.
+    let line = r#"<input wire:model="prüfung">"#;
+    assert!(wire_attribute_completion_context(line, 22).is_none());
+    assert!(wire_attribute_target_at(line, 22).is_none());
+}
+
+#[test]
+fn cursor_past_end_of_line_does_not_panic() {
+    let line = r#"<input wire:model="title">"#;
+    let past = line.len() as u32 + 5;
+    assert!(wire_attribute_completion_context(line, past).is_none());
+    assert!(wire_attribute_target_at(line, past).is_none());
+}
