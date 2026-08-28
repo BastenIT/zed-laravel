@@ -72,6 +72,7 @@ fn view_ref(name: &str) -> ViewReferenceData {
         column: 0,
         end_column: 0,
         is_route_view: false,
+        is_property_site: false,
     }
 }
 

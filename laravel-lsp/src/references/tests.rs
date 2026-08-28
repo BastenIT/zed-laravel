@@ -26,6 +26,7 @@ fn with_view(name: &str, line: u32, col: u32) -> ParsedPatternsData {
         column: col,
         end_column: col + name.len() as u32,
         is_route_view: false,
+        is_property_site: false,
     }));
     p.build_position_index();
     p

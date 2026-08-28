@@ -354,8 +354,9 @@ fn declared_view_literal_node_points_at_literal_content() {
     let tree = crate::parser::parse_php(src).unwrap();
     let bytes = src.as_bytes();
 
-    let content =
-        declared_view_literal_node(tree.root_node(), bytes).expect("should find the $view node");
+    let nodes = declared_view_literal_nodes(tree.root_node(), bytes);
+    assert_eq!(nodes.len(), 1, "one declaring class, one node");
+    let content = nodes[0];
     assert_eq!(
         content.utf8_text(bytes).unwrap(),
         "legal-contractmanagement::filament.pages.contract-edit-page"
@@ -373,9 +374,9 @@ fn declared_view_literal_node_static_variant() {
     let tree = crate::parser::parse_php(src).unwrap();
     let bytes = src.as_bytes();
 
-    let content =
-        declared_view_literal_node(tree.root_node(), bytes).expect("should find the $view node");
-    assert_eq!(content.utf8_text(bytes).unwrap(), "widgets.stats");
+    let nodes = declared_view_literal_nodes(tree.root_node(), bytes);
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].utf8_text(bytes).unwrap(), "widgets.stats");
 }
 
 #[test]
@@ -384,7 +385,7 @@ fn declared_view_literal_node_non_literal_is_none() {
     let tree = crate::parser::parse_php(src).unwrap();
     let bytes = src.as_bytes();
 
-    assert!(declared_view_literal_node(tree.root_node(), bytes).is_none());
+    assert!(declared_view_literal_nodes(tree.root_node(), bytes).is_empty());
 }
 
 #[test]
@@ -393,7 +394,7 @@ fn declared_view_literal_node_no_view_property_is_none() {
     let tree = crate::parser::parse_php(src).unwrap();
     let bytes = src.as_bytes();
 
-    assert!(declared_view_literal_node(tree.root_node(), bytes).is_none());
+    assert!(declared_view_literal_nodes(tree.root_node(), bytes).is_empty());
 }
 
 #[test]
@@ -1848,4 +1849,144 @@ new class extends Component {
         "user/count/increment index; notAMember drops"
     );
     assert!(captured.iter().all(|e| e.fqcn.starts_with("volt::")));
+}
+
+#[test]
+fn every_class_in_a_file_gets_its_own_render_site() {
+    // Two classes, two render sites — neither drops, in document order.
+    let src = r#"<?php
+class PageA { protected string $view = 'pages.a'; }
+class PageB { protected string $view = 'pages.b'; }
+"#;
+    let r = renders(src);
+    let names: Vec<&str> = r.iter().map(|v| v.view_name.as_str()).collect();
+    assert_eq!(names, vec!["pages.a", "pages.b"]);
+}
+
+#[test]
+fn anonymous_class_does_not_hijack_its_host_page() {
+    // The anonymous class nested in a method gets its OWN render site; the
+    // host page keeps its site AND its typed surface.
+    let src = r#"<?php
+use App\Models\User;
+class SettingsPage {
+    public User $user;
+    protected string $view = 'pages.settings';
+    public function modal() { return new class { protected string $view = 'pages.modal'; }; }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 2, "got {r:?}");
+    let settings = r
+        .iter()
+        .find(|v| v.view_name == "pages.settings")
+        .expect("the host page keeps its render site");
+    assert_eq!(
+        settings.vars.get("user").map(String::as_str),
+        Some("App\\Models\\User"),
+        "…and its typed surface"
+    );
+    let modal = r
+        .iter()
+        .find(|v| v.view_name == "pages.modal")
+        .expect("the anonymous class contributes its own site");
+    assert!(
+        modal.vars.is_empty(),
+        "the host's $user must not leak into the anonymous class's site"
+    );
+}
+
+#[test]
+fn view_property_heredoc_is_skipped() {
+    let src = "<?php\nclass DynamicPage {\n    protected string $view = <<<'VIEW'\npages.dynamic\nVIEW;\n}\n";
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn global_with_helper_does_not_pollute_the_surface() {
+    // Laravel's global `with($value, $callback)` is NOT Volt's functional
+    // `with(fn () => [...])` — only a LEADING closure argument contributes.
+    let src = r#"<?php
+use App\Models\User;
+class ReportPage {
+    protected string $view = 'pages.report';
+
+    public function boot() {
+        return with(User::first(), fn () => ['leaked' => User::first()]);
+    }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert!(
+        !r[0].vars.contains_key("leaked"),
+        "global with() helper leaked into the surface: {:?}",
+        r[0].vars
+    );
+}
+
+// ---- view_names_for_path_namespaced ----------------------------------------
+
+#[test]
+fn namespace_selection_is_deterministic_across_map_instances() {
+    // Two prefixes registered against the SAME directory: the winner must
+    // not depend on HashMap iteration order. Alphabetical tiebreak, checked
+    // across many fresh maps.
+    let dir = PathBuf::from("/proj/modules/shop/resources/views");
+    let file = dir.join("index.blade.php");
+    for _ in 0..100 {
+        let mut namespaces = std::collections::HashMap::new();
+        namespaces.insert("shop".to_string(), dir.clone());
+        namespaces.insert("alpha".to_string(), dir.clone());
+        assert_eq!(
+            view_name_for_path_namespaced(&file, &[], &namespaces).as_deref(),
+            Some("alpha::index"),
+            "same inputs, same answer, every run"
+        );
+    }
+}
+
+#[test]
+fn published_vendor_override_maps_to_the_namespaced_name() {
+    // `resolve_view_path("ns::x")` probes the published override at
+    // `{view_root}/vendor/ns/x.blade.php` — the reverse direction must
+    // agree, since the published copy is the file actually being edited.
+    let root = PathBuf::from("/proj/resources/views");
+    let mut namespaces = std::collections::HashMap::new();
+    namespaces.insert(
+        "filament-panels".to_string(),
+        PathBuf::from("/proj/vendor/filament/panels/resources/views"),
+    );
+    let published = root.join("vendor/filament-panels/pages/auth/login.blade.php");
+    assert_eq!(
+        view_name_for_path_namespaced(&published, std::slice::from_ref(&root), &namespaces)
+            .as_deref(),
+        Some("filament-panels::pages.auth.login")
+    );
+    // An unregistered directory under vendor/ is NOT a namespace.
+    let stray = root.join("vendor/unregistered/x.blade.php");
+    assert_eq!(
+        view_name_for_path_namespaced(&stray, &[root], &namespaces).as_deref(),
+        Some("vendor.unregistered.x"),
+        "falls through to the plain dotted name"
+    );
+}
+
+#[test]
+fn namespace_dir_inside_a_view_root_keeps_both_names() {
+    // A namespace registered INSIDE a plain view root: the file answers to
+    // both its `ns::` name and its plain dotted name, namespaced first —
+    // a controller's view('admin.dashboard') render site stays connected.
+    let root = PathBuf::from("/proj/resources/views");
+    let mut namespaces = std::collections::HashMap::new();
+    namespaces.insert("admin".to_string(), root.join("admin"));
+    let file = root.join("admin/dashboard.blade.php");
+    assert_eq!(
+        view_names_for_path_namespaced(&file, std::slice::from_ref(&root), &namespaces),
+        vec![
+            "admin::dashboard".to_string(),
+            "admin.dashboard".to_string()
+        ]
+    );
 }

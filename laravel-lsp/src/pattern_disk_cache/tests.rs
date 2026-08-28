@@ -19,6 +19,7 @@ fn fake_patterns(view_name: &str) -> ParsedPatternsData {
         column: 0,
         end_column: 10,
         is_route_view: false,
+        is_property_site: false,
     }));
     data.build_position_index();
     data
@@ -458,6 +459,7 @@ fn save_borrowed_then_load_owned_round_trips() {
         column: 1,
         end_column: 14,
         is_route_view: true,
+        is_property_site: false,
     }));
     patterns.route_refs.push(Arc::new(RouteReferenceData {
         name: "users.show".into(),
@@ -560,17 +562,37 @@ fn old_schema_version_is_treated_as_stale() {
     let cache = Arc::new(DashMap::new());
 
     let file = touch(project.path(), "home.blade.php", "<x-foo/>");
-    cache.insert(file.clone(), (0, Arc::new(fake_patterns("home"))));
+    // The entry carries exactly the hazard this bump exists for: a
+    // `ViewRenderPlanData` whose `surface` holds a class's typed surface. A
+    // v14 blob decoded with `#[serde(default)]` would silently come back
+    // with `surface: None` — the loader must reject on VERSION instead.
+    let mut patterns = fake_patterns("home");
+    let mut context = crate::salsa_impl::MemberContextData::default();
+    context
+        .view_renders
+        .push(crate::salsa_impl::ViewRenderPlanData {
+            view_name: "pages.settings".to_string(),
+            items: Vec::new(),
+            surface: Some(crate::salsa_impl::VoltSurfaceData {
+                items: vec![crate::salsa_impl::VoltPropPlanData::TypedProp {
+                    name: "user".to_string(),
+                    fqcn: "App\\Models\\User".to_string(),
+                }],
+                aliases: Default::default(),
+            }),
+        });
+    patterns.member_context = Some(Box::new(context));
+    cache.insert(file.clone(), (0, Arc::new(patterns)));
     save_from(&cache, &Default::default(), project.path()).unwrap();
 
-    // Rewrite the saved blob with the previous schema version, keeping the
-    // entries byte-identical — exactly what a cache left behind by the
-    // previous release looks like.
+    // Rewrite the saved blob with the LITERAL previous release's version —
+    // not `SCHEMA_VERSION - 1`, which would move with the constant and let a
+    // reverted bump slip past this test unnoticed.
     let path = cache_file_path(project.path()).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     let (mut on_disk, _): (CacheFile, _) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-    on_disk.schema_version = SCHEMA_VERSION - 1;
+    on_disk.schema_version = 14;
     std::fs::write(
         &path,
         bincode::serde::encode_to_vec(&on_disk, bincode::config::standard()).unwrap(),
