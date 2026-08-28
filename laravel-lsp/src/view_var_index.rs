@@ -633,8 +633,12 @@ fn class_surface_types(
             "method_declaration" if method_name_is(n, bytes, "mount") => {
                 collect_mount_assignments(n, bytes, aliases, &mut out);
             }
-            // Class-API `public function with(): array { return [...]; }`.
-            "method_declaration" if method_name_is(n, bytes, "with") => {
+            // Class-API `public function with(): array { return [...]; }`,
+            // and `getViewData()` — Filament's `with()`-equivalent extension
+            // point on `Page`/`Widget`.
+            "method_declaration"
+                if method_name_is(n, bytes, "with") || method_name_is(n, bytes, "getViewData") =>
+            {
                 if let Some(ret) = function_return_expr(n) {
                     let mut temp = HashMap::new();
                     collect_vars(
@@ -1208,16 +1212,19 @@ pub fn view_renders_in_file(
             stack.push(ch);
         }
     }
-    if let Some(view_name) = declared_view_literal(tree.root_node(), bytes) {
-        let vars = class_surface_types(
-            tree.root_node(),
-            bytes,
-            &aliases,
-            resolver,
-            classviews,
-            project_root,
-        );
-        out.push(ViewRender { view_name, vars });
+    if let Some(value) = declared_view_value_node(tree.root_node(), bytes) {
+        if let Some(view_name) = declared_view_plain_literal(value, bytes) {
+            let surface_root = owning_class_like(value).unwrap_or_else(|| tree.root_node());
+            let vars = class_surface_types(
+                surface_root,
+                bytes,
+                &aliases,
+                resolver,
+                classviews,
+                project_root,
+            );
+            out.push(ViewRender { view_name, vars });
+        }
     }
     out
 }
@@ -1226,7 +1233,7 @@ pub fn view_renders_in_file(
 /// $view = <expr>;` — whatever `<expr>` is. Visibility and `static` don't
 /// matter, only the property's NAME. `None` when the class declares no
 /// `$view` property. The one place that walks the AST for "which property
-/// declaration is `$view`" — both [`declared_view_literal`] and
+/// declaration is `$view`" — the render-site walks and
 /// [`declared_view_literal_node`] build on it so that detection rule lives
 /// once.
 fn declared_view_value_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>> {
@@ -1257,22 +1264,53 @@ fn declared_view_value_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>
     None
 }
 
-/// The literal view name declared by a Filament-style
-/// `protected string $view = '…';` (or `protected static string $view = '…';`)
-/// class property — the convention `Page`/`Widget` subclasses use instead of
-/// calling `view()`. `None` when the class declares no `$view` property, or
-/// its value isn't a literal (a constant reference, a `config()` call, …) —
-/// such a class isn't a resolvable render site.
-fn declared_view_literal(root: Node, bytes: &[u8]) -> Option<String> {
-    string_literal_value(declared_view_value_node(root, bytes)?, bytes)
+/// Strict literal check for the `$view` property's initializer: only a plain
+/// (non-interpolated, non-empty) string literal qualifies. Unlike the looser
+/// [`string_literal_value`], an interpolated `"pages.{$type}"` yields `None` —
+/// the actual name depends on runtime state, so it is not a resolvable render
+/// site. Mirrors the rule [`declared_view_literal_node`] applies for position
+/// capture, keeping the two sites in agreement.
+fn declared_view_plain_literal(value: Node, bytes: &[u8]) -> Option<String> {
+    if !matches!(value.kind(), "string" | "encapsed_string") {
+        return None;
+    }
+    if value.named_child_count() != 1 {
+        return None;
+    }
+    let content = value.named_child(0)?;
+    if content.kind() != "string_content" {
+        return None;
+    }
+    content.utf8_text(bytes).ok().map(str::to_string)
 }
 
-/// Same `$view`-property lookup as [`declared_view_literal`], but returns
+/// The class-like declaration (`class`, `trait`, `enum`, or an anonymous
+/// class body) that owns `node`. Scopes the typed-surface walk to the
+/// `$view`-bearing class alone — a second class in the same file must never
+/// leak its properties/methods into this render site's vars.
+fn owning_class_like(node: Node) -> Option<Node> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "trait_declaration"
+                | "enum_declaration"
+                | "object_creation_expression"
+        ) {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Same `$view`-property lookup as the render-site walks, but returns
 /// the literal's CONTENT node — the span between the quotes — instead of the
 /// trimmed value, so a capture site can report a position (goto/hover/
 /// diagnostics on a `ViewReferenceData`). `None` both when there's no
 /// `$view` property and when its initializer isn't a PLAIN literal: unlike
-/// [`declared_view_literal`]'s looser [`string_literal_value`], this needs
+/// the looser [`string_literal_value`], this needs
 /// an actual `string_content` node to position at, so an empty `''` or an
 /// interpolated string also yields `None` here.
 pub(crate) fn declared_view_literal_node<'t>(root: Node<'t>, bytes: &[u8]) -> Option<Node<'t>> {
@@ -1532,8 +1570,12 @@ pub(crate) fn capture_render_plans(
             stack.push(ch);
         }
     }
-    if let Some(view_name) = declared_view_literal(tree.root_node(), bytes) {
-        let items = capture_class_surface_items(tree.root_node(), bytes, aliases);
+    if let Some(value) = declared_view_value_node(tree.root_node(), bytes) {
+        let Some(view_name) = declared_view_plain_literal(value, bytes) else {
+            return out;
+        };
+        let surface_root = owning_class_like(value).unwrap_or_else(|| tree.root_node());
+        let items = capture_class_surface_items(surface_root, bytes, aliases);
         out.push(ViewRenderPlanData {
             view_name,
             items: Vec::new(),
@@ -1735,7 +1777,9 @@ fn capture_class_surface_items(
             "method_declaration" if method_name_is(n, bytes, "mount") => {
                 collect_mount_assignment_plans(n, bytes, aliases, &mut items);
             }
-            "method_declaration" if method_name_is(n, bytes, "with") => {
+            "method_declaration"
+                if method_name_is(n, bytes, "with") || method_name_is(n, bytes, "getViewData") =>
+            {
                 if let Some(ret) = function_return_expr(n) {
                     items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
                         ret, bytes, aliases,
