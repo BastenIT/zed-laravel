@@ -139,6 +139,232 @@ pub fn extract_blade_variable_at_cursor(
     None
 }
 
+/// The Livewire binding target of a `wire:` attribute, extracted from its
+/// quoted value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireTarget {
+    /// A method-call binding (`wire:click`, `wire:submit.prevent`,
+    /// `wire:poll.2000ms`, ...) — the bare identifier before any `(`.
+    Method(String),
+    /// `wire:model[.modifiers]` binds a PROPERTY, not a method call — the
+    /// target is the first dot-segment of the value (`contractData.title`
+    /// → `contractData`).
+    Property(String),
+}
+
+/// If the cursor sits inside a `wire:*="value"` attribute's quoted value on
+/// `line`, extract its goto/hover target.
+///
+/// Returns `None` when the cursor isn't inside such a value, or the value
+/// isn't a resolvable PHP identifier (`wire:click="$wire.foo++"` has no
+/// member target — a Blade/JS expression, not a bound method).
+///
+/// `cursor_col` is treated as a byte offset into `line`, matching
+/// [`extract_blade_variable_at_cursor`]'s convention.
+pub fn wire_attribute_target_at(line: &str, cursor_col: u32) -> Option<WireTarget> {
+    let cursor = cursor_col as usize;
+    // Same cursor guard as every other cursor site (alpine.rs,
+    // method_name_completion.rs): the LSP position is not a trustworthy
+    // byte index — past-the-end and mid-UTF-8-codepoint offsets both
+    // arrive in practice, and slicing on them panics.
+    if cursor > line.len() || !line.is_char_boundary(cursor) {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+
+    while let Some(rel) = line[search_from..].find("wire:") {
+        let attr_start = search_from + rel;
+        let mut i = attr_start + "wire:".len();
+        // Attribute name, modifiers included (`wire:poll.2000ms`, `wire:model.live`).
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'.'
+                || bytes[i] == b'-'
+                || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+        let attr_name = &line[attr_start..i];
+        search_from = i;
+
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let Some(&quote) = bytes.get(j).filter(|b| **b == b'"' || **b == b'\'') else {
+            continue;
+        };
+        let value_start = j + 1;
+        let Some(rel_end) = line[value_start..].find(quote as char) else {
+            continue;
+        };
+        let value_end = value_start + rel_end;
+        search_from = (value_end + 1).min(line.len());
+
+        if cursor < value_start || cursor > value_end {
+            continue;
+        }
+        let value = &line[value_start..value_end];
+        let base = attr_name.strip_prefix("wire:")?.split('.').next()?;
+        return match wire_value_kind(base) {
+            Some(WireValueKind::Property) => {
+                let prop = value.split('.').next().unwrap_or("").trim();
+                is_php_identifier(prop).then(|| WireTarget::Property(prop.to_string()))
+            }
+            Some(WireValueKind::Method) => {
+                let ident = value.split('(').next().unwrap_or("").trim();
+                is_php_identifier(ident).then(|| WireTarget::Method(ident.to_string()))
+            }
+            None => None,
+        };
+    }
+
+    None
+}
+
+/// What kind of component member a `wire:{base}` attribute's value names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireValueKind {
+    /// The value is an action — a public method (`wire:click`, `wire:poll`,
+    /// `wire:submit`, any DOM-event binding).
+    Method,
+    /// The value binds a public property (`wire:model`, `wire:show`,
+    /// `wire:text`).
+    Property,
+}
+
+/// Classify a `wire:` attribute's base name (modifiers stripped) by what its
+/// value names. `None` for attributes whose value is not a component member
+/// at all (`wire:key`, `wire:target`, `wire:ignore`, ...). Everything not
+/// explicitly listed is treated as a DOM-event action binding, since Livewire
+/// accepts `wire:{any-dom-event}`.
+fn wire_value_kind(base: &str) -> Option<WireValueKind> {
+    match base {
+        "model" | "show" | "text" => Some(WireValueKind::Property),
+        "key" | "id" | "ignore" | "loading" | "dirty" | "offline" | "target" | "stream"
+        | "replace" | "transition" | "navigate" | "cloak" | "current" | "confirm" => None,
+        _ => Some(WireValueKind::Method),
+    }
+}
+
+/// If the cursor sits inside a `wire:*="…"` quoted value on `line`, return
+/// the completion context: what member kind the attribute binds and the
+/// (possibly empty) identifier prefix typed before the cursor.
+///
+/// Unlike [`wire_attribute_target_at`] this accepts empty and partial
+/// values — that's the completion moment. `None` when the typed text is
+/// already something other than a plain identifier (a JS expression, a
+/// nested `wire:model` path past its first segment), so richer expressions
+/// fall through to other completion providers.
+pub fn wire_attribute_completion_context(
+    line: &str,
+    cursor_col: u32,
+) -> Option<(WireValueKind, String)> {
+    let cursor = cursor_col as usize;
+    // See wire_attribute_target_at — identical cursor guard, identical
+    // reason.
+    if cursor > line.len() || !line.is_char_boundary(cursor) {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+
+    while let Some(rel) = line[search_from..].find("wire:") {
+        let attr_start = search_from + rel;
+        let mut i = attr_start + "wire:".len();
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'.'
+                || bytes[i] == b'-'
+                || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+        let attr_name = &line[attr_start..i];
+        search_from = i;
+
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let Some(&quote) = bytes.get(j).filter(|b| **b == b'"' || **b == b'\'') else {
+            continue;
+        };
+        let value_start = j + 1;
+        // The closing quote may not be typed yet — treat end-of-line as the
+        // value end in that case.
+        let value_end = line[value_start..]
+            .find(quote as char)
+            .map(|rel_end| value_start + rel_end)
+            .unwrap_or(line.len());
+        // An unclosed value ends AT line.len(); the resume point must not
+        // step past it — `line[search_from..]` on len()+1 panics.
+        search_from = (value_end + 1).min(line.len());
+
+        if cursor < value_start || cursor > value_end {
+            continue;
+        }
+        let typed = line[value_start..cursor].trim();
+        let kind = wire_value_kind(attr_name.strip_prefix("wire:")?.split('.').next()?)?;
+        let acceptable = match kind {
+            // Actions are a single identifier.
+            WireValueKind::Method => typed.is_empty() || is_php_identifier(typed),
+            // Bindings may be a dotted path into a nested object
+            // (`wire:model="contractData.title"`): every completed segment
+            // must be an identifier, the segment under the cursor may be
+            // empty (right after a dot) or partial.
+            WireValueKind::Property => is_property_path_prefix(typed),
+        };
+        return if acceptable {
+            Some((kind, typed.to_string()))
+        } else {
+            None
+        };
+    }
+
+    None
+}
+
+/// A (possibly unfinished) dotted property path: `a`, `a.b`, `a.` or an
+/// empty string. Every segment before the last must be an identifier; the
+/// last may be empty (cursor right after a dot) or a partial identifier.
+fn is_property_path_prefix(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    let segments: Vec<&str> = s.split('.').collect();
+    let (last, completed) = segments.split_last().unwrap();
+    completed.iter().all(|seg| is_php_identifier(seg))
+        && (last.is_empty() || is_php_identifier(last))
+}
+
+/// A bare PHP identifier: `[A-Za-z_][A-Za-z0-9_]*`, nothing else. Used to
+/// reject `wire:` values that are JS/Blade expressions rather than a plain
+/// method or property name (`$wire.foo++`, `save() && close()`).
+fn is_php_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 // ============================================================================
 // Component resolution (Phase 3)
 // ============================================================================
@@ -577,6 +803,206 @@ fn front_matter_window(content: &str) -> &str {
         adjusted -= 1;
     }
     &content[..adjusted]
+}
+
+/// True when `var` (name without the `$`) is bound LOCALLY in the template
+/// at 0-based `line`, so a bare-`$var` reference there must not navigate to a
+/// backing-class property — the local binding shadows it.
+///
+/// Local binding sources, per Blade's own scoping:
+/// - an ENCLOSING `@foreach` / `@forelse` loop variable (`as $item`,
+///   `as $key => $item`) — out of scope again after the matching
+///   `@endforeach` / `@endforelse`;
+/// - Blade's `$loop`, inside any `@foreach` / `@forelse`;
+/// - an ENCLOSING `@for` init variable (`@for ($i = 0; …)`);
+/// - a `@php` assignment (block or inline `@php($x = …)`) — PHP locals
+///   persist in the compiled template's scope, so the binding holds from
+///   that line to the end of the file;
+/// - a `@props([...])` / `@aware([...])` component-prop declaration —
+///   file-wide.
+///
+/// Line-granular by design: a binding and a use on the same line count as
+/// in scope (`@foreach ($users as $user)` — cursor on `$user`).
+pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
+    let mut loop_stack: Vec<Vec<String>> = Vec::new();
+    let mut for_stack: Vec<Vec<String>> = Vec::new();
+    let mut persistent: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_php_block = false;
+
+    for (idx, text) in content.lines().enumerate() {
+        if idx > line as usize {
+            break;
+        }
+        let mut scan = text;
+
+        // `@php($x = …)` inline form first — it must not toggle block state.
+        if let Some(rest) = find_directive(scan, "@php") {
+            if rest.trim_start().starts_with('(') {
+                collect_assignments(rest, &mut persistent);
+            } else {
+                in_php_block = true;
+                scan = rest;
+            }
+        }
+        if in_php_block {
+            collect_assignments(scan, &mut persistent);
+        }
+        if scan.contains("@endphp") {
+            in_php_block = false;
+        }
+
+        if let Some(rest) =
+            find_directive(text, "@props").or_else(|| find_directive(text, "@aware"))
+        {
+            collect_quoted_names(rest, &mut persistent);
+        }
+
+        if let Some(rest) =
+            find_directive(text, "@foreach").or_else(|| find_directive(text, "@forelse"))
+        {
+            loop_stack.push(loop_binding_names(rest));
+        }
+        if let Some(rest) = find_directive(text, "@for") {
+            // `@for` only — `@foreach`/`@forelse` were consumed above and
+            // find_directive requires a non-identifier char after the name.
+            let mut names = Vec::new();
+            collect_assignment_names(rest, &mut names);
+            for_stack.push(names);
+        }
+
+        if idx == line as usize {
+            break;
+        }
+        if text.contains("@endforeach") || text.contains("@endforelse") {
+            loop_stack.pop();
+        }
+        if text.contains("@endfor")
+            && !text.contains("@endforeach")
+            && !text.contains("@endforelse")
+        {
+            for_stack.pop();
+        }
+    }
+
+    if var == "loop" && !loop_stack.is_empty() {
+        return true;
+    }
+    persistent.contains(var)
+        || loop_stack
+            .iter()
+            .any(|names| names.iter().any(|n| n == var))
+        || for_stack.iter().any(|names| names.iter().any(|n| n == var))
+}
+
+/// The text following `@{name}` on `line`, when the directive occurs with a
+/// non-identifier character (or end of line) right after it — so `@for`
+/// never matches inside `@foreach`.
+fn find_directive<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(name) {
+        let at = from + rel;
+        let after = at + name.len();
+        let boundary = line[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if boundary {
+            return Some(&line[after..]);
+        }
+        from = after;
+    }
+    None
+}
+
+/// The variables an `@foreach` / `@forelse` head binds: everything after
+/// `as` — `$item`, or `$key => $item`.
+fn loop_binding_names(rest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(pos) = rest.find(" as ") {
+        collect_dollar_names(&rest[pos + 4..], &mut names);
+    }
+    names
+}
+
+/// Every `$name` token in `s`.
+fn collect_dollar_names(s: &str, out: &mut Vec<String>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > start {
+                out.push(s[start..end].to_string());
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Every `$name` that is being ASSIGNED (`$name =`, not `==`/`=>`/`<=` etc.)
+/// in `s`, appended to `out`.
+fn collect_assignment_names(s: &str, out: &mut Vec<String>) {
+    let mut names = Vec::new();
+    collect_dollar_names(s, &mut names);
+    for name in names {
+        // Find `$name` followed (after whitespace) by a single `=`.
+        let needle = format!("${name}");
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(&needle) {
+            let after = from + rel + needle.len();
+            let rest = s[after..].trim_start();
+            let assigns = rest.starts_with('=')
+                && !rest.starts_with("==")
+                && !rest.starts_with("=>")
+                && !rest.starts_with("===");
+            if assigns {
+                out.push(name.clone());
+                break;
+            }
+            from = after;
+        }
+    }
+}
+
+/// [`collect_assignment_names`] into a set.
+fn collect_assignments(s: &str, out: &mut std::collections::HashSet<String>) {
+    let mut names = Vec::new();
+    collect_assignment_names(s, &mut names);
+    out.extend(names);
+}
+
+/// Every `'name'` / `"name"` string key or entry in a `@props([...])` /
+/// `@aware([...])` argument on this line.
+fn collect_quoted_names(s: &str, out: &mut std::collections::HashSet<String>) {
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' || c == '"' {
+            if let Some(rel) = s[i + 1..].find(c) {
+                let name = &s[i + 1..i + 1 + rel];
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    out.insert(name.to_string());
+                }
+                // skip past the closing quote
+                while let Some(&(j, _)) = chars.peek() {
+                    if j <= i + 1 + rel {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 const VOLT_FUNCTIONAL_CALLS: &[&str] = &[

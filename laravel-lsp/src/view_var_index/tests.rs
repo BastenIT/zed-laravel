@@ -170,6 +170,66 @@ fn index_clear_empties() {
     assert_eq!(idx.view_count(), 0);
 }
 
+#[test]
+fn render_source_files_returns_every_contributing_file() {
+    let mut idx = ViewVarIndex::new();
+    let controller = PathBuf::from("/proj/UserController.php");
+    let page = PathBuf::from("/proj/Filament/UserPage.php");
+    idx.insert_file(
+        controller.clone(),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    idx.insert_file(
+        page.clone(),
+        &[render("users.show", &[("account", "App\\Models\\Account")])],
+    );
+    idx.insert_file(
+        PathBuf::from("/proj/OtherController.php"),
+        &[render("other.view", &[("x", "App\\X")])],
+    );
+
+    let mut sources = idx.render_source_files("users.show");
+    sources.sort();
+    let mut expected = vec![controller, page];
+    expected.sort();
+    assert_eq!(sources, expected);
+    assert!(idx.render_source_files("missing.view").is_empty());
+}
+
+#[test]
+fn vars_for_view_returns_every_variable_sorted() {
+    let mut idx = ViewVarIndex::new();
+    idx.insert_file(
+        PathBuf::from("/proj/UserController.php"),
+        &[render(
+            "dash",
+            &[
+                ("user", "App\\Models\\User"),
+                ("posts", "App\\Models\\Post"),
+            ],
+        )],
+    );
+    idx.insert_file(
+        PathBuf::from("/proj/AdminController.php"),
+        &[render("dash", &[("user", "App\\Models\\Admin")])],
+    );
+
+    assert_eq!(
+        idx.vars_for_view("dash"),
+        vec![
+            ("posts".to_string(), vec!["App\\Models\\Post".to_string()]),
+            (
+                "user".to_string(),
+                vec![
+                    "App\\Models\\Admin".to_string(),
+                    "App\\Models\\User".to_string()
+                ]
+            ),
+        ]
+    );
+    assert!(idx.vars_for_view("missing.view").is_empty());
+}
+
 // ---- view_name_for_path --------------------------------------------------
 
 #[test]
@@ -1376,4 +1436,19 @@ new class extends Component {
         "user/count/increment index; notAMember drops"
     );
     assert!(captured.iter().all(|e| e.fqcn.starts_with("volt::")));
+}
+
+#[test]
+fn render_source_files_are_sorted_for_deterministic_first_match() {
+    let mut idx = ViewVarIndex::new();
+    for name in ["zeta", "alpha", "midway"] {
+        idx.insert_file(
+            PathBuf::from(format!("/proj/{name}/Controller.php")),
+            &[render("users.show", &[("user", "App\\Models\\User")])],
+        );
+    }
+    let files = idx.render_source_files("users.show");
+    let mut sorted = files.clone();
+    sorted.sort();
+    assert_eq!(files, sorted, "HashMap order must not leak to callers");
 }
