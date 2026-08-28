@@ -4734,8 +4734,10 @@ impl LaravelLanguageServer {
             *self.module_path_patterns.write().await = new_module_paths;
             *self.cached_module_dirs.write().await = None;
             // Translation namespaces include module-provider registrations,
-            // so the merged map must rebuild with the new module set.
-            *self.vendor_translation_namespaces.write().await = None;
+            // so the provider-derived map must rebuild with the new module
+            // set (`module_dirs_for` re-registers the extras on its next
+            // resolve).
+            let _ = self.salsa.invalidate_translation_providers().await;
             // Livewire class namespaces come from module providers too.
             *self.cached_livewire.write().await = None;
         }
@@ -4767,6 +4769,15 @@ impl LaravelLanguageServer {
         let patterns = self.module_path_patterns.read().await.clone();
         let expanded = Arc::new(laravel_lsp::config::expand_module_dirs(root, &patterns));
         *self.cached_module_dirs.write().await = Some(expanded.clone());
+        // Module service providers register translation namespaces via
+        // `loadTranslationsFrom` too — hand them to the Salsa translation
+        // layer as first-party providers (a no-op when the set is
+        // unchanged), so `ns::` hover/goto/completion covers modules.
+        let module_providers = laravel_lsp::config::module_provider_files(&expanded);
+        let _ = self
+            .salsa
+            .set_translation_provider_extras(module_providers)
+            .await;
         expanded
     }
 
@@ -23312,7 +23323,7 @@ impl LanguageServer for LaravelLanguageServer {
             {
                 let p = path.to_string_lossy();
                 if p.ends_with(".php") && p.contains("/config/") {
-                    self.file_exists_cache.write().await.remove(&path);
+                    self.file_exists_cache.lock().unwrap().pop(&path);
                     self.invalidate_config_cache().await;
                 }
             }

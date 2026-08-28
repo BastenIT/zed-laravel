@@ -1723,6 +1723,13 @@ pub struct TranslationCache {
     /// The discovered provider set. `None` until the first scan, and reset by
     /// [`Self::invalidate_providers`] so a create or delete is picked up.
     provider_files: Option<TranslationProviderFiles>,
+    /// Additional first-party provider files registered by the LSP host —
+    /// module service providers discovered via the `modules.paths` setting,
+    /// which live outside `app/Providers/` (e.g.
+    /// `app/{Parent}/{Module}/Providers/`). Scanned like app providers, but
+    /// ordered BEFORE them so a real `app/Providers/` registration still
+    /// wins on a namespace conflict (the app boots last).
+    extra_provider_files: Vec<PathBuf>,
     /// How many times this cache has touched disk — one per
     /// `fs::read_to_string` or `read_dir` that actually ran. Lets a test prove
     /// a second resolution is served from Salsa rather than re-read.
@@ -1971,48 +1978,96 @@ impl TranslationCache {
         db: &mut LaravelDatabase,
         root: &Path,
     ) -> Vec<TranslationKeyCompletionData> {
-        let Some(lang_root) = crate::translation_lookup::project_lang_roots(root)
-            .into_iter()
-            .find(|dir| dir.exists())
-        else {
-            return Vec::new();
-        };
-        let listing = self.ensure_dir(db, &lang_root, root);
-        // Sorted before taking the first: `locales_in_dir` preserves the
-        // directory listing order, which is filesystem-dependent — APFS hands
-        // entries back sorted, ext4 does not. Taking `first()` off the raw
-        // listing therefore made *which locale answers autocomplete* vary by
-        // platform (caught by CI on ubuntu, green on macOS). Alphabetical is
-        // arbitrary but stable, and matches how `locales` orders.
-        let mut candidates = locales_in_dir(&*db, listing).clone();
-        candidates.sort();
-        let Some(locale) = candidates.first().cloned() else {
-            return Vec::new();
-        };
-
-        let locale_dir = lang_root.join(&locale);
-        let files = self.ensure_dir(db, &locale_dir, root).entries(&*db).clone();
-
+        // Root-catalogue scan. Its absence must not end the request early:
+        // a project whose ONLY catalogues live under registered namespaces
+        // (never published to a root `lang/`) still gets the namespaced
+        // completions below.
         let mut completions = Vec::new();
-        for (name, is_dir) in files {
-            if is_dir {
-                continue;
+        let lang_root = crate::translation_lookup::project_lang_roots(root)
+            .into_iter()
+            .find(|dir| dir.exists());
+        let locale = lang_root.as_ref().and_then(|lang_root| {
+            let listing = self.ensure_dir(db, lang_root, root);
+            // Sorted before taking the first: `locales_in_dir` preserves the
+            // directory listing order, which is filesystem-dependent — APFS
+            // hands entries back sorted, ext4 does not. Taking `first()` off
+            // the raw listing therefore made *which locale answers
+            // autocomplete* vary by platform (caught by CI on ubuntu, green
+            // on macOS). Alphabetical is arbitrary but stable, and matches
+            // how `locales` orders.
+            let mut candidates = locales_in_dir(&*db, listing).clone();
+            candidates.sort();
+            candidates.first().cloned()
+        });
+        if let (Some(lang_root), Some(locale)) = (lang_root, locale) {
+            let locale_dir = lang_root.join(&locale);
+            let files = self.ensure_dir(db, &locale_dir, root).entries(&*db).clone();
+
+            for (name, is_dir) in files {
+                if is_dir {
+                    continue;
+                }
+                let path = locale_dir.join(&name);
+                if path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let source = format!("lang/{}/{}", locale, name);
+                let file = self.ensure_file(db, &path, root);
+                for (key, value) in
+                    translation_keys_in_file(&*db, file, base_key.to_string()).clone()
+                {
+                    completions.push(TranslationKeyCompletionData {
+                        key,
+                        value,
+                        source: source.clone(),
+                    });
+                }
             }
-            let path = locale_dir.join(&name);
-            if path.extension().is_none_or(|ext| ext != "php") {
-                continue;
-            }
-            let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+        }
+
+        // Namespaced catalogues — every provider-registered `ns::` lang
+        // directory (vendor packages, modules, app `loadTranslationsFrom`
+        // calls). Without these, a project that keeps a namespace's
+        // catalogues only under its registered directory (never published
+        // to root `lang/vendor/…`) gets zero completions for
+        // `ns::file.key`. Same first-locale rule as the root scan.
+        let namespaces = self.vendor_namespaces(db, root);
+        let mut namespace_pairs: Vec<(String, PathBuf)> = namespaces.into_iter().collect();
+        namespace_pairs.sort();
+        for (namespace, ns_dir) in namespace_pairs {
+            let listing = self.ensure_dir(db, &ns_dir, root);
+            let mut ns_locales = locales_in_dir(&*db, listing).clone();
+            ns_locales.sort();
+            let Some(ns_locale) = ns_locales.first().cloned() else {
                 continue;
             };
-            let source = format!("lang/{}/{}", locale, name);
-            let file = self.ensure_file(db, &path, root);
-            for (key, value) in translation_keys_in_file(&*db, file, base_key.to_string()).clone() {
-                completions.push(TranslationKeyCompletionData {
-                    key,
-                    value,
-                    source: source.clone(),
-                });
+            let ns_locale_dir = ns_dir.join(&ns_locale);
+            let files = self.ensure_dir(db, &ns_locale_dir, root).entries(&*db).clone();
+            for (name, is_dir) in files {
+                if is_dir {
+                    continue;
+                }
+                let path = ns_locale_dir.join(&name);
+                if path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let source = format!("{}::lang/{}/{}", namespace, ns_locale, name);
+                let file = self.ensure_file(db, &path, root);
+                for (key, value) in
+                    translation_keys_in_file(&*db, file, base_key.to_string()).clone()
+                {
+                    completions.push(TranslationKeyCompletionData {
+                        key: format!("{}::{}", namespace, key),
+                        value,
+                        source: source.clone(),
+                    });
+                }
             }
         }
 
@@ -2099,6 +2154,19 @@ impl TranslationCache {
         self.providers.clear();
     }
 
+    /// Replace the host-registered extra provider files (module providers
+    /// from the `modules.paths` setting). A no-op when the set is unchanged;
+    /// otherwise the discovered provider set is dropped so the next lookup
+    /// folds the new files in.
+    pub fn set_extra_provider_files(&mut self, mut files: Vec<PathBuf>) {
+        files.sort();
+        if files == self.extra_provider_files {
+            return;
+        }
+        self.extra_provider_files = files;
+        self.invalidate_providers();
+    }
+
     /// The Salsa input for one provider's text, registering it on first touch.
     ///
     /// No containment guard here, unlike [`Self::ensure_file`], and the
@@ -2135,7 +2203,8 @@ impl TranslationCache {
         }
         self.disk_reads += 1;
         let vendor = crate::vendor_translations::vendor_provider_candidates(root);
-        let app = crate::vendor_translations::app_provider_candidates(root);
+        let mut app = self.extra_provider_files.clone();
+        app.extend(crate::vendor_translations::app_provider_candidates(root));
         self.version += 1;
         let files = TranslationProviderFiles::new(&*db, self.version, vendor, app);
         self.provider_files = Some(files);
@@ -6418,6 +6487,13 @@ pub enum SalsaRequest {
     },
     /// Drop everything derived from service providers
     InvalidateTranslationProviders { reply: oneshot::Sender<()> },
+
+    /// Replace the host-registered extra translation-provider files (module
+    /// providers from the `modules.paths` setting).
+    SetTranslationProviderExtras {
+        files: Vec<PathBuf>,
+        reply: oneshot::Sender<()>,
+    },
     /// How many times the translation cache has touched disk
     LangDiskReads { reply: oneshot::Sender<usize> },
 
@@ -7768,6 +7844,25 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// Register module service-provider files (from the `modules.paths`
+    /// setting) as first-party translation-namespace providers.
+    pub async fn set_translation_provider_extras(
+        &self,
+        files: Vec<PathBuf>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SetTranslationProviderExtras {
+                files,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     /// Drop everything derived from service providers after one changed.
     pub async fn invalidate_translation_providers(&self) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -8997,6 +9092,10 @@ impl SalsaActor {
                 }
                 SalsaRequest::InvalidateTranslationProviders { reply } => {
                     self.translations.invalidate_providers();
+                    let _ = reply.send(());
+                }
+                SalsaRequest::SetTranslationProviderExtras { files, reply } => {
+                    self.translations.set_extra_provider_files(files);
                     let _ = reply.send(());
                 }
                 SalsaRequest::LangDiskReads { reply } => {

@@ -85,7 +85,7 @@ async fn seed(
     *backend.root_path.write().await = Some(root.to_path_buf());
     *backend.cached_livewire.write().await =
         Some((root.to_path_buf(), livewire, LivewireVersion::V4));
-    *backend.cached_config.write().await = Some(config);
+    *backend.cached_config.write().await = Some(std::sync::Arc::new(config));
     backend
 }
 

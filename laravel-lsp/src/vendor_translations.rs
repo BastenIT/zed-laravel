@@ -150,30 +150,6 @@ pub fn namespaces_in_source(
     out
 }
 
-/// Extract translation namespaces from an explicit list of provider files —
-/// the module providers discovered via the `modules.paths` setting, which
-/// live outside `app/Providers/` (e.g. `app/{Parent}/{Module}/app/Providers/`)
-/// and register per-module namespaces with `loadTranslationsFrom`.
-pub fn scan_provider_files_translation_namespaces(
-    root: &Path,
-    provider_files: &[PathBuf],
-) -> HashMap<String, PathBuf> {
-    let mut namespaces: HashMap<String, PathBuf> = HashMap::new();
-
-    for path in provider_files {
-        let Ok(source) = fs::read_to_string(path) else {
-            continue;
-        };
-        if !source.contains("loadTranslationsFrom") && !source.contains("hasTranslations") {
-            continue;
-        }
-
-        process_provider_file(&source, path, root, &mut namespaces);
-    }
-
-    namespaces
-}
-
 /// Run both extraction passes over a single provider file: the AST-based
 /// `loadTranslationsFrom(...)` walk and the regex-based builder convention.
 fn process_provider_file(

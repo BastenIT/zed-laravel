@@ -1,45 +1,56 @@
 //! Namespaced translation-key completion (`ns::file.key`).
 //!
-//! `get_all_translation_keys` used to enumerate only the project's own root
-//! `lang/` catalogue, so a project keeping a namespace's translations only
-//! under its registered directory (vendor package, module, or an app
+//! Completion used to enumerate only the project's own root `lang/`
+//! catalogue, so a project keeping a namespace's translations only under its
+//! registered directory (vendor package, module, or an app
 //! `loadTranslationsFrom` call — never published to `lang/vendor/…`) got
-//! zero completions for that namespace's keys. It now also walks every
-//! registered namespace — the same map hover/goto/diagnostics already share
-//! via `vendor_translation_namespaces_for` — emitting `{ns}::{file}.{key}`.
+//! zero completions for that namespace's keys. The Salsa translation layer
+//! now also walks every provider-registered namespace — the same map
+//! hover/goto/diagnostics share — emitting `{ns}::{file}.{key}`. Module
+//! service providers reach that map through
+//! `set_translation_provider_extras`, the hook `module_dirs_for` feeds.
 //!
-//! These tests drive the private async method directly on a server built
-//! through the `tower_lsp::LspService` harness, priming `root_path` and
-//! `vendor_translation_namespaces` so the scan runs purely against a tempdir
-//! (same pattern as `translation_namespace_navigation.rs`).
+//! These tests drive the private async method on a server built through the
+//! `tower_lsp::LspService` harness, priming `root_path` and registering a
+//! real module provider file so the scan runs purely against a tempdir.
 
 use crate::LaravelLanguageServer;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tower_lsp::LspService;
 
-/// Build a backend with the project root and the namespace map primed, so
-/// `vendor_translation_namespaces_for` returns the cache without scanning
-/// disk.
-async fn backend_with_namespaces(
-    root: &Path,
-    namespaces: HashMap<String, PathBuf>,
-) -> LaravelLanguageServer {
+/// Build a backend rooted at `root`, with `provider` (a real on-disk module
+/// service provider registering translation namespaces) handed to the Salsa
+/// translation layer the same way `module_dirs_for` does.
+async fn backend_with_module_provider(root: &Path, provider: PathBuf) -> LaravelLanguageServer {
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
     *backend.root_path.write().await = Some(root.to_path_buf());
-    *backend.vendor_translation_namespaces.write().await = Some(Arc::new(namespaces));
     backend
+        .salsa
+        .set_translation_provider_extras(vec![provider])
+        .await
+        .expect("salsa actor should accept provider extras");
+    backend
+}
+
+/// Write a module service provider that registers `namespace` for the
+/// module's own `lang/` directory (the `modules.paths` convention:
+/// `app/{Parent}/{Module}/Providers/…` next to `app/{Parent}/{Module}/lang`).
+fn write_module_provider(module_dir: &Path, namespace: &str) -> PathBuf {
+    let providers = module_dir.join("Providers");
+    fs::create_dir_all(&providers).unwrap();
+    let path = providers.join("ModuleServiceProvider.php");
+    let source = format!(
+        "<?php\nclass ModuleServiceProvider {{\n    public function boot(): void {{\n        $this->loadTranslationsFrom(__DIR__.'/../lang', '{namespace}');\n    }}\n}}\n"
+    );
+    fs::write(&path, source).unwrap();
+    path
 }
 
 /// Write a one-key catalogue at `<lang_dir>/en/<file>.php`. `key` may be
 /// dotted (`"details.title"`) — each segment becomes its own nested,
-/// one-per-line PHP array level, matching how Laravel catalogues actually
-/// declare nested keys AND the shape `parse_translation_keys`'s line-based
-/// scan expects (it tracks array open/close per line, not a literal dotted
-/// string key).
+/// one-per-line PHP array level.
 fn write_catalogue(lang_dir: &Path, file: &str, key: &str, value: &str) {
     let dir = lang_dir.join("en");
     fs::create_dir_all(&dir).unwrap();
@@ -74,17 +85,16 @@ async fn namespaced_lang_dir_yields_prefixed_completions_alongside_root() {
     // A namespace whose catalogues live only under its registered dir,
     // never published to `lang/vendor/…` (the fixture shape:
     // legal-contractmanagement::contract-management.details.title).
-    let ns_lang_dir = root.join("app/Legal/ContractManagement/lang");
+    let module_dir = root.join("app/Legal/ContractManagement");
     write_catalogue(
-        &ns_lang_dir,
+        &module_dir.join("lang"),
         "contract-management",
         "details.title",
         "Vertragsdetails",
     );
-    let mut namespaces = HashMap::new();
-    namespaces.insert("legal-contractmanagement".to_string(), ns_lang_dir);
+    let provider = write_module_provider(&module_dir, "legal-contractmanagement");
 
-    let backend = backend_with_namespaces(&root, namespaces).await;
+    let backend = backend_with_module_provider(&root, provider).await;
     let keys = backend.get_all_translation_keys().await;
     let all_keys: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
 
@@ -105,17 +115,16 @@ async fn namespace_only_project_still_completes() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
 
-    let ns_lang_dir = root.join("app/Legal/ContractManagement/lang");
+    let module_dir = root.join("app/Legal/ContractManagement");
     write_catalogue(
-        &ns_lang_dir,
+        &module_dir.join("lang"),
         "contract-management",
         "details.title",
         "Vertragsdetails",
     );
-    let mut namespaces = HashMap::new();
-    namespaces.insert("legal-contractmanagement".to_string(), ns_lang_dir);
+    let provider = write_module_provider(&module_dir, "legal-contractmanagement");
 
-    let backend = backend_with_namespaces(&root, namespaces).await;
+    let backend = backend_with_module_provider(&root, provider).await;
     let keys = backend.get_all_translation_keys().await;
     let all_keys: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
 
