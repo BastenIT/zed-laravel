@@ -146,3 +146,29 @@ fn module_root_namespace_variants() {
         "App\\NoProviders"
     );
 }
+
+#[test]
+fn extracts_direct_add_namespace_with_named_arguments_in_declared_order() {
+    let (_tmp, root, provider_path) = module_layout();
+    let source = r#"<?php
+
+namespace App\Common\UI\Providers;
+
+use Livewire\Livewire;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        Livewire::addNamespace(
+            namespace: 'common-ui',
+            classPath: __DIR__.'/../Livewire',
+            classNamespace: 'App\\Common\\UI\\Livewire',
+        );
+    }
+}
+"#;
+    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let reg = map.get("common-ui").expect("common-ui registered");
+    assert_eq!(reg.class_namespace, "App\\Common\\UI\\Livewire");
+}

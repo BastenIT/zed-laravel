@@ -153,3 +153,81 @@ fn translation_call_context_passes_namespace_prefix_through_unmangled() {
         "legal-contractmanagement::contract-management.details."
     );
 }
+
+#[tokio::test]
+async fn translation_namespace_disappears_when_the_registration_is_removed() {
+    // Negative control for the module-provider registration: the identical
+    // fixture minus the loadTranslationsFrom call resolves nothing.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let module_dir = root.join("app/Legal/ContractManagement");
+    write_catalogue(
+        &module_dir.join("lang"),
+        "contract-management",
+        "details.title",
+        "Vertragsdetails",
+    );
+    let providers = module_dir.join("Providers");
+    fs::create_dir_all(&providers).unwrap();
+    let provider = providers.join("ModuleServiceProvider.php");
+    fs::write(
+        &provider,
+        "<?php\nclass ModuleServiceProvider {\n    public function boot(): void {}\n}\n",
+    )
+    .unwrap();
+
+    let backend = backend_with_module_provider(&root, provider).await;
+    assert!(
+        backend.get_all_translation_keys().await.is_empty(),
+        "no loadTranslationsFrom call, no namespaced keys"
+    );
+}
+
+#[tokio::test]
+async fn conflicting_namespace_registrations_resolve_last_registered_wins() {
+    // Two module providers register the SAME namespace for different lang
+    // dirs. Documented rule: among module providers the LAST-registered one
+    // wins (matching the last-merged-wins config rule); a real
+    // `app/Providers/` registration would override both, because the app
+    // boots last.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let alpha = root.join("app/Legal/Alpha");
+    write_catalogue(&alpha.join("lang"), "shared", "origin", "from-alpha");
+    let beta = root.join("app/Legal/Beta");
+    write_catalogue(&beta.join("lang"), "shared", "origin", "from-beta");
+
+    let mut providers = Vec::new();
+    for module in [&alpha, &beta] {
+        let dir = module.join("Providers");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ModuleServiceProvider.php");
+        fs::write(
+            &path,
+            "<?php\nclass ModuleServiceProvider {\n    public function boot(): void {\n        $this->loadTranslationsFrom(__DIR__.'/../lang', 'legal-shared');\n    }\n}\n",
+        )
+        .unwrap();
+        providers.push(path);
+    }
+
+    let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+    let backend = service.inner().clone();
+    *backend.root_path.write().await = Some(root.clone());
+    backend
+        .salsa
+        .set_translation_provider_extras(providers)
+        .await
+        .unwrap();
+
+    let keys = backend.get_all_translation_keys().await;
+    let entry = keys
+        .iter()
+        .find(|k| k.key == "legal-shared::shared.origin")
+        .expect("namespace resolves");
+    assert_eq!(
+        entry.value, "from-beta",
+        "the later-registered module's directory wins"
+    );
+}

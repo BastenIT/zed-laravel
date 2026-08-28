@@ -2045,7 +2045,10 @@ impl TranslationCache {
                 continue;
             };
             let ns_locale_dir = ns_dir.join(&ns_locale);
-            let files = self.ensure_dir(db, &ns_locale_dir, root).entries(&*db).clone();
+            let files = self
+                .ensure_dir(db, &ns_locale_dir, root)
+                .entries(&*db)
+                .clone();
             for (name, is_dir) in files {
                 if is_dir {
                     continue;
