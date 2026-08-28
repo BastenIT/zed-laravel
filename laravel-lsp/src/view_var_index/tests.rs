@@ -97,6 +97,386 @@ fn no_view_calls_yields_empty() {
     assert!(r.is_empty());
 }
 
+// ---- Filament `$view` property render site --------------------------------
+//
+// `protected string $view = '…';` (Filament `Page`) / `protected static
+// string $view = '…';` (Filament `Widget`) declares which Blade view the
+// class renders — the class-property counterpart of a controller's
+// `view('name', […])` call. The class's typed surface becomes that view's
+// variables.
+
+#[test]
+fn view_property_typed_public_property_is_render_site() {
+    let src = r#"<?php
+namespace App\Filament\Pages;
+use App\Models\User;
+class ContractViewPage {
+    public ?User $user = null;
+    protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].view_name,
+        "legal-contractmanagement::filament.pages.contract-edit-page"
+    );
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_computed_method_is_render_var() {
+    let src = r#"<?php
+use App\Models\User;
+class ReportPage {
+    protected string $view = 'pages.report';
+
+    #[Computed]
+    public function user(): User { return User::first(); }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_mount_assignment_is_render_var() {
+    let src = r#"<?php
+use App\Models\User;
+class ProfilePage {
+    protected string $view = 'pages.profile';
+    public $user;
+
+    public function mount(User $injected) {
+        $this->user = $injected;
+    }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_static_variant_is_render_site() {
+    // Filament `Widget`s declare `$view` as `static`.
+    let src = r#"<?php
+class StatsWidget {
+    protected static string $view = 'widgets.stats';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "widgets.stats");
+}
+
+#[test]
+fn view_property_public_untyped_variant_is_render_site() {
+    // Neither visibility nor a type hint gates detection — only the
+    // property's NAME and a literal initializer.
+    let src = r#"<?php
+class BannerWidget {
+    public $view = 'widgets.banner';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "widgets.banner");
+}
+
+#[test]
+fn view_property_private_typed_variant_is_render_site() {
+    let src = r#"<?php
+class SecretPage {
+    private string $view = 'pages.secret';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "pages.secret");
+}
+
+#[test]
+fn view_property_static_untyped_variant_is_render_site() {
+    let src = r#"<?php
+class LegacyWidget {
+    protected static $view = 'widgets.legacy';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(r[0].view_name, "widgets.legacy");
+}
+
+#[test]
+fn view_property_get_view_data_is_render_var() {
+    // `getViewData()` is Filament's `with()`-equivalent extension point on
+    // `Page`/`Widget` — its returned array folds into the view's variables.
+    let src = r#"<?php
+use App\Models\User;
+class ReportPage {
+    protected string $view = 'pages.report';
+
+    protected function getViewData(): array {
+        return ['user' => User::first()];
+    }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_surface_is_scoped_to_owning_class() {
+    // Two classes in one file, only one declares `$view`: the other class's
+    // typed surface must never leak into this render site's vars.
+    let src = r#"<?php
+use App\Models\Order;
+use App\Models\User;
+class UnrelatedHelper {
+    public Order $order;
+}
+class ProfilePage {
+    public User $user;
+    protected string $view = 'pages.profile';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+    assert!(
+        !r[0].vars.contains_key("order"),
+        "the other class's property leaked: {:?}",
+        r[0].vars
+    );
+}
+
+#[test]
+fn view_property_non_literal_is_skipped() {
+    // `self::VIEW` isn't a string literal — no resolvable render site.
+    let src = r#"<?php
+class DynamicPage {
+    const VIEW = 'pages.dynamic';
+    protected string $view = self::VIEW;
+}
+
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_interpolated_string_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view = "pages.{$type}";
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_call_initializer_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view = self::defaultView();
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_concatenation_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view = 'pages.' . 'home';
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_without_initializer_is_skipped() {
+    let src = r#"<?php
+class DynamicPage {
+    protected string $view;
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn view_property_constructor_promoted_is_skipped() {
+    // A promoted parameter's default is a PARAMETER default — the actual
+    // value depends on the caller, so it is not a resolvable render site.
+    let src = r#"<?php
+class DynamicPage {
+    public function __construct(protected string $view = 'pages.injected') {}
+}
+"#;
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+// ---- `declared_view_literal_node` — position-aware sibling used by the
+// pattern-capture site (`queries::extract_all_php_patterns`) to report the
+// `$view` property as a ViewReferenceData for goto/hover/diagnostics -------
+
+#[test]
+fn declared_view_literal_node_points_at_literal_content() {
+    // Line 2 (0-based):
+    //     protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+    //     0         1         2         3         4         5         6         7         8
+    //     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234
+    let src = "<?php\nclass ContractViewPage {\n    protected string $view = \
+               'legal-contractmanagement::filament.pages.contract-edit-page';\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    let nodes = declared_view_literal_nodes(tree.root_node(), bytes);
+    assert_eq!(nodes.len(), 1, "one declaring class, one node");
+    let content = nodes[0];
+    assert_eq!(
+        content.utf8_text(bytes).unwrap(),
+        "legal-contractmanagement::filament.pages.contract-edit-page"
+    );
+    // Position points at the literal's CONTENT, not the surrounding quotes.
+    assert_eq!(content.start_position().row, 2);
+    assert_eq!(content.start_position().column, 30);
+    assert_eq!(content.end_position().column, 89);
+}
+
+#[test]
+fn declared_view_literal_node_static_variant() {
+    let src =
+        "<?php\nclass StatsWidget {\n    protected static string $view = 'widgets.stats';\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    let nodes = declared_view_literal_nodes(tree.root_node(), bytes);
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].utf8_text(bytes).unwrap(), "widgets.stats");
+}
+
+#[test]
+fn declared_view_literal_node_non_literal_is_none() {
+    let src = "<?php\nclass DynamicPage {\n    const VIEW = 'pages.dynamic';\n    protected string $view = self::VIEW;\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    assert!(declared_view_literal_nodes(tree.root_node(), bytes).is_empty());
+}
+
+#[test]
+fn declared_view_literal_node_no_view_property_is_none() {
+    let src = "<?php\nclass NoView {\n    public function render() {}\n}\n";
+    let tree = crate::parser::parse_php(src).unwrap();
+    let bytes = src.as_bytes();
+
+    assert!(declared_view_literal_nodes(tree.root_node(), bytes).is_empty());
+}
+
+#[test]
+fn captured_view_property_render_matches_live() {
+    // Plan capture/eval (`capture_render_plans` + `evaluate_render_plans`) must
+    // reproduce the live `view_renders_in_file` result exactly, across a typed
+    // property AND a `#[Computed]` method on the same class.
+    let p = blade_project();
+    let controller = r#"<?php
+namespace App\Filament\Pages;
+use App\Models\User;
+class ContractViewPage {
+    public ?User $user = null;
+
+    #[Computed]
+    public function admin(): User { return User::first(); }
+
+    protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+}
+"#;
+    let (live, captured) = render_both_ways(&p.index, &p.root, controller);
+    assert_eq!(
+        live, captured,
+        "captured $view render plan diverged from live"
+    );
+    assert_eq!(live.len(), 1, "got {live:?}");
+    assert_eq!(
+        live[0].vars.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+    assert_eq!(
+        live[0].vars.get("admin").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn view_property_real_world_filament_page_shape() {
+    // Mirrors ContractViewPage.php's actual shape: a `#[Validate(...)]`
+    // attribute directly above the typed property, an untyped `#[Locked]`
+    // property, a non-class builtin-typed property, a protected (non-public)
+    // typed property, and a namespace-qualified `$view` literal — none of
+    // which should confuse the typed-property scan.
+    let src = r#"<?php
+namespace App\Legal\ContractManagement\Filament\Pages;
+
+use Filament\Pages\Page;
+use Livewire\Attributes\Locked;
+use Livewire\Attributes\Validate;
+use Livewire\Features\SupportFileUploads\TemporaryUploadedFile;
+
+class ContractViewPage extends Page
+{
+    #[Locked]
+    public ?string $contractId = null;
+
+    public bool $isEditMode = false;
+
+    #[Validate('file|max:10240|mimes:pdf', as: ['uploadedFile' => 'Contract document'], translate: true)]
+    public ?TemporaryUploadedFile $uploadedFile = null;
+
+    protected string $contractService;
+
+    protected string $view = 'legal-contractmanagement::filament.pages.contract-edit-page';
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert_eq!(
+        r[0].view_name,
+        "legal-contractmanagement::filament.pages.contract-edit-page"
+    );
+    assert_eq!(
+        r[0].vars.get("uploadedFile").map(String::as_str),
+        Some("Livewire\\Features\\SupportFileUploads\\TemporaryUploadedFile")
+    );
+    // Builtins, `#[Locked]`-only, and non-public props contribute nothing.
+    assert!(!r[0].vars.contains_key("contractId"));
+    assert!(!r[0].vars.contains_key("isEditMode"));
+    assert!(!r[0].vars.contains_key("contractService"));
+}
+
 // ---- ViewVarIndex --------------------------------------------------------
 
 use std::collections::HashMap;
@@ -271,6 +651,65 @@ fn view_name_longest_root_wins() {
             &roots
         ),
         Some("button".to_string())
+    );
+}
+
+// ---- view_name_for_path_namespaced ----------------------------------------
+
+#[test]
+fn view_name_namespaced_directory_maps_to_prefixed_name() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ns_dir = dir
+        .path()
+        .join("modules/legal-contractmanagement/resources/views");
+    let file = ns_dir.join("filament/pages/contract-edit-page.blade.php");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "").unwrap();
+
+    let mut namespaces = HashMap::new();
+    namespaces.insert("legal-contractmanagement".to_string(), ns_dir);
+    let roots = vec![dir.path().join("resources/views")];
+
+    assert_eq!(
+        view_name_for_path_namespaced(&file, &roots, &namespaces),
+        Some("legal-contractmanagement::filament.pages.contract-edit-page".to_string())
+    );
+}
+
+#[test]
+fn view_name_namespace_wins_over_plain_root_when_both_match() {
+    // A namespace dir NESTED under a plain view root (e.g. a module's views
+    // published under resources/views/modules/legal) must still key with the
+    // namespace prefix, not the plain-root-relative name.
+    let dir = tempfile::TempDir::new().unwrap();
+    let plain_root = dir.path().join("resources/views");
+    let ns_dir = plain_root.join("modules/legal");
+    let file = ns_dir.join("show.blade.php");
+    fs::create_dir_all(&ns_dir).unwrap();
+    fs::write(&file, "").unwrap();
+
+    let mut namespaces = HashMap::new();
+    namespaces.insert("legal".to_string(), ns_dir);
+    let roots = vec![plain_root];
+
+    assert_eq!(
+        view_name_for_path_namespaced(&file, &roots, &namespaces),
+        Some("legal::show".to_string())
+    );
+}
+
+#[test]
+fn view_name_namespaced_falls_back_to_plain_roots() {
+    // No namespace matches — falls through to `view_name_for_path`.
+    let roots = vec![PathBuf::from("/proj/resources/views")];
+    let namespaces: HashMap<String, PathBuf> = HashMap::new();
+    assert_eq!(
+        view_name_for_path_namespaced(
+            Path::new("/proj/resources/views/users/show.blade.php"),
+            &roots,
+            &namespaces,
+        ),
+        Some("users.show".to_string())
     );
 }
 
@@ -1436,6 +1875,198 @@ new class extends Component {
         "user/count/increment index; notAMember drops"
     );
     assert!(captured.iter().all(|e| e.fqcn.starts_with("volt::")));
+}
+
+#[test]
+fn every_class_in_a_file_gets_its_own_render_site() {
+    // Two classes, two render sites — neither drops, in document order.
+    let src = r#"<?php
+class PageA { protected string $view = 'pages.a'; }
+class PageB { protected string $view = 'pages.b'; }
+"#;
+    let r = renders(src);
+    let names: Vec<&str> = r.iter().map(|v| v.view_name.as_str()).collect();
+    assert_eq!(names, vec!["pages.a", "pages.b"]);
+}
+
+#[test]
+fn anonymous_class_and_host_never_absorb_each_other() {
+    // BOTH directions: the anonymous class nested in a method gets its OWN
+    // render site without the host's members, AND the host's surface walk
+    // stops at the class boundary instead of descending through the method
+    // body into the anonymous class — each site's vars are EXACTLY its own
+    // class's members.
+    let src = r#"<?php
+use App\Models\Secret;
+use App\Models\User;
+class SettingsPage {
+    public User $user;
+    protected string $view = 'pages.settings';
+    public function modal() {
+        return new class {
+            public Secret $secret;
+            protected string $view = 'pages.modal';
+        };
+    }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 2, "got {r:?}");
+    let settings = r
+        .iter()
+        .find(|v| v.view_name == "pages.settings")
+        .expect("the host page keeps its render site");
+    let mut settings_vars: Vec<&str> = settings.vars.keys().map(String::as_str).collect();
+    settings_vars.sort_unstable();
+    assert_eq!(
+        settings_vars,
+        vec!["user"],
+        "the host's surface is exactly its own members — the anonymous \
+         class's $secret must not fold in: {:?}",
+        settings.vars
+    );
+    let modal = r
+        .iter()
+        .find(|v| v.view_name == "pages.modal")
+        .expect("the anonymous class contributes its own site");
+    let mut modal_vars: Vec<&str> = modal.vars.keys().map(String::as_str).collect();
+    modal_vars.sort_unstable();
+    assert_eq!(
+        modal_vars,
+        vec!["secret"],
+        "…and vice versa: the host's $user stays out: {:?}",
+        modal.vars
+    );
+}
+
+#[test]
+fn captured_plan_surface_stops_at_the_class_boundary_too() {
+    // The plan path (`capture_class_surface_items`) shares the bounded
+    // descent — parity with the live walk on the two-directional fixture.
+    let src = r#"<?php
+use App\Models\Secret;
+use App\Models\User;
+class SettingsPage {
+    public User $user;
+    protected string $view = 'pages.settings';
+    public function modal() {
+        return new class {
+            public Secret $secret;
+            protected string $view = 'pages.modal';
+        };
+    }
+}
+"#;
+    let p = blade_project();
+    let (live, captured) = render_both_ways(&p.index, &p.root, src);
+    assert_eq!(
+        live, captured,
+        "captured $view render plans diverged from live"
+    );
+    let settings = live
+        .iter()
+        .find(|v| v.view_name == "pages.settings")
+        .expect("host site");
+    assert!(
+        !settings.vars.contains_key("secret"),
+        "plan path leaked the anonymous class's member: {:?}",
+        settings.vars
+    );
+}
+
+#[test]
+fn view_property_heredoc_is_skipped() {
+    let src = "<?php\nclass DynamicPage {\n    protected string $view = <<<'VIEW'\npages.dynamic\nVIEW;\n}\n";
+    let r = renders(src);
+    assert!(r.is_empty(), "got {r:?}");
+}
+
+#[test]
+fn global_with_helper_does_not_pollute_the_surface() {
+    // Laravel's global `with($value, $callback)` is NOT Volt's functional
+    // `with(fn () => [...])` — only a LEADING closure argument contributes.
+    let src = r#"<?php
+use App\Models\User;
+class ReportPage {
+    protected string $view = 'pages.report';
+
+    public function boot() {
+        return with(User::first(), fn () => ['leaked' => User::first()]);
+    }
+}
+"#;
+    let r = renders(src);
+    assert_eq!(r.len(), 1, "got {r:?}");
+    assert!(
+        !r[0].vars.contains_key("leaked"),
+        "global with() helper leaked into the surface: {:?}",
+        r[0].vars
+    );
+}
+
+// ---- view_names_for_path_namespaced ----------------------------------------
+
+#[test]
+fn namespace_selection_is_deterministic_across_map_instances() {
+    // Two prefixes registered against the SAME directory: the winner must
+    // not depend on HashMap iteration order. Alphabetical tiebreak, checked
+    // across many fresh maps.
+    let dir = PathBuf::from("/proj/modules/shop/resources/views");
+    let file = dir.join("index.blade.php");
+    for _ in 0..100 {
+        let mut namespaces = std::collections::HashMap::new();
+        namespaces.insert("shop".to_string(), dir.clone());
+        namespaces.insert("alpha".to_string(), dir.clone());
+        assert_eq!(
+            view_name_for_path_namespaced(&file, &[], &namespaces).as_deref(),
+            Some("alpha::index"),
+            "same inputs, same answer, every run"
+        );
+    }
+}
+
+#[test]
+fn published_vendor_override_maps_to_the_namespaced_name() {
+    // `resolve_view_path("ns::x")` probes the published override at
+    // `{view_root}/vendor/ns/x.blade.php` — the reverse direction must
+    // agree, since the published copy is the file actually being edited.
+    let root = PathBuf::from("/proj/resources/views");
+    let mut namespaces = std::collections::HashMap::new();
+    namespaces.insert(
+        "filament-panels".to_string(),
+        PathBuf::from("/proj/vendor/filament/panels/resources/views"),
+    );
+    let published = root.join("vendor/filament-panels/pages/auth/login.blade.php");
+    assert_eq!(
+        view_name_for_path_namespaced(&published, std::slice::from_ref(&root), &namespaces)
+            .as_deref(),
+        Some("filament-panels::pages.auth.login")
+    );
+    // An unregistered directory under vendor/ is NOT a namespace.
+    let stray = root.join("vendor/unregistered/x.blade.php");
+    assert_eq!(
+        view_name_for_path_namespaced(&stray, &[root], &namespaces).as_deref(),
+        Some("vendor.unregistered.x"),
+        "falls through to the plain dotted name"
+    );
+}
+
+#[test]
+fn namespace_dir_inside_a_view_root_keeps_both_names() {
+    // A namespace registered INSIDE a plain view root: the file answers to
+    // both its `ns::` name and its plain dotted name, namespaced first —
+    // a controller's view('admin.dashboard') render site stays connected.
+    let root = PathBuf::from("/proj/resources/views");
+    let mut namespaces = std::collections::HashMap::new();
+    namespaces.insert("admin".to_string(), root.join("admin"));
+    let file = root.join("admin/dashboard.blade.php");
+    assert_eq!(
+        view_names_for_path_namespaced(&file, std::slice::from_ref(&root), &namespaces),
+        vec![
+            "admin::dashboard".to_string(),
+            "admin.dashboard".to_string()
+        ]
+    );
 }
 
 #[test]

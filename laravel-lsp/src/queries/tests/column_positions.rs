@@ -77,6 +77,31 @@ fn view_ternary_argument_column_positions() {
 }
 
 #[test]
+fn view_property_literal_column_positions() {
+    // Line 2 (0-based): `protected string $view = 'pages.report';`
+    // Position: 0         1         2         3
+    //           0123456789012345678901234567890123456789
+    let source = "<?php\nclass C {\nprotected string $view = 'pages.report';\n}\n";
+    let tree = parse_php(source).expect("Should parse PHP");
+    let lang = language_php();
+    let patterns = extract_all_php_patterns(&tree, source, &lang).expect("Should extract patterns");
+
+    assert_eq!(patterns.views.len(), 1, "got {:?}", patterns.views);
+    let view = &patterns.views[0];
+    assert_eq!(view.view_name, "pages.report");
+    assert_eq!(view.row, 2, "the property sits on the 3rd line (0-based)");
+    // 'p' of "pages.report" starts right after the opening quote at column 26
+    assert_eq!(
+        view.column, 26,
+        "column should point to first char of the literal"
+    );
+    assert_eq!(
+        view.end_column, 38,
+        "end_column should be after the last char"
+    );
+}
+
+#[test]
 fn env_column_positions() {
     // env('APP_NAME')
     // Position: 0         1         2

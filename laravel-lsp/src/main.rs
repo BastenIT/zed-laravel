@@ -3360,6 +3360,10 @@ async fn build_magic_member_entries(
     >,
     root: &Path,
     view_paths: &[PathBuf],
+    // Registered view namespaces (`loadViewsFrom()` prefix → absolute view
+    // dir), so a module Blade file (Filament package views, etc.) keys into
+    // the view-var index as `ns::dotted.rel` instead of failing to map at all.
+    view_namespaces: &HashMap<String, PathBuf>,
     max_concurrent: usize,
     // First-load progress handle. Drives the "Resolving members in N of M…"
     // status while PHP member accesses resolve — the slow phase on big projects
@@ -3413,13 +3417,23 @@ async fn build_magic_member_entries(
     // ── Pass 1: build the view-variable index ────────────────────────────
     // Scan non-vendor controllers (PHP with `view()` calls) for render sites,
     // resolving each passed variable's type so Blade accesses can be typed.
+    // Also scans classes with a Filament-style `$view` property render site —
+    // `.views` (the tree-sitter `view_name`/`route_view_name` query capture)
+    // never sees those, since there's no `view()` call to match; the captured
+    // `member_context.view_renders` plan does, so it's the OR'd-in fallback
+    // signal for a class this filter would otherwise skip.
     let view_targets: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
         pattern_cache
             .iter()
             .filter(|e| {
                 !e.key().components().any(|c| c.as_os_str() == "vendor")
                     && !e.key().to_string_lossy().ends_with(".blade.php")
-                    && !e.value().1.views.is_empty()
+                    && (!e.value().1.views.is_empty()
+                        || e.value()
+                            .1
+                            .member_context
+                            .as_ref()
+                            .is_some_and(|ctx| !ctx.view_renders.is_empty()))
             })
             .map(|e| (e.key().clone(), e.value().1.clone()))
             .collect();
@@ -3629,6 +3643,7 @@ async fn build_magic_member_entries(
             .collect();
     if !blade_targets.is_empty() {
         let view_paths = Arc::new(view_paths.to_vec());
+        let view_namespaces = Arc::new(view_namespaces.clone());
         let blade_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
         let mut blade_handles = Vec::with_capacity(blade_targets.len());
         for (path, data) in blade_targets {
@@ -3640,6 +3655,7 @@ async fn build_magic_member_entries(
             let implementers = implementers.clone();
             let view_var_index = view_var_index.clone();
             let view_paths = view_paths.clone();
+            let view_namespaces = view_namespaces.clone();
             let classviews = classviews.clone();
             let root = root.clone();
             blade_handles.push(tokio::spawn(async move {
@@ -3723,10 +3739,15 @@ async fn build_magic_member_entries(
                                     Some(&mut deps),
                                 )
                             } else {
-                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
-                                    &path,
-                                    &view_paths,
-                                )?;
+                                let view_name =
+                                    laravel_lsp::view_var_index::best_indexed_view_name(
+                                        laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                            &path,
+                                            &view_paths,
+                                            &view_namespaces,
+                                        ),
+                                        &view_var_index,
+                                    )?;
                                 laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
                                     ctx,
                                     &data.member_access_refs,
@@ -3782,10 +3803,15 @@ async fn build_magic_member_entries(
                                     Some(&mut deps),
                                 )
                             } else {
-                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
-                                    &path,
-                                    &view_paths,
-                                )?;
+                                let view_name =
+                                    laravel_lsp::view_var_index::best_indexed_view_name(
+                                        laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                            &path,
+                                            &view_paths,
+                                            &view_namespaces,
+                                        ),
+                                        &view_var_index,
+                                    )?;
                                 laravel_lsp::view_var_index::resolve_blade_member_accesses(
                                     &data.member_access_refs,
                                     &view_name,
@@ -5128,6 +5154,10 @@ impl LaravelLanguageServer {
         // view-name mapping). Cloned here because `view_paths` was moved into
         // `register_project_files` above.
         let view_paths_for_warm = config.view_paths.clone();
+        // Registered view namespaces, cloned alongside `view_paths_for_warm`
+        // for the same reason — module/package Blade files need the prefix
+        // map to key into the view-var index as `ns::dotted.rel`.
+        let view_namespaces_for_warm = config.view_namespaces.clone();
         // pattern_cache already cloned above for the load step; clone
         // again here so the warming task can (a) skip files already in
         // cache from the load and (b) hand the same map to save_from.
@@ -5594,13 +5624,16 @@ impl LaravelLanguageServer {
                             {
                                 continue;
                             }
-                            if let Some(name) = laravel_lsp::view_var_index::view_name_for_path(
+                            let names = laravel_lsp::view_var_index::view_names_for_path_namespaced(
                                 p,
                                 &view_paths_for_warm,
-                            ) {
-                                if changed_views.contains(name.as_str()) {
-                                    work.insert(p.clone());
-                                }
+                                &view_namespaces_for_warm,
+                            );
+                            if names
+                                .iter()
+                                .any(|name| changed_views.contains(name.as_str()))
+                            {
+                                work.insert(p.clone());
                             }
                         }
                     }
@@ -5642,6 +5675,7 @@ impl LaravelLanguageServer {
                     &pattern_cache_for_warm,
                     &root_for_save,
                     &view_paths_for_warm,
+                    &view_namespaces_for_warm,
                     MAX_CONCURRENT_PARSES,
                     progress.as_mut(),
                     parse_top,
@@ -6864,13 +6898,18 @@ impl LaravelLanguageServer {
         }
 
         if !changed_views.is_empty() {
-            let view_paths = self
-                .cached_config
-                .read()
-                .await
-                .as_ref()
-                .map(|c| c.view_paths.clone())
-                .unwrap_or_default();
+            let (view_paths, view_namespaces) = {
+                let cfg = self.cached_config.read().await;
+                let view_paths = cfg
+                    .as_ref()
+                    .map(|c| c.view_paths.clone())
+                    .unwrap_or_default();
+                let view_namespaces = cfg
+                    .as_ref()
+                    .map(|c| c.view_namespaces.clone())
+                    .unwrap_or_default();
+                (view_paths, view_namespaces)
+            };
             let changed: HashSet<&str> = changed_views.iter().map(String::as_str).collect();
             // No published cache means nothing has been indexed yet, so there
             // are no Blade files to re-resolve — an empty work set, not a
@@ -6883,12 +6922,13 @@ impl LaravelLanguageServer {
                     {
                         continue;
                     }
-                    if let Some(name) =
-                        laravel_lsp::view_var_index::view_name_for_path(p, &view_paths)
-                    {
-                        if changed.contains(name.as_str()) {
-                            work.insert(p.clone());
-                        }
+                    let names = laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                        p,
+                        &view_paths,
+                        &view_namespaces,
+                    );
+                    if names.iter().any(|name| changed.contains(name.as_str())) {
+                        work.insert(p.clone());
                     }
                 }
             }
@@ -7088,15 +7128,18 @@ impl LaravelLanguageServer {
         // Controller-rendered Blade needs the view paths (an await), fetched
         // here at the async top level so both the captured-context and the
         // vendor fallback branches below can use it without re-awaiting.
-        let view_paths = if is_blade && !is_volt {
-            self.cached_config
-                .read()
-                .await
-                .as_ref()
-                .map(|c| c.view_paths.clone())
-                .unwrap_or_default()
+        let (view_paths, view_namespaces) = if is_blade && !is_volt {
+            let cfg = self.cached_config.read().await;
+            (
+                cfg.as_ref()
+                    .map(|c| c.view_paths.clone())
+                    .unwrap_or_default(),
+                cfg.as_ref()
+                    .map(|c| c.view_namespaces.clone())
+                    .unwrap_or_default(),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), HashMap::new())
         };
         // Resolve from the context captured at parse when present. The ONLY
         // no-context case is a VENDOR save: the build passes skip vendor, so
@@ -7131,7 +7174,16 @@ impl LaravelLanguageServer {
                         Some(&mut deps),
                     )
                 } else if is_blade {
-                    match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
+                    match self.view_vars.read().ok().and_then(|vv| {
+                        laravel_lsp::view_var_index::best_indexed_view_name(
+                            laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                path,
+                                &view_paths,
+                                &view_namespaces,
+                            ),
+                            &vv,
+                        )
+                    }) {
                         Some(view_name) => match self.view_vars.read() {
                             Ok(vv) => {
                                 laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
@@ -7179,7 +7231,16 @@ impl LaravelLanguageServer {
                         Some(&mut deps),
                     )
                 } else if is_blade {
-                    match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
+                    match self.view_vars.read().ok().and_then(|vv| {
+                        laravel_lsp::view_var_index::best_indexed_view_name(
+                            laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                                path,
+                                &view_paths,
+                                &view_namespaces,
+                            ),
+                            &vv,
+                        )
+                    }) {
                         Some(view_name) => match self.view_vars.read() {
                             Ok(vv) => laravel_lsp::view_var_index::resolve_blade_member_accesses(
                                 &patterns.member_access_refs,
@@ -10914,6 +10975,34 @@ impl LaravelLanguageServer {
             resolved_type = Some(class);
         }
 
+        // Project-wide render index fallback: covers render-site shapes the
+        // per-source checks above don't — controllers rendering namespaced
+        // module views, and Filament-style `$view`-property classes whose
+        // typed public properties / #[Computed] surface was captured into
+        // the index. Uses the namespace-aware view name, which
+        // `extract_view_name_from_path` above doesn't produce.
+        if resolved_type.is_none() {
+            let (view_paths, view_namespaces) = match self.cached_config.read().await.as_ref() {
+                Some(config) => (config.view_paths.clone(), config.view_namespaces.clone()),
+                None => (vec![root.join("resources/views")], HashMap::new()),
+            };
+            for vn in laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                &file_path,
+                &view_paths,
+                &view_namespaces,
+            ) {
+                let indexed_type = self
+                    .view_vars
+                    .read()
+                    .ok()
+                    .and_then(|idx| idx.var_types(&vn, var_without_dollar).into_iter().next());
+                if indexed_type.is_some() {
+                    resolved_type = indexed_type;
+                    break;
+                }
+            }
+        }
+
         // Fetch loop blocks via Salsa (memoized). Use std::path::PathBuf to send to the actor.
         let path_buf = std::path::PathBuf::from(path);
         let loops = self.salsa.get_loop_blocks(path_buf).await.ok().flatten();
@@ -11513,57 +11602,43 @@ impl LaravelLanguageServer {
 
         // 7. Project-wide render index fallback (lowest priority — everything
         // above already claimed its names via `seen`). Covers render-site
-        // shapes the per-source checks above don't — any class whose render
-        // site was captured into the index (controllers, and `$view`-property
-        // pages once #295 lands). Namespace-aware reverse mapping arrives
-        // with the #295 branch; until then plain view roots resolve here.
-        let view_paths_config = self
+        // shapes the per-source checks above don't: controllers rendering
+        // namespaced module views, and Filament-style `$view`-property pages
+        // whose typed public properties / #[Computed] surface was captured
+        // into the index. Uses the namespace-aware view name, which
+        // `extract_view_name_from_path` above doesn't produce.
+        let namespaced_config = self
             .cached_config
             .try_read()
             .ok()
             .map(|g| match g.as_ref() {
-                Some(config) => config.view_paths.clone(),
-                None => vec![root.join("resources/views")],
+                Some(config) => (config.view_paths.clone(), config.view_namespaces.clone()),
+                None => (vec![root.join("resources/views")], HashMap::new()),
             });
-        if let Some(view_paths) = view_paths_config {
-            if let Some(vn) =
-                laravel_lsp::view_var_index::view_name_for_path(&file_path, &view_paths)
-            {
-                let source_files = if let Ok(idx) = self.view_vars.read() {
+        if let Some((view_paths, view_namespaces)) = namespaced_config {
+            for vn in laravel_lsp::view_var_index::view_names_for_path_namespaced(
+                &file_path,
+                &view_paths,
+                &view_namespaces,
+            ) {
+                if let Ok(idx) = self.view_vars.read() {
                     for (name, types) in idx.vars_for_view(&vn) {
                         if seen.insert(name.clone()) {
                             variables.push(BladeVariableInfo {
                                 name,
-                                php_type: types
-                                    .into_iter()
-                                    .next()
-                                    .unwrap_or_else(|| "mixed".to_string()),
-                                source: "component".to_string(),
-                            });
-                        }
-                    }
-                    idx.render_source_files(&vn)
-                } else {
-                    Vec::new()
-                };
-
-                // The render index keeps only class-typed properties (scalars
-                // have no members to resolve), but a template reads scalar
-                // and untyped publics as bare `$vars` too — enumerate every
-                // public property of the contributing class files so
-                // `$`-completion offers the full surface.
-                for class_file in source_files {
-                    let Ok(class_source) = std::fs::read_to_string(&class_file) else {
-                        continue;
-                    };
-                    for (name, php_type) in
-                        laravel_lsp::component_member_locator::public_property_types(&class_source)
-                    {
-                        if seen.insert(name.clone()) {
-                            variables.push(BladeVariableInfo {
-                                name,
-                                php_type,
-                                source: "component".to_string(),
+                                // The full union across render sites — one
+                                // render site may type `$user` as `User`,
+                                // another as `Authenticatable`; picking one
+                                // silently would misreport the other site.
+                                php_type: if types.is_empty() {
+                                    "mixed".to_string()
+                                } else {
+                                    types.join("|")
+                                },
+                                // These come from a controller or a
+                                // `$view`-property page — the render index —
+                                // not from a view component.
+                                source: "render site".to_string(),
                             });
                         }
                     }
@@ -18176,6 +18251,14 @@ return [
         if is_php {
             // Check view() calls using Salsa patterns
             for view_ref in &patterns.views {
+                // A `$view = '…'` class PROPERTY keeps goto/hover but never
+                // raises the missing-view ERROR: any PHP class may declare a
+                // string property named `view` that isn't a Blade view, and
+                // the render-index contribution is inert on a false
+                // positive — the diagnostic is not.
+                if view_ref.is_property_site {
+                    continue;
+                }
                 let possible_paths = config.resolve_view_path(&view_ref.name);
                 // Containment guard (issue #194, secondary): out-of-root
                 // candidates are filtered out before the `.exists()` probe, so an

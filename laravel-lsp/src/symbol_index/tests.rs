@@ -15,6 +15,7 @@ fn fixture(view: &str, route: &str) -> ParsedPatternsData {
         column: 5,
         end_column: 20,
         is_route_view: false,
+        is_property_site: false,
     }));
     d.route_refs.push(Arc::new(RouteReferenceData {
         name: route.to_string(),

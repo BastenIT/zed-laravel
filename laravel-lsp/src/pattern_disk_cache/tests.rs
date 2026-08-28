@@ -19,6 +19,7 @@ fn fake_patterns(view_name: &str) -> ParsedPatternsData {
         column: 0,
         end_column: 10,
         is_route_view: false,
+        is_property_site: false,
     }));
     data.build_position_index();
     data
@@ -458,6 +459,7 @@ fn save_borrowed_then_load_owned_round_trips() {
         column: 1,
         end_column: 14,
         is_route_view: true,
+        is_property_site: false,
     }));
     patterns.route_refs.push(Arc::new(RouteReferenceData {
         name: "users.show".into(),
@@ -547,4 +549,61 @@ fn save_borrowed_then_load_owned_round_trips() {
     // find_at_position (lazy, Win 2) must still resolve on the restored,
     // borrowed-then-owned-round-tripped entry.
     assert!(restored.find_at_position(3, 5).is_some());
+}
+
+#[test]
+fn old_schema_version_is_treated_as_stale() {
+    // bincode is non-self-describing, so a blob written by an older build
+    // could silently decode into today's shapes with default-empty new
+    // fields — a restored Filament-page file would keep resolving its
+    // template's vars as empty until an unrelated edit. The version check
+    // must reject the whole file BEFORE any entry decodes.
+    let project = TempDir::new().unwrap();
+    let cache = Arc::new(DashMap::new());
+
+    let file = touch(project.path(), "home.blade.php", "<x-foo/>");
+    // The entry carries exactly the hazard this bump exists for: a
+    // `ViewRenderPlanData` whose `surface` holds a class's typed surface. A
+    // v14 blob decoded with `#[serde(default)]` would silently come back
+    // with `surface: None` — the loader must reject on VERSION instead.
+    let mut patterns = fake_patterns("home");
+    let mut context = crate::salsa_impl::MemberContextData::default();
+    context
+        .view_renders
+        .push(crate::salsa_impl::ViewRenderPlanData {
+            view_name: "pages.settings".to_string(),
+            items: Vec::new(),
+            surface: Some(crate::salsa_impl::VoltSurfaceData {
+                items: vec![crate::salsa_impl::VoltPropPlanData::TypedProp {
+                    name: "user".to_string(),
+                    fqcn: "App\\Models\\User".to_string(),
+                }],
+                aliases: Default::default(),
+            }),
+        });
+    patterns.member_context = Some(Box::new(context));
+    cache.insert(file.clone(), (0, Arc::new(patterns)));
+    save_from(&cache, &Default::default(), project.path()).unwrap();
+
+    // Rewrite the saved blob with the LITERAL previous release's version —
+    // not `SCHEMA_VERSION - 1`, which would move with the constant and let a
+    // reverted bump slip past this test unnoticed.
+    let path = cache_file_path(project.path()).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let (mut on_disk, _): (CacheFile, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    on_disk.schema_version = 14;
+    std::fs::write(
+        &path,
+        bincode::serde::encode_to_vec(&on_disk, bincode::config::standard()).unwrap(),
+    )
+    .unwrap();
+
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into(&restored_cache, project.path());
+    assert_eq!(lr.restored, 0, "a stale-schema cache must not restore");
+    assert!(
+        restored_cache.is_empty(),
+        "no entries may leak out of a stale-schema cache"
+    );
 }

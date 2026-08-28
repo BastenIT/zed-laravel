@@ -360,6 +360,10 @@ pub struct ViewReference<'db> {
     pub end_column: u32,
     #[returns(copy)]
     pub is_route_view: bool,
+    /// `$view = '…'` class-property site — goto/hover yes, missing-view
+    /// diagnostic no (see `ViewMatch::is_property_site`).
+    #[returns(copy)]
+    pub is_property_site: bool,
 }
 
 /// A parsed component reference found in code
@@ -979,6 +983,7 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     col,
                     end_col,
                     view.is_route_view,
+                    view.is_property_site,
                 ));
             }
             for env in snippet_patterns.env_calls {
@@ -1135,6 +1140,7 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         view.column as u32,
                         view.end_column as u32,
                         view.is_route_view,
+                        view.is_property_site,
                     ));
                 }
 
@@ -4117,6 +4123,11 @@ pub struct ViewReferenceData {
     pub column: u32,
     pub end_column: u32,
     pub is_route_view: bool,
+    /// `$view = '…'` class-property site — feeds goto/hover and the render
+    /// index, skipped by the missing-view diagnostic (a string property
+    /// named `view` on a non-Filament class is not a Blade reference).
+    #[serde(default)]
+    pub is_property_site: bool,
 }
 
 /// Inertia page reference data for transfer across async boundaries (issue
@@ -4651,10 +4662,21 @@ pub enum ValueExprPlanData {
 
 /// One `view('name', […])` render site's compiled plan (pass 1). `items` are in
 /// traversal order so the resolve replay reproduces last-wins map semantics.
+///
+/// A Filament-style `protected string $view = '…';` class property is also a
+/// render site (see `view_var_index::declared_view_literal`), but its vars come
+/// from the class's declared surface (typed props / `#[Computed]` / `mount()`)
+/// rather than a `view()` call's data argument — `surface` carries that plan
+/// instead, with `items` left empty. `#[serde(default)]` so a pattern-cache
+/// entry from before this field existed deserializes with `None` rather than
+/// failing — harmless since the schema bump below already forces those entries
+/// to re-parse regardless.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ViewRenderPlanData {
     pub view_name: String,
     pub items: Vec<(String, ValueExprPlanData)>,
+    #[serde(default)]
+    pub surface: Option<VoltSurfaceData>,
 }
 
 /// A Volt front-matter property plan, replayed in declaration order.
@@ -9382,6 +9404,7 @@ impl SalsaActor {
                     column: v.column(&self.db),
                     end_column: v.end_column(&self.db),
                     is_route_view: v.is_route_view(&self.db),
+                    is_property_site: v.is_property_site(&self.db),
                 })
             })
             .collect();
