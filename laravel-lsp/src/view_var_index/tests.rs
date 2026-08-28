@@ -551,6 +551,32 @@ fn index_clear_empties() {
 }
 
 #[test]
+fn render_source_files_returns_every_contributing_file() {
+    let mut idx = ViewVarIndex::new();
+    let controller = PathBuf::from("/proj/UserController.php");
+    let page = PathBuf::from("/proj/Filament/UserPage.php");
+    idx.insert_file(
+        controller.clone(),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    idx.insert_file(
+        page.clone(),
+        &[render("users.show", &[("account", "App\\Models\\Account")])],
+    );
+    idx.insert_file(
+        PathBuf::from("/proj/OtherController.php"),
+        &[render("other.view", &[("x", "App\\X")])],
+    );
+
+    let mut sources = idx.render_source_files("users.show");
+    sources.sort();
+    let mut expected = vec![controller, page];
+    expected.sort();
+    assert_eq!(sources, expected);
+    assert!(idx.render_source_files("missing.view").is_empty());
+}
+
+#[test]
 fn vars_for_view_returns_every_variable_sorted() {
     let mut idx = ViewVarIndex::new();
     idx.insert_file(
@@ -2041,4 +2067,19 @@ fn namespace_dir_inside_a_view_root_keeps_both_names() {
             "admin.dashboard".to_string()
         ]
     );
+}
+
+#[test]
+fn render_source_files_are_sorted_for_deterministic_first_match() {
+    let mut idx = ViewVarIndex::new();
+    for name in ["zeta", "alpha", "midway"] {
+        idx.insert_file(
+            PathBuf::from(format!("/proj/{name}/Controller.php")),
+            &[render("users.show", &[("user", "App\\Models\\User")])],
+        );
+    }
+    let files = idx.render_source_files("users.show");
+    let mut sorted = files.clone();
+    sorted.sort();
+    assert_eq!(files, sorted, "HashMap order must not leak to callers");
 }

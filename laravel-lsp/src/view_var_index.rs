@@ -135,6 +135,27 @@ impl ViewVarIndex {
             .unwrap_or_default()
     }
 
+    /// Every file that currently contributes a render site for `view_name` —
+    /// the reverse of `by_file`'s per-file contribution. A Filament-style
+    /// `$view`-property page and any controller `view(...)` call site that
+    /// renders the same view both show up here, letting a Blade-goto/hover
+    /// fallback jump straight from the template into whichever class(es)
+    /// declare its variables.
+    pub fn render_source_files(&self, view_name: &str) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self
+            .by_file
+            .iter()
+            .filter(|(_, renders)| renders.iter().any(|r| r.view_name == view_name))
+            .map(|(path, _)| path.clone())
+            .collect();
+        // Sorted for the same reason `vars_for_view` sorts: `by_file` is a
+        // HashMap, and `locate_in_backing_class_files` takes the FIRST hit
+        // over this list — unsorted, a member declared by two contributing
+        // classes would flap between targets run to run.
+        files.sort();
+        files
+    }
+
     /// Every variable `view_name` has a render site for, as `(name, sorted
     /// FQCN types)` — the same union-across-render-sites [`Self::var_types`]
     /// exposes, but for every variable at once (feeds `$`-completion). Pairs
