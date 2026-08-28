@@ -624,3 +624,172 @@ fn property_path_prefix_rejects_malformed_paths() {
     assert!(!is_property_path_prefix("a..b"));
     assert!(!is_property_path_prefix("a.b c"));
 }
+
+#[test]
+fn wire_keydown_enter_is_an_action_binding() {
+    // Any DOM-event directive is an action binding, not just click/submit/
+    // poll — and the method name need not echo the event name.
+    let line = r#"<input wire:keydown.enter="performSearch">"#;
+    let cursor = line.find("performSearch").unwrap() as u32 + 2;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("performSearch".to_string()))
+    );
+}
+
+#[test]
+fn wire_submit_with_mismatched_method_name_navigates() {
+    let line = r#"<form wire:submit="handleSubmit">"#;
+    let cursor = line.find("handleSubmit").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("handleSubmit".to_string()))
+    );
+}
+
+#[test]
+fn wire_change_and_blur_are_action_bindings() {
+    for line in [
+        r#"<select wire:change="applyFilter">"#,
+        r#"<input wire:blur="validateField">"#,
+    ] {
+        let value_start = line.find('"').unwrap() as u32 + 1;
+        assert!(
+            matches!(
+                wire_attribute_target_at(line, value_start),
+                Some(WireTarget::Method(_))
+            ),
+            "line: {line}"
+        );
+    }
+}
+
+#[test]
+fn wire_confirm_value_is_a_message_not_a_member() {
+    // Deviation from the issue's example list, deliberately: `wire:confirm`'s
+    // value is the confirmation MESSAGE shown to the user, not a method name.
+    let line = r#"<button wire:confirm="Delete" wire:click="delete">x</button>"#;
+    let cursor = line.find("Delete").unwrap() as u32;
+    assert!(wire_attribute_target_at(line, cursor).is_none());
+}
+
+#[test]
+fn non_wire_prefixed_js_expressions_have_no_target() {
+    // The `$wire.`-prefixed case is covered above; these two prove the
+    // exclusion is the value GRAMMAR, not a `$wire` special case.
+    for line in [
+        r#"<button wire:click="count++">+</button>"#,
+        r#"<button wire:click="open = true">go</button>"#,
+    ] {
+        let value_start = line.find('"').unwrap() as u32 + 1;
+        assert!(
+            wire_attribute_target_at(line, value_start).is_none(),
+            "line: {line}"
+        );
+    }
+}
+
+#[test]
+fn wire_target_works_with_single_quoted_values() {
+    let line = "<button wire:click='enterEditMode'>Edit</button>";
+    let cursor = line.find("enterEditMode").unwrap() as u32 + 1;
+    assert_eq!(
+        wire_attribute_target_at(line, cursor),
+        Some(WireTarget::Method("enterEditMode".to_string()))
+    );
+}
+
+#[test]
+fn wire_completion_context_single_quotes_and_unclosed_mid_line() {
+    // Single-quote style.
+    let line = "<input wire:model='contract";
+    let cursor = line.len() as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, cursor),
+        Some((WireValueKind::Property, "contract".to_string()))
+    );
+    // Unclosed double quote while the document continues past this line —
+    // the value ends at end-of-line for completion purposes.
+    let line = r#"    <button wire:click="ent"#;
+    let cursor = line.len() as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, cursor),
+        Some((WireValueKind::Method, "ent".to_string()))
+    );
+}
+
+// ---- template-local bindings shadow class properties ----------------------
+
+#[test]
+fn foreach_loop_variable_is_local_inside_the_loop_only() {
+    let content = "\
+<div>
+@foreach ($users as $user)
+    <span>{{ $user->name }}</span>
+@endforeach
+<span>{{ $user }}</span>
+</div>";
+    assert!(is_template_local_binding(content, 2, "user"));
+    assert!(
+        is_template_local_binding(content, 1, "user"),
+        "binding and use on the @foreach line itself count as in scope"
+    );
+    assert!(
+        !is_template_local_binding(content, 4, "user"),
+        "after @endforeach the loop variable is out of scope"
+    );
+}
+
+#[test]
+fn foreach_key_value_binds_both_names_and_loop() {
+    let content = "\
+@foreach ($rows as $index => $row)
+    {{ $loop->iteration }} {{ $index }} {{ $row }}
+@endforeach";
+    assert!(is_template_local_binding(content, 1, "row"));
+    assert!(is_template_local_binding(content, 1, "index"));
+    assert!(is_template_local_binding(content, 1, "loop"));
+    assert!(!is_template_local_binding(content, 1, "rows"));
+}
+
+#[test]
+fn php_block_assignment_persists_after_endphp() {
+    let content = "\
+@php
+    $total = 0;
+@endphp
+<span>{{ $total }}</span>";
+    assert!(
+        is_template_local_binding(content, 3, "total"),
+        "PHP locals persist in the compiled template scope"
+    );
+    assert!(!is_template_local_binding(content, 3, "other"));
+}
+
+#[test]
+fn inline_php_and_for_and_props_bind_locals() {
+    let content = "\
+@props(['variant', 'size' => 'md'])
+@php($discount = 5)
+@for ($i = 0; $i < 3; $i++)
+    {{ $i }} {{ $variant }} {{ $discount }}
+@endfor
+{{ $i }}";
+    assert!(is_template_local_binding(content, 3, "variant"));
+    assert!(is_template_local_binding(content, 3, "size"));
+    assert!(is_template_local_binding(content, 3, "discount"));
+    assert!(is_template_local_binding(content, 3, "i"));
+    assert!(
+        !is_template_local_binding(content, 5, "i"),
+        "@endfor closes the loop-variable scope"
+    );
+}
+
+#[test]
+fn class_property_reference_is_not_shadowed() {
+    let content = "\
+<div>
+    <span>{{ $prefillStatus }}</span>
+</div>";
+    assert!(!is_template_local_binding(content, 1, "prefillStatus"));
+}

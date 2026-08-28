@@ -791,6 +791,206 @@ fn front_matter_window(content: &str) -> &str {
     &content[..adjusted]
 }
 
+/// True when `var` (name without the `$`) is bound LOCALLY in the template
+/// at 0-based `line`, so a bare-`$var` reference there must not navigate to a
+/// backing-class property — the local binding shadows it.
+///
+/// Local binding sources, per Blade's own scoping:
+/// - an ENCLOSING `@foreach` / `@forelse` loop variable (`as $item`,
+///   `as $key => $item`) — out of scope again after the matching
+///   `@endforeach` / `@endforelse`;
+/// - Blade's `$loop`, inside any `@foreach` / `@forelse`;
+/// - an ENCLOSING `@for` init variable (`@for ($i = 0; …)`);
+/// - a `@php` assignment (block or inline `@php($x = …)`) — PHP locals
+///   persist in the compiled template's scope, so the binding holds from
+///   that line to the end of the file;
+/// - a `@props([...])` / `@aware([...])` component-prop declaration —
+///   file-wide.
+///
+/// Line-granular by design: a binding and a use on the same line count as
+/// in scope (`@foreach ($users as $user)` — cursor on `$user`).
+pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
+    let mut loop_stack: Vec<Vec<String>> = Vec::new();
+    let mut for_stack: Vec<Vec<String>> = Vec::new();
+    let mut persistent: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_php_block = false;
+
+    for (idx, text) in content.lines().enumerate() {
+        if idx > line as usize {
+            break;
+        }
+        let mut scan = text;
+
+        // `@php($x = …)` inline form first — it must not toggle block state.
+        if let Some(rest) = find_directive(scan, "@php") {
+            if rest.trim_start().starts_with('(') {
+                collect_assignments(rest, &mut persistent);
+            } else {
+                in_php_block = true;
+                scan = rest;
+            }
+        }
+        if in_php_block {
+            collect_assignments(scan, &mut persistent);
+        }
+        if scan.contains("@endphp") {
+            in_php_block = false;
+        }
+
+        if let Some(rest) =
+            find_directive(text, "@props").or_else(|| find_directive(text, "@aware"))
+        {
+            collect_quoted_names(rest, &mut persistent);
+        }
+
+        if let Some(rest) =
+            find_directive(text, "@foreach").or_else(|| find_directive(text, "@forelse"))
+        {
+            loop_stack.push(loop_binding_names(rest));
+        }
+        if let Some(rest) = find_directive(text, "@for") {
+            // `@for` only — `@foreach`/`@forelse` were consumed above and
+            // find_directive requires a non-identifier char after the name.
+            let mut names = Vec::new();
+            collect_assignment_names(rest, &mut names);
+            for_stack.push(names);
+        }
+
+        if idx == line as usize {
+            break;
+        }
+        if text.contains("@endforeach") || text.contains("@endforelse") {
+            loop_stack.pop();
+        }
+        if text.contains("@endfor")
+            && !text.contains("@endforeach")
+            && !text.contains("@endforelse")
+        {
+            for_stack.pop();
+        }
+    }
+
+    if var == "loop" && !loop_stack.is_empty() {
+        return true;
+    }
+    persistent.contains(var)
+        || loop_stack
+            .iter()
+            .any(|names| names.iter().any(|n| n == var))
+        || for_stack.iter().any(|names| names.iter().any(|n| n == var))
+}
+
+/// The text following `@{name}` on `line`, when the directive occurs with a
+/// non-identifier character (or end of line) right after it — so `@for`
+/// never matches inside `@foreach`.
+fn find_directive<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(name) {
+        let at = from + rel;
+        let after = at + name.len();
+        let boundary = line[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if boundary {
+            return Some(&line[after..]);
+        }
+        from = after;
+    }
+    None
+}
+
+/// The variables an `@foreach` / `@forelse` head binds: everything after
+/// `as` — `$item`, or `$key => $item`.
+fn loop_binding_names(rest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(pos) = rest.find(" as ") {
+        collect_dollar_names(&rest[pos + 4..], &mut names);
+    }
+    names
+}
+
+/// Every `$name` token in `s`.
+fn collect_dollar_names(s: &str, out: &mut Vec<String>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > start {
+                out.push(s[start..end].to_string());
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Every `$name` that is being ASSIGNED (`$name =`, not `==`/`=>`/`<=` etc.)
+/// in `s`, appended to `out`.
+fn collect_assignment_names(s: &str, out: &mut Vec<String>) {
+    let mut names = Vec::new();
+    collect_dollar_names(s, &mut names);
+    for name in names {
+        // Find `$name` followed (after whitespace) by a single `=`.
+        let needle = format!("${name}");
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(&needle) {
+            let after = from + rel + needle.len();
+            let rest = s[after..].trim_start();
+            let assigns = rest.starts_with('=')
+                && !rest.starts_with("==")
+                && !rest.starts_with("=>")
+                && !rest.starts_with("===");
+            if assigns {
+                out.push(name.clone());
+                break;
+            }
+            from = after;
+        }
+    }
+}
+
+/// [`collect_assignment_names`] into a set.
+fn collect_assignments(s: &str, out: &mut std::collections::HashSet<String>) {
+    let mut names = Vec::new();
+    collect_assignment_names(s, &mut names);
+    out.extend(names);
+}
+
+/// Every `'name'` / `"name"` string key or entry in a `@props([...])` /
+/// `@aware([...])` argument on this line.
+fn collect_quoted_names(s: &str, out: &mut std::collections::HashSet<String>) {
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' || c == '"' {
+            if let Some(rel) = s[i + 1..].find(c) {
+                let name = &s[i + 1..i + 1 + rel];
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    out.insert(name.to_string());
+                }
+                // skip past the closing quote
+                while let Some(&(j, _)) = chars.peek() {
+                    if j <= i + 1 + rel {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 const VOLT_FUNCTIONAL_CALLS: &[&str] = &[
     "state(",
     "action(",

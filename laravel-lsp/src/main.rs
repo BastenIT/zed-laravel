@@ -3371,6 +3371,7 @@ struct VariableAccess {
 
 /// Represents an available variable in a Blade file
 /// Used for $variable name autocompletion
+#[derive(Debug)]
 struct BladeVariableInfo {
     name: String,
     php_type: String,
@@ -11389,6 +11390,20 @@ impl LaravelLanguageServer {
         let (var_name, property) =
             extract_blade_variable_at_cursor(&line_text, position.character)?;
 
+        // Template-local bindings shadow class properties: a `$var` bound by
+        // an enclosing `@foreach`/`@for` loop, a `@php` assignment, a
+        // component `@props`, or Blade's own `$loop` is NOT a reference to a
+        // backing-class member, so no class-property navigation is offered.
+        if property.is_none()
+            && laravel_lsp::livewire_resolver::is_template_local_binding(
+                &content,
+                position.line,
+                &var_name,
+            )
+        {
+            return None;
+        }
+
         let root = self.root_path.read().await.clone()?;
 
         let target = match &property {
@@ -11874,6 +11889,31 @@ impl LaravelLanguageServer {
                                 source: "component".to_string(),
                             });
                         }
+                    }
+                }
+            }
+        }
+
+        // An inline `new class extends Component` (Livewire v4 SFC, Volt
+        // class API) has no standalone `.php` file for the render index or
+        // the loops above to reach — its public properties come straight
+        // from the template's own front matter. `seen` keeps the merge
+        // deduplicated against every earlier source.
+        let blade_content = match content {
+            Some(c) => Some(c.to_string()),
+            None => std::fs::read_to_string(&file_path).ok(),
+        };
+        if let Some(blade_content) = blade_content {
+            if laravel_lsp::php_class::detect_inline_livewire_class(&blade_content) {
+                for (name, php_type) in
+                    laravel_lsp::component_member_locator::public_property_types(&blade_content)
+                {
+                    if seen.insert(name.clone()) {
+                        variables.push(BladeVariableInfo {
+                            name,
+                            php_type,
+                            source: "component".to_string(),
+                        });
                     }
                 }
             }
@@ -13027,6 +13067,42 @@ impl LaravelLanguageServer {
     /// Locate `member` (a property or method name) in whichever `.php`
     /// file(s) back `blade_path` (see [`Self::blade_backing_class_files`]).
     /// Returns the first hit's file plus its declaration position.
+    /// Every `(path, source)` pair whose PHP class backs `blade_path` — the
+    /// plain-`.php` backing files ([`Self::blade_backing_class_files`]), plus
+    /// the blade file ITSELF when it declares an inline
+    /// `new class extends Component` (a Livewire v4 single-file component or
+    /// a class-based Volt component). Those two shapes have no standalone
+    /// `.php` source: the class lives in the template's own front matter, so
+    /// the template is the source to parse and member positions land in the
+    /// `.blade.php` itself. The live editor buffer wins over disk for it.
+    async fn blade_backing_class_sources(&self, blade_path: &Path) -> Vec<(PathBuf, String)> {
+        let mut out: Vec<(PathBuf, String)> = Vec::new();
+        for class_path in self.blade_backing_class_files(blade_path).await {
+            if let Ok(source) = std::fs::read_to_string(&class_path) {
+                out.push((class_path, source));
+            }
+        }
+        let live = match Url::from_file_path(blade_path) {
+            Ok(url) => self
+                .documents
+                .read()
+                .await
+                .get(&url)
+                .map(|(c, _)| c.clone()),
+            Err(()) => None,
+        };
+        let blade_content = match live {
+            Some(content) => Some(content),
+            None => std::fs::read_to_string(blade_path).ok(),
+        };
+        if let Some(content) = blade_content {
+            if laravel_lsp::php_class::detect_inline_livewire_class(&content) {
+                out.push((blade_path.to_path_buf(), content));
+            }
+        }
+        out
+    }
+
     async fn locate_in_backing_class_files(
         &self,
         blade_path: &Path,
@@ -13035,10 +13111,7 @@ impl LaravelLanguageServer {
         PathBuf,
         laravel_lsp::component_member_locator::MemberLocation,
     )> {
-        for class_path in self.blade_backing_class_files(blade_path).await {
-            let Ok(source) = std::fs::read_to_string(&class_path) else {
-                continue;
-            };
+        for (class_path, source) in self.blade_backing_class_sources(blade_path).await {
             if let Some(loc) = laravel_lsp::component_member_locator::locate_member(&source, member)
             {
                 return Some((class_path, loc));
@@ -20071,27 +20144,40 @@ return [
         Self::goto_link(&decl_file, line, start, end)
     }
 
-    /// Minimal hover card for `$this->member` in a Blade template whose
-    /// backing class is known (a Filament `$view`-property page, a Livewire
-    /// component): header `ClassName::member` (methods) or `ClassName::$member`
-    /// (properties), plus a source link to the declaration. `None` when no
-    /// backing class declares `member`.
+    /// Hover card for `$this->member` in a Blade template whose backing
+    /// class is known (a Filament `$view`-property page, a Livewire
+    /// component, an inline SFC/Volt class): header `ClassName::member()` /
+    /// `ClassName::$member`, the member's declaration header as a PHP code
+    /// block (a method's full signature — modifiers, parameters, return
+    /// type — or a property's modifiers + declared type), and a source link
+    /// to the declaration. Emitted unconditionally in Blade: Intelephense
+    /// cannot resolve `$this` in a template's PHP context, so there is no
+    /// PHP-tooling card to defer to. `None` when no backing class declares
+    /// `member`.
     async fn this_member_hover_card(&self, blade_path: &Path, member: &str) -> Option<String> {
         use laravel_lsp::component_member_locator::MemberKind;
         use laravel_lsp::hover;
 
-        let (class_path, loc) = self
-            .locate_in_backing_class_files(blade_path, member)
-            .await?;
-        let class_name = laravel_lsp::php_class::extract_class_fqn(&class_path)
+        let sources = self.blade_backing_class_sources(blade_path).await;
+        let (class_path, source, loc) = sources.iter().find_map(|(path, source)| {
+            laravel_lsp::component_member_locator::locate_member(source, member)
+                .map(|loc| (path, source, loc))
+        })?;
+        let class_name = laravel_lsp::php_class::extract_class_fqn(class_path)
             .unwrap_or_else(|| "Component".to_string());
         let header = match loc.kind {
             MemberKind::Method => format!("{class_name}::{member}()"),
             MemberKind::Property => format!("{class_name}::${member}"),
         };
-        let link = self.source_link(&class_path, Some(loc.line + 1)).await;
+        let signature =
+            laravel_lsp::component_member_locator::member_declaration_summary(source, member);
+        let link = self.source_link(class_path, Some(loc.line + 1)).await;
         let rendered = hover::render(&hover::HoverContent {
             header: Some(&header),
+            code: signature.as_deref().map(|sig| hover::CodeBlock {
+                language: hover::CodeLanguage::Php,
+                content: sig,
+            }),
             source_link: Some(&link),
             ..Default::default()
         });
@@ -25794,10 +25880,8 @@ impl LanguageServer for LaravelLanguageServer {
                     if let Ok(blade_path) = uri.to_file_path() {
                         let mut items: Vec<CompletionItem> = Vec::new();
                         let mut seen_members = std::collections::HashSet::new();
-                        for class_file in self.blade_backing_class_files(&blade_path).await {
-                            let Ok(class_source) = std::fs::read_to_string(&class_file) else {
-                                continue;
-                            };
+                        for (_, class_source) in self.blade_backing_class_sources(&blade_path).await
+                        {
                             match wire_kind {
                                 laravel_lsp::livewire_resolver::WireValueKind::Property => {
                                     for (name, php_type) in
