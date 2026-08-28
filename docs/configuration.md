@@ -65,7 +65,14 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
         //     last-registered module provider wins; an app/Providers
         //     registration overrides modules, because the app boots last.
         // All of it is parsed statically (tree-sitter) — no project PHP is
-        // ever executed. Guide examples:
+        // ever executed. Two operational notes: changing "paths" MID-SESSION
+        // re-resolves everything except the file watchers — restart the
+        // server for watcher coverage of newly added module trees. And
+        // independent of this setting, ns::key translation completion covers
+        // every provider-registered namespace (vendor packages included) —
+        // that closes a pre-existing gap in the Salsa translation layer and
+        // arrives regardless of whether modules are configured.
+        // Guide examples:
         //   "paths": ["app/Common/*", "app/*/*"]        Default: [] (off)
         "modules": {
           "paths": [],

@@ -16540,10 +16540,7 @@ return [
         }
 
         if links.is_empty() {
-            for path in laravel_lsp::config::config_group_files(&root, &module_dirs, config_file)
-                .into_iter()
-                .rev()
-            {
+            for path in laravel_lsp::config::config_group_files(&root, &module_dirs, config_file) {
                 let Ok(target_uri) = Url::from_file_path(&path) else {
                     continue;
                 };
@@ -22717,11 +22714,18 @@ impl LanguageServer for LaravelLanguageServer {
                 let psr4_roots =
                     laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root)
                         .project_source_roots();
+                // Module dirs get their own watcher pair — settings were
+                // pulled earlier in this same `initialized` flow, so the
+                // expanded set is available here. Changing `modules.paths`
+                // MID-SESSION does not re-register watchers: that needs a
+                // server restart (documented in docs/configuration.md).
+                let module_dirs = server.module_dirs_for(&root).await;
                 let registration = laravel_lsp::file_watcher::build_registration(
                     &root,
                     &config.view_paths,
                     config.livewire_path.as_deref(),
                     &psr4_roots,
+                    &module_dirs,
                 );
                 match server.client.register_capability(vec![registration]).await {
                     Ok(_) => info!(

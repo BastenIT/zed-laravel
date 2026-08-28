@@ -23,11 +23,11 @@ pub fn resolve_value(root: &Path, dotted_key: &str) -> Option<String> {
 }
 
 /// Like [`resolve_value`], but additionally searches every module config
-/// file contributing to the key's group (see
-/// [`crate::config::config_group_files`]) and reports which file produced
-/// the value. Files are consulted in descending merge precedence, matching
-/// `array_replace_recursive` semantics: the last-merged module wins, the
-/// project `config/` file is the fallback.
+/// file contributing to the key's group and reports which file produced
+/// the value. [`crate::config::config_group_files`] already hands the files
+/// over in descending merge precedence — `array_replace_recursive`
+/// semantics: the last-merged module wins, the project `config/` file is
+/// the fallback — so the first file resolving the key is the winner.
 pub fn resolve_value_with_source(
     root: &Path,
     module_dirs: &[PathBuf],
@@ -37,10 +37,7 @@ pub fn resolve_value_with_source(
     let file = parts.next()?;
     let key_path: Vec<&str> = parts.collect();
 
-    for config_path in crate::config::config_group_files(root, module_dirs, file)
-        .into_iter()
-        .rev()
-    {
+    for config_path in crate::config::config_group_files(root, module_dirs, file) {
         let Ok(content) = std::fs::read_to_string(&config_path) else {
             continue;
         };

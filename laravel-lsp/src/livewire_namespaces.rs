@@ -36,8 +36,9 @@ pub struct LivewireClassNamespace {
 }
 
 /// Extract every statically resolvable Livewire namespace registration from
-/// one provider file. First registration wins on prefix conflict, matching
-/// provider boot order within a file.
+/// one provider file. Within a file the LAST registration wins on a prefix
+/// conflict — PHP executes every statement, so the later `addNamespace`
+/// overwrites the earlier one in Livewire's registry.
 pub fn extract_livewire_namespaces(
     source: &str,
     provider_path: &Path,
@@ -83,7 +84,7 @@ fn walk(
     match node.kind() {
         "scoped_call_expression" => {
             if let Some((prefix, reg)) = classify_add_namespace(node, bytes, provider_dir, root) {
-                out.entry(prefix).or_insert(reg);
+                out.insert(prefix, reg);
             }
         }
         "member_call_expression" => {
@@ -95,7 +96,7 @@ fn walk(
                 registrar_methods,
                 file_namespace,
             ) {
-                out.entry(prefix).or_insert(reg);
+                out.insert(prefix, reg);
             }
         }
         _ => {}
@@ -188,8 +189,11 @@ fn classify_registrar_call(
 
 /// Order a call's arguments by the given parameter names: positional
 /// arguments fill slots left to right, named arguments land in their slot
-/// regardless of position. `None` when a named argument doesn't match any
-/// known parameter (a signature we don't understand).
+/// regardless of position. An argument we don't understand — a named
+/// argument for a parameter we don't track (`lazy: true`, or any parameter
+/// a future Livewire adds), or a positional argument past the tracked
+/// slots — skips THAT argument, never the whole call: one unknown flag must
+/// not silently disable the namespace registration.
 fn collect_arguments<'t>(
     call: tree_sitter::Node<'t>,
     bytes: &[u8],
@@ -204,16 +208,22 @@ fn collect_arguments<'t>(
         if arg.kind() != "argument" {
             continue;
         }
-        let value = argument_value(arg)?;
+        let Some(value) = argument_value(arg) else {
+            continue;
+        };
         match arg.child_by_field_name("name") {
             Some(label) => {
-                let label_text = label.utf8_text(bytes).ok()?;
-                let slot = parameter_names.iter().position(|p| *p == label_text)?;
+                let Some(label_text) = label.utf8_text(bytes).ok() else {
+                    continue;
+                };
+                let Some(slot) = parameter_names.iter().position(|p| *p == label_text) else {
+                    continue;
+                };
                 slots[slot] = Some(value);
             }
             None => {
                 if next_positional >= slots.len() {
-                    return None;
+                    continue;
                 }
                 slots[next_positional] = Some(value);
                 next_positional += 1;
